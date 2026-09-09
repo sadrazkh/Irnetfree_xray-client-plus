@@ -10,23 +10,38 @@ const os = require('node:os');
 const path = require('node:path');
 const { pickUpdateAsset, parseSha256Sums, sha256File } = require('../src/main/appUpdate');
 
+// plus: the artifact names carry "Plus" (package.json → build), so these are
+// the names a Plus release publishes.
 const assets = [
-  { name: 'IRNetFree-Setup-1.6.0.exe', browser_download_url: 'u1', size: 1 },
-  { name: 'IRNetFree-Portable-1.6.0.exe', browser_download_url: 'u2', size: 2 },
-  { name: 'IRNetFree-1.6.0-arm64.dmg', browser_download_url: 'u3', size: 3 },
-  { name: 'IRNetFree-1.6.0-x64.dmg', browser_download_url: 'u4', size: 4 },
-  { name: 'IRNetFree-1.6.0.AppImage', browser_download_url: 'u5', size: 5 },
-  { name: 'IRNetFree-1.6.0.apk', browser_download_url: 'u6', size: 6 },
+  { name: 'IRNetFree-Plus-Setup-2.1.0.exe', browser_download_url: 'u1', size: 1 },
+  { name: 'IRNetFree-Plus-Portable-2.1.0.exe', browser_download_url: 'u2', size: 2 },
+  { name: 'IRNetFree-Plus-2.1.0-arm64.dmg', browser_download_url: 'u3', size: 3 },
+  { name: 'IRNetFree-Plus-2.1.0-x64.dmg', browser_download_url: 'u4', size: 4 },
+  { name: 'IRNetFree-Plus-2.1.0.AppImage', browser_download_url: 'u5', size: 5 },
+  { name: 'IRNetFree-2.1.0.apk', browser_download_url: 'u6', size: 6 },
   { name: 'SHA256SUMS-windows-latest.txt', browser_download_url: 'u7', size: 7 }
 ];
 
 test('pickUpdateAsset: the installer for this platform and arch, never the portable or the APK', () => {
-  assert.equal(pickUpdateAsset(assets, 'win32', 'x64').name, 'IRNetFree-Setup-1.6.0.exe');
-  assert.equal(pickUpdateAsset(assets, 'darwin', 'arm64').name, 'IRNetFree-1.6.0-arm64.dmg');
-  assert.equal(pickUpdateAsset(assets, 'darwin', 'x64').name, 'IRNetFree-1.6.0-x64.dmg');
-  assert.equal(pickUpdateAsset(assets, 'linux', 'x64').name, 'IRNetFree-1.6.0.AppImage');
+  assert.equal(pickUpdateAsset(assets, 'win32', 'x64').name, 'IRNetFree-Plus-Setup-2.1.0.exe');
+  assert.equal(pickUpdateAsset(assets, 'darwin', 'arm64').name, 'IRNetFree-Plus-2.1.0-arm64.dmg');
+  assert.equal(pickUpdateAsset(assets, 'darwin', 'x64').name, 'IRNetFree-Plus-2.1.0-x64.dmg');
+  assert.equal(pickUpdateAsset(assets, 'linux', 'x64').name, 'IRNetFree-Plus-2.1.0.AppImage');
   assert.equal(pickUpdateAsset([], 'win32', 'x64'), null);
   assert.equal(pickUpdateAsset(null, 'win32', 'x64'), null);
+});
+
+// The two apps live side by side: an installer of the ORIGINAL app must never
+// be offered as an update for Plus, or an "update" would replace the other app.
+test('pickUpdateAsset: the original IRNetFree assets are not installers for Plus', () => {
+  const original = [
+    { name: 'IRNetFree-Setup-1.6.0.exe', browser_download_url: 'o1', size: 1 },
+    { name: 'IRNetFree-1.6.0-x64.dmg', browser_download_url: 'o2', size: 2 },
+    { name: 'IRNetFree-1.6.0.AppImage', browser_download_url: 'o3', size: 3 }
+  ];
+  assert.equal(pickUpdateAsset(original, 'win32', 'x64'), null);
+  assert.equal(pickUpdateAsset(original, 'darwin', 'x64'), null);
+  assert.equal(pickUpdateAsset(original, 'linux', 'x64'), null);
 });
 
 test('parseSha256Sums and sha256File agree; malformed lines are ignored; names keep their case', async () => {

@@ -12,6 +12,14 @@ Windows · macOS (Intel + Apple Silicon) · Linux
 
 ---
 
+## ➕ IRNetFree **Plus**
+
+این مخزن، فورک **پلاس** از IRNetFree است: همان کلاینت، به‌علاوهٔ دو تب تازه — **سرور** (اجرای xray به‌عنوان سرور روی همین دستگاه، با inbound و کاربر و به‌خصوص ریورس‌پراکسی) و **اسکن IP** (یک کانفیگ و یک فهرست IP بدهید تا روی هر هستهٔ پشتیبانی‌شده تست و رتبه‌بندی شوند). پلاس **کنار** نسخهٔ اصلی نصب و اجرا می‌شود و چیزی از آن را دست نمی‌زند: شناسهٔ برنامه `com.irnetfree.plus`، نام محصول `IRNetFree Plus`، پوشهٔ دادهٔ جدا (`%APPDATA%\irnetfree-plus`)، تسک استارتاپ `IRNetFreePlus`، و پورت‌های پیش‌فرض `10818`/`10819`/`10095` به‌جای `10808`/`10809`/`10085`. روش هم‌گام‌شدن با مخزن اصلی و قواعد نگه‌داری فورک در [`docs/FORK.md`](docs/FORK.md) آمده است.
+
+This repository is the **Plus** fork of IRNetFree: the same client, plus two new tabs — a **Server** tab (run xray as a server on this machine: inbounds, clients, and first-class reverse proxy) and an **IP scan** tab (give it a config and a list of IPs; it tests them on every supported core and ranks them). Plus installs and runs **next to** the original and touches nothing of it: app id `com.irnetfree.plus`, product name `IRNetFree Plus`, its own data folder (`%APPDATA%\irnetfree-plus`), autostart task `IRNetFreePlus`, and default ports `10818`/`10819`/`10095` instead of `10808`/`10809`/`10085`. How this fork tracks upstream — remotes, sync commands, conflict policy — is in [`docs/FORK.md`](docs/FORK.md).
+
+---
+
 ## 📑 فهرست (Table of Contents)
 
 - [امکانات کامل](#-امکانات-کامل-features)

@@ -5,6 +5,10 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 const t = (k) => window.i18n.t(k);
 
+// Release repo — the page to open when main did not name one (see the download
+// button below). Keep it in step with APP_REPO in main.js.
+const APP_REPO = 'sadrazkh/Irnetfree_xray-client-plus';   // plus: Plus publishes its own releases
+
 const state = {
   servers: [],
   subscriptions: [],
@@ -2209,7 +2213,7 @@ $('#btnCheckUpdate').onclick = async () => {
   }
 };
 $('#btnDownloadUpdate').onclick = async () => {
-  const url = (updateInfo && updateInfo.url) || 'https://github.com/sadrazkh/Irnetfree_xray-client/releases/latest';
+  const url = (updateInfo && updateInfo.url) || `https://github.com/${APP_REPO}/releases/latest`;   // plus
   // No installer named for this machine (or an older backend): the release page, as before.
   if (!updateInfo || !updateInfo.asset || !window.api.downloadUpdate) {
     window.api.openExternal(url);

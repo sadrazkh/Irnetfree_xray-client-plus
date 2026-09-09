@@ -15,9 +15,11 @@ const crypto = require('crypto');
 function pickUpdateAsset(assets, platform = process.platform, arch = process.arch) {
   const list = Array.isArray(assets) ? assets : [];
   const find = (re) => list.find(a => a && re.test(String(a.name || ''))) || null;
-  if (platform === 'win32') return find(/^IRNetFree-Setup-.*\.exe$/i);
-  if (platform === 'darwin') return find(new RegExp(`^IRNetFree-.*-${arch === 'arm64' ? 'arm64' : 'x64'}\\.dmg$`, 'i'));
-  return find(/^IRNetFree-.*\.AppImage$/i);
+  // plus: the artifact names carry "Plus", so a release of the original app
+  // never looks like an installer for this one.
+  if (platform === 'win32') return find(/^IRNetFree-Plus-Setup-.*\.exe$/i);
+  if (platform === 'darwin') return find(new RegExp(`^IRNetFree-Plus-.*-${arch === 'arm64' ? 'arm64' : 'x64'}\\.dmg$`, 'i'));
+  return find(/^IRNetFree-Plus-.*\.AppImage$/i);
 }
 
 /** `sha256sum` output → { fileName: hex }. A line that is not "64 hex, whitespace, [*]name" is ignored. */

@@ -14,7 +14,10 @@
  * touches the machine, so the shape is pinned by a test.
  */
 
-const TASK = 'IRNetFree';
+// plus: its own task name. The original IRNetFree registers 'IRNetFree', and
+// schtasks /Create /F replaces a task of the same name — sharing the name would
+// mean whichever app was installed last owns the other's autostart.
+const TASK = 'IRNetFreePlus';
 
 /**
  * Create (or replace: /F) the logon task. /RL HIGHEST is the elevation, /IT

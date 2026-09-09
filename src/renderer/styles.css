@@ -169,6 +169,17 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
   text-transform: uppercase;
 }
 .tb-title b { font-weight: 700; color: var(--ink); }
+/* plus */
+/* The fork's badge in the title bar: smaller and widely tracked so it reads as
+   a mark on the name rather than a third word, and in the accent so a glance
+   tells this window apart from the original app running beside it. */
+.tb-plus {
+  font-size: .62em;
+  letter-spacing: .12em;
+  color: var(--accent);
+  margin-inline-start: .35em;
+  font-weight: 700;
+}
 
 .tb-sep { width: 1px; height: 18px; background: var(--line); }
 
