@@ -573,6 +573,10 @@ test('applyModel: errors come back without persisting; a valid model is persiste
   assert.equal(h.core.status().state, 'running');
   assert.equal(h.configFile().log.loglevel, 'info');
 
+  const quiet = await h.core.applyModel(Object.assign({}, h.model(), { publicAddress: '203.0.113.7', autoStart: true }));
+  assert.equal(quiet.ok, true);
+  assert.equal(h.spawns.length, 2, 'a change the core would not see does not restart it');
+
   const warned = await h.core.applyModel(Object.assign({}, h.model(), { inbounds: [inbound({ clients: [] })] }));
   assert.equal(warned.ok, true);
   assert.equal(warned.warnings[0].path, 'inbounds[0].clients');

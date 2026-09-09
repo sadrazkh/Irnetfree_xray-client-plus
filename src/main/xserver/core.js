@@ -541,9 +541,23 @@ class ServerCore {
     }
     const v = validateModel(model, { servers: this.getServers() });
     if (!v.ok) return { ok: false, errors: v.errors, warnings: v.warnings, model };
+    // A client switched on while still out of quota or time goes out again
+    // here, not a tick later — and that is a config change like any other.
+    this._enforce(model);
     this.setModel(model);
-    if (this.proc || this.startP) await this.restart();
+    // Only a change the running core would see is worth dropping every
+    // connection for: a new public address, autoStart or a note change the
+    // model, not the config.
+    if ((this.proc || this.startP) && this._configDiffers(current, model)) await this.restart();
     return { ok: true, errors: [], warnings: v.warnings, model };
+  }
+
+  /** Would the two models run as different configs (or on different cores)? */
+  _configDiffers(a, b) {
+    if (a.engine !== b.engine) return true;
+    const opts = { apiPort: 1, servers: this.getServers(), geoAvailable: this._geo() };
+    try { return JSON.stringify(buildServerConfig(a, opts)) !== JSON.stringify(buildServerConfig(b, opts)); }
+    catch { return true; }
   }
 }
 
