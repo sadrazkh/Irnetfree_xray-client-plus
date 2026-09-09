@@ -468,6 +468,127 @@
       <!-- plus: IP SCAN (src/renderer/plus/scan.js) -->
       <section class="view" id="view-scan">
         <div class="view-head"><h2 data-i18n="scan.title">اسکن IP</h2></div>
+        <p class="hint" data-i18n="scan.intro"></p>
+
+        <div class="scan-forms">
+          <!-- what is dialled: a stored config, or a link pasted here -->
+          <div class="card scan-card">
+            <div class="sec"><span class="sec-label" data-i18n="scan.config">کانفیگ</span></div>
+            <div class="seg scan-seg" id="scanSourceSeg">
+              <button type="button" class="seg-btn active" data-src="server" data-i18n="scan.srcServer">از سرورهای ذخیره‌شده</button>
+              <button type="button" class="seg-btn" data-src="link" data-i18n="scan.srcLink">جای‌گذاری لینک</button>
+            </div>
+            <div class="scan-src" id="scanSrcServer">
+              <label class="field-label" data-i18n="scan.pickServer">کانفیگ پایه</label>
+              <!-- the searchable picker mounts here; the <select> stays the value
+                   holder, out of sight, the way the settings option-cards do -->
+              <div class="scan-mount" id="scanSourceMount"></div>
+              <select id="scanSource" class="select vis-hidden" tabindex="-1" aria-hidden="true"></select>
+              <p class="hint" data-i18n="scan.pickHint"></p>
+            </div>
+            <div class="scan-src" id="scanSrcLink" hidden>
+              <label class="field-label" data-i18n="scan.link">لینک کانفیگ</label>
+              <textarea id="scanLink" class="textarea" rows="3" dir="ltr" spellcheck="false" data-i18n-ph="scan.linkPh"></textarea>
+            </div>
+          </div>
+
+          <!-- where to dial it from -->
+          <div class="card scan-card">
+            <div class="sec"><span class="sec-label" data-i18n="scan.ips">آدرس‌ها</span></div>
+            <textarea id="scanIps" class="textarea scan-ips" rows="7" dir="ltr" spellcheck="false" data-i18n-ph="scan.ipsPh"></textarea>
+            <div class="row-gap scan-ip-actions">
+              <button class="btn ghost small" id="btnScanCf" data-i18n="scan.cf">رنج‌های کلودفلر</button>
+              <button class="btn ghost small" id="btnScanSample" data-i18n="scan.sample">نمونهٔ تصادفی</button>
+              <input type="number" id="scanSampleN" class="input scan-num" dir="ltr" min="1" max="5000" value="100" data-i18n-title="scan.sampleN" />
+              <button class="btn ghost small" id="btnScanFile" data-i18n="scan.file">از فایل</button>
+              <input type="file" id="scanFile" accept=".txt,.csv,.log,text/plain" class="vis-hidden" tabindex="-1" aria-hidden="true" />
+              <span class="scan-count" id="scanCount"></span>
+            </div>
+          </div>
+
+          <!-- which cores, which probes, and how hard to push -->
+          <div class="card scan-card">
+            <div class="sec"><span class="sec-label" data-i18n="scan.tests">تست‌ها</span></div>
+            <label class="field-label" data-i18n="scan.engines">هسته‌ها</label>
+            <div class="scan-checks" id="scanEngines"></div>
+            <label class="field-label scan-sub-label" data-i18n="scan.testsPick">چه چیزی اندازه گرفته شود</label>
+            <div class="scan-checks" id="scanTests"></div>
+            <label class="field-label scan-sub-label" data-i18n="scan.limits">محدودیت‌ها</label>
+            <div class="scan-limits">
+              <div>
+                <label class="field-label" for="scanConc" data-i18n="scan.conc">هم‌زمان</label>
+                <input type="number" id="scanConc" class="input" dir="ltr" min="1" max="64" />
+              </div>
+              <div>
+                <label class="field-label" for="scanBatch" data-i18n="scan.batch">اندازهٔ دسته</label>
+                <input type="number" id="scanBatch" class="input" dir="ltr" min="1" max="50" />
+              </div>
+              <div>
+                <label class="field-label" for="scanSamples" data-i18n="scan.samples">نمونهٔ تأخیر</label>
+                <input type="number" id="scanSamples" class="input" dir="ltr" min="1" max="10" />
+              </div>
+              <div>
+                <label class="field-label" for="scanDownMb" data-i18n="scan.downMb">حجم دانلود (MB)</label>
+                <input type="number" id="scanDownMb" class="input" dir="ltr" min="1" max="500" />
+              </div>
+              <div>
+                <label class="field-label" for="scanDownHost" data-i18n="scan.downHost">هاست دانلود</label>
+                <input type="text" id="scanDownHost" class="input" dir="ltr" spellcheck="false" />
+              </div>
+              <div>
+                <label class="field-label" for="scanDownPath" data-i18n="scan.downPath">مسیر دانلود</label>
+                <input type="text" id="scanDownPath" class="input" dir="ltr" spellcheck="false" data-i18n-ph="scan.downPathPh" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card scan-run">
+          <div class="scan-run-row">
+            <button class="btn primary" id="btnScanStart" data-i18n="scan.start">شروع اسکن</button>
+            <button class="btn ghost" id="btnScanStop" data-i18n="scan.stop" disabled>توقف</button>
+            <!-- the bar itself IS the fill: the wrapper is the track -->
+            <div class="scan-bar"><span class="scan-bar-fill" id="scanProgress"></span></div>
+            <span class="scan-prog-text" id="scanProgressText"></span>
+          </div>
+          <p class="hint warn scan-error" id="scanError" hidden></p>
+        </div>
+
+        <div class="card scan-results">
+          <div class="sec">
+            <span class="sec-label" data-i18n="scan.results">نتیجه‌ها</span>
+            <div class="head-actions">
+              <button class="btn ghost small" id="btnScanRetop" data-i18n="scan.retop">تست دوبارهٔ بهترین‌ها</button>
+              <input type="number" id="scanRetopN" class="input scan-num" dir="ltr" min="1" max="500" value="10" data-i18n-title="scan.retopN" />
+              <button class="btn ghost small" id="btnScanExportCsv" data-i18n="scan.exportCsv">خروجی CSV</button>
+              <button class="btn ghost small" id="btnScanExportJson" data-i18n="scan.exportJson">خروجی JSON</button>
+              <button class="btn ghost small" id="btnScanClear" data-i18n="scan.clear">پاک کردن</button>
+            </div>
+          </div>
+          <!-- eleven columns never fit 900px: the table scrolls inside this
+               wrapper so the page itself never grows sideways -->
+          <div class="scan-table-wrap">
+            <table class="scan-table" id="scanTable">
+              <thead>
+                <tr>
+                  <th class="scan-th" data-sort="ip"><span data-i18n="scan.col.ip">IP</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="engine"><span data-i18n="scan.col.engine">هسته</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="tcp"><span data-i18n="scan.col.tcp">TCP</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="avg"><span data-i18n="scan.col.avg">تأخیر</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="min"><span data-i18n="scan.col.min">کمینه</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="jitter"><span data-i18n="scan.col.jitter">جیتر</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="loss"><span data-i18n="scan.col.loss">اتلاف</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="down"><span data-i18n="scan.col.down">دانلود</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="up"><span data-i18n="scan.col.up">آپلود</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="score"><span data-i18n="scan.col.score">امتیاز</span><span class="scan-sort"></span></th>
+                  <th class="scan-th scan-th-acts"><span data-i18n="scan.col.actions">کارها</span></th>
+                </tr>
+              </thead>
+              <tbody id="scanTbody"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="scanEmpty" data-i18n="scan.empty">هنوز نتیجه‌ای نیست.</div>
+        </div>
       </section>
 
       <!-- SETTINGS -->
