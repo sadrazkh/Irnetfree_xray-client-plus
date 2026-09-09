@@ -1,1 +1,327 @@
-/* plus: the Server tab (#view-xserver) — tokens only, logical properties, filled in by task R1 */
+/* plus: the Server tab (#view-xserver) — tokens only, logical properties */
+
+/* =========================================================================
+   Everything on this page is a row of small facts about one thing: an inbound
+   is a badge, a name, an address, a transport, a count and a meter; a user is
+   a name, a secret, an expiry and a bar. Rows like that cannot be a fixed
+   grid — at the window's own 900px minimum the content column is about 680px
+   and eight columns of figures do not fit — so every one of them is a flex row
+   that wraps, and the page never grows sideways.
+   ========================================================================= */
+
+.xs-card { margin-block-end: 16px; }
+
+/* ----------------------------- the head ----------------------------- */
+
+.xs-status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-block-end: 16px;
+}
+.xs-run-actions { margin-inline-start: auto; }
+
+/* the state, in one word, coloured by what it says */
+.xs-pill {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 5px 12px;
+  border-radius: var(--r2);
+  border: 1px solid var(--softline);
+  background: var(--soft);
+  color: var(--dim);
+  white-space: nowrap;
+}
+.xs-pill[data-state="running"] { color: var(--ok); border-color: var(--ok); background: var(--okSoft); }
+.xs-pill[data-state="starting"] { color: var(--warn); border-color: var(--warn); }
+.xs-pill[data-state="error"] { color: var(--danger); border-color: var(--danger); background: var(--dangerSoft); }
+
+.xs-run-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  direction: ltr;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+.xs-uptime { color: var(--ink2); }
+
+.xs-head-grid { margin-block-end: 12px; }
+/* a label that follows a block instead of opening a card needs air above it */
+.xs-sub-label { margin-block-start: 14px; }
+
+/* ----------------------------- inbound cards ----------------------------- */
+
+.xs-inbounds { display: flex; flex-direction: column; gap: 12px; }
+.xs-inbounds:empty { display: none; }
+
+.xs-in-card {
+  margin-block-end: 0;
+  padding: 12px 14px;
+  background: var(--soft);
+}
+.xs-in-card.disabled { opacity: .55; }
+
+.xs-in-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.xs-in-name {
+  font-size: 13px;
+  font-weight: 600;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+.xs-in-addr {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accentInk);
+  direction: ltr;
+  white-space: nowrap;
+}
+.xs-in-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  direction: ltr;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+.xs-in-traffic {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink2);
+  direction: ltr;
+  white-space: nowrap;
+}
+/* the switch and the buttons hold the end of the row; on a narrow window they
+   wrap together rather than splitting across two lines */
+.xs-in-sw { margin-inline-start: auto; }
+.xs-in-actions { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+
+/* ----------------------------- client rows ----------------------------- */
+
+.xs-clients {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-block-start: 10px;
+}
+.xs-no-clients {
+  font-size: 11px;
+  color: var(--dim);
+  padding-block: 8px;
+}
+
+.xs-cl-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: var(--r3);
+  border: 1px solid transparent;
+  background: var(--panel);
+}
+.xs-cl-row:hover { border-color: var(--softline); }
+.xs-cl-row.disabled { opacity: .5; }
+
+/* a counter that moved in the last tick — the only "live" thing on the page */
+.xs-cl-dot {
+  inline-size: 7px;
+  block-size: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+  flex: 0 0 auto;
+}
+.xs-cl-dot[data-online="1"] { background: var(--ok); box-shadow: 0 0 0 3px var(--okSoft); }
+
+.xs-cl-name {
+  font-size: 12px;
+  font-weight: 600;
+  min-inline-size: 70px;
+  overflow-wrap: anywhere;
+}
+.xs-cl-secret {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  direction: ltr;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.xs-cl-secret:hover { color: var(--accentInk); }
+.xs-cl-exp {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  direction: ltr;
+  white-space: nowrap;
+}
+
+/* the meter: a track only when there is a quota to measure against */
+.xs-cl-quota {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 150px;
+  min-inline-size: 110px;
+}
+.xs-cl-quota .usage-bar { flex: 1 1 auto; min-inline-size: 40px; }
+.xs-cl-used {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  direction: ltr;
+  white-space: nowrap;
+}
+
+/* why the enforcer switched this user off */
+.xs-cl-flag {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  padding: 2px 6px;
+  border-radius: var(--r2);
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  white-space: nowrap;
+}
+.xs-cl-sw { margin-inline-start: auto; }
+.xs-cl-actions { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+.xs-cl-actions .icon-btn { font-size: 12px; padding: 3px 5px; }
+
+/* ----------------------------- the reverse pair ----------------------------- */
+
+.xs-diagram {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 14px;
+  margin-block: 14px;
+  background: var(--soft);
+  border: 1px solid var(--softline);
+  border-radius: var(--r5);
+}
+.xs-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  min-inline-size: 110px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r5);
+}
+.xs-node-ico { font-size: 18px; line-height: 1.2; }
+.xs-node-name { font-size: 11px; color: var(--ink3); }
+.xs-node-role {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accentInk);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+/* the flow reads start-to-end, so the glyph mirrors with the document */
+.xs-arrow { font-size: 20px; color: var(--accent); }
+[dir="rtl"] .xs-arrow { transform: scaleX(-1); }
+
+.xs-seg { margin-block-end: 12px; }
+.xs-mount { display: block; }
+/* the searchable picker is a button-width element by default; here it owns the row */
+.xs-mount .ss { display: block; inline-size: 100%; }
+.xs-rev-actions { margin-block-start: 14px; }
+
+.xs-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.xs-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  background: var(--soft);
+  border: 1px solid var(--softline);
+  border-radius: var(--r4);
+  cursor: pointer;
+  transition: border-color 140ms ease-out;
+}
+.xs-check:hover { border-color: var(--dim); }
+.xs-check input { accent-color: var(--accent); margin: 0; }
+.xs-check-label { font-size: 12px; font-weight: 600; color: var(--ink2); }
+
+/* a field with a button glued to its end (generate, copy, QR) */
+.xs-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.xs-row .input { flex: 1 1 auto; min-inline-size: 0; }
+.xs-gen-row { margin-block-start: 10px; }
+
+/* ----------------------------- log and errors ----------------------------- */
+
+.xs-log {
+  max-block-size: 34vh;
+  overflow: auto;
+}
+.xs-preview {
+  max-block-size: 52vh;
+  overflow: auto;
+  white-space: pre;
+}
+
+.xs-errors {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.xs-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+.xs-error-path {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--danger);
+  direction: ltr;
+  white-space: nowrap;
+}
+.xs-error-msg { color: var(--ink2); line-height: 1.6; }
+
+/* the card a refused path belongs to, and the message under it */
+.xs-invalid { border-color: var(--danger); }
+.xs-card-err { color: var(--danger); }
+
+.xs-qr-fallback { padding: 24px 8px; }
+
+/* ----------------------------- narrow window ----------------------------- */
+
+/* At the app's own minimum the head's three controls and the inbound toolbars
+   are the first things to run out of room: let them take the whole line rather
+   than squeeze the name they sit next to. */
+@media (max-width: 1100px) {
+  .xs-run-actions { margin-inline-start: 0; inline-size: 100%; }
+  .xs-in-sw, .xs-cl-sw { margin-inline-start: 0; }
+  .xs-head-grid { grid-template-columns: minmax(0, 1fr); }
+}
