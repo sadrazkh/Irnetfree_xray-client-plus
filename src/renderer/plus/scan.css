@@ -1,1 +1,236 @@
 /* plus: the IP-scan tab (#view-scan) — tokens only, logical properties, filled in by task R2 */
+
+/* =========================================================================
+   The form is three cards that share a row when there is room and stack when
+   there is not; 900px is the window's own minimum, and at that width the
+   content column is barely 500px, so nothing here may declare a fixed size.
+   The results table is the one thing that cannot fold — eleven columns of
+   figures — so it scrolls inside its own wrapper and the page never grows
+   sideways.
+   ========================================================================= */
+
+.scan-forms {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+/* the cards already carry the gap; their own bottom margin would double it */
+.scan-card { margin-block-end: 0; }
+
+.scan-seg { margin-block-end: 12px; }
+.scan-src { min-inline-size: 0; }
+.scan-mount { display: block; }
+/* the picker is a button-width element by default; here it owns the row */
+.scan-mount .ss { display: block; inline-size: 100%; }
+
+.scan-ips { min-block-size: 130px; }
+.scan-ip-actions { align-items: center; margin-block-start: 10px; }
+.scan-num { inline-size: 82px; flex: 0 0 auto; }
+.scan-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  margin-inline-start: auto;
+  white-space: nowrap;
+}
+
+/* ----------------------------- check rows ----------------------------- */
+
+.scan-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-block-end: 4px;
+}
+.scan-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  background: var(--soft);
+  border: 1px solid var(--softline);
+  border-radius: var(--r4);
+  cursor: pointer;
+  transition: border-color 140ms ease-out, background 140ms ease-out;
+}
+.scan-check:hover { border-color: var(--dim); }
+.scan-check.disabled { opacity: .55; cursor: not-allowed; }
+.scan-check.disabled:hover { border-color: var(--softline); }
+.scan-check input { accent-color: var(--accent); margin: 0; }
+.scan-check-label { font-size: 12px; font-weight: 600; color: var(--ink2); }
+.scan-check-hint {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--warn);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+/* the second and third headings inside the tests card need air above them */
+.scan-sub-label { margin-block-start: 14px; }
+
+.scan-limits {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+}
+.scan-limits .field-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ----------------------------- run row ----------------------------- */
+
+.scan-run { margin-block-start: 16px; }
+.scan-run-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+/* the track; #scanProgress is the fill inside it */
+.scan-bar {
+  flex: 1 1 180px;
+  min-inline-size: 120px;
+  block-size: 6px;
+  background: var(--line);
+  border-radius: var(--r1);
+  overflow: hidden;
+}
+.scan-bar-fill {
+  display: block;
+  block-size: 100%;
+  inline-size: 0;
+  background: var(--accent);
+  border-radius: var(--r1);
+  transition: inline-size 200ms ease-out;
+}
+.scan-prog-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink2);
+  direction: ltr;
+  white-space: nowrap;
+  min-inline-size: 110px;
+  text-align: end;
+}
+.scan-error { margin-block-start: 10px; }
+
+/* ----------------------------- results ----------------------------- */
+
+.scan-results .sec { margin-block-end: 10px; }
+/* the rule of the .sec heading runs between the label and the toolbar */
+.scan-results .sec .head-actions { order: 3; }
+
+.scan-table-wrap {
+  max-block-size: 52vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r5);
+}
+.scan-table {
+  inline-size: 100%;
+  /* Measured: eleven columns of figures need 660px, and the content column at
+     the app's own 900px minimum is 678px — so at the narrowest window the whole
+     table is still visible. Narrower than that (the headless panel on a phone)
+     the wrapper scrolls, never the page. */
+  min-inline-size: 660px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.scan-table thead th {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  background: var(--panel);
+  /* a collapsed border belongs to the table and scrolls away under a sticky
+     header; an inset shadow travels with the cell */
+  box-shadow: inset 0 -1px 0 var(--line);
+}
+.scan-th {
+  padding: 9px 8px;
+  text-align: start;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink3);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.scan-th:hover { color: var(--ink); }
+.scan-th.active { color: var(--accentInk); }
+.scan-th-acts { cursor: default; text-align: end; }
+.scan-th-acts:hover { color: var(--ink3); }
+.scan-sort { font-size: 9px; margin-inline-start: 4px; }
+
+.scan-row { border-block-end: 1px solid var(--line); }
+.scan-row:last-child { border-block-end: 0; }
+.scan-row:hover { background: var(--soft); }
+/* a row that measured nothing usable is still worth seeing, just not first */
+.scan-row-dead { opacity: .6; }
+
+.scan-row td { padding: 5px 8px; }
+.scan-c-ip {
+  font-family: var(--mono);
+  font-size: 12px;
+  direction: ltr;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.scan-c-ip:hover { color: var(--accentInk); }
+.scan-c-eng {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  white-space: nowrap;
+}
+.scan-n {
+  font-family: var(--mono);
+  font-size: 12px;
+  direction: ltr;
+  text-align: end;
+  white-space: nowrap;
+  color: var(--ink2);
+}
+
+/* the cell stays a table cell — a `display: flex` on a <td> drops it out of the
+   column grid — and the bar and the figure share a wrapper inside it */
+.scan-c-score { min-inline-size: 110px; }
+.scan-score-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.scan-score-bar {
+  flex: 1 1 auto;
+  min-inline-size: 40px;
+  block-size: 5px;
+  background: var(--line);
+  border-radius: var(--r1);
+  overflow: hidden;
+}
+.scan-score-fill {
+  display: block;
+  block-size: 100%;
+  inline-size: 0;
+  background: var(--accent);
+  border-radius: var(--r1);
+}
+.scan-score-val {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  direction: ltr;
+  min-inline-size: 42px;
+  text-align: end;
+}
+
+.scan-c-acts {
+  white-space: nowrap;
+  text-align: end;
+}
+.scan-c-acts .icon-btn { font-size: 12px; padding: 3px 5px; }
+
+/* Narrow window: the toolbar of the results card is the first thing to run
+   out of room, so it wraps under its own heading instead of pushing the card. */
+@media (max-width: 1100px) {
+  .scan-results .sec { flex-wrap: wrap; }
+  .scan-results .sec .head-actions { inline-size: 100%; }
+}
