@@ -155,6 +155,108 @@ for (const [name, [plan, over]] of Object.entries(shapes)) {
   }
 }
 
+// Server-tab shapes (plus): every golden inbound, the exit through a stored
+// config, a bridge and a portal of the VLESS reverse proxy — and, for each
+// golden inbound, the CLIENT config its share link parses into, so the link a
+// user copies is proven to dial in a form the core takes. The TLS inbounds
+// need real files (the core reads them at load), so the self-signed pair from
+// tests/fixtures is written to the work dir. Nothing listens: `-test` only.
+let srvTotal = 0, srvFailed = 0;
+{
+  const X = require('../src/main/xserver/config');
+  const { buildTestConfig } = require('../src/main/configBuilder');
+  const { parseLink } = require('../src/main/parser');
+  const pem = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'tests', 'fixtures', 'selfsigned.json'), 'utf8'));
+  const certFile = path.join(work, 'server.crt'), keyFile = path.join(work, 'server.key');
+  fs.writeFileSync(certFile, pem.certificate.join('\n') + '\n');
+  fs.writeFileSync(keyFile, pem.key.join('\n') + '\n');
+  for (const [name, cfg] of serverShapes({ certFile, keyFile })) {
+    total++; srvTotal++;
+    const file = path.join(work, `server-${name}.json`);
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+    const r = spawnSync(exe, ['run', '-test', '-c', file], {
+      env: Object.assign({}, process.env, { XRAY_LOCATION_ASSET: assetDir, V2RAY_LOCATION_ASSET: assetDir }),
+      encoding: 'utf8', timeout: 15000, windowsHide: true
+    });
+    if (r.status === 0) { console.log('ok   ' + path.basename(file)); continue; }
+    failed++; srvFailed++;
+    console.log('FAIL ' + path.basename(file));
+    console.log('     ' + ((r.stdout || '') + (r.stderr || '')).trim().split(/\r?\n/).slice(-3).join('\n     '));
+  }
+
+  function serverShapes({ certFile, keyFile }) {
+    const PRIV = 'kOp0Yl1o8m6ZgFh3EiXJ5gMt3dY8hbz2j6wMv3aEp2A';
+    const PUB = 'D5UJIsDIIYFaaZxWaOsbUmB-uLE2OgOV1r-qyBHIsyI';
+    const tls = { certFile, keyFile, serverName: 'a.example.com', alpn: ['h2', 'http/1.1'] };
+    const reality = { dest: 'www.microsoft.com:443', serverNames: ['www.microsoft.com'], privateKey: PRIV, publicKey: PUB, shortIds: [X.randomShortId()] };
+    const alice = (protocol, over) => X.newClient(protocol, Object.assign({ email: 'alice' }, over || {}));
+    // Every inbound listens on loopback at a high port; -test binds nothing anyway.
+    const inb = (protocol, over, clients) => X.newInbound(protocol, Object.assign({ listen: '127.0.0.1' }, over, { clients: clients || [alice(protocol, over && over.ss ? { method: over.ss.method } : null)] }));
+    const golden = {
+      'vless-tcp-reality': inb('vless', { port: 47443, security: 'reality', reality }, [alice('vless', { flow: 'xtls-rprx-vision' })]),
+      'vless-ws-tls': inb('vless', { port: 47444, network: 'ws', path: '/ws', host: 'cdn.example.com', security: 'tls', tls }),
+      'vless-grpc-tls': inb('vless', { port: 47445, network: 'grpc', serviceName: 'svc', security: 'tls', tls }),
+      'vless-grpc-reality': inb('vless', { port: 47455, network: 'grpc', serviceName: 'svc', security: 'reality', reality }),
+      'vless-xhttp-none': inb('vless', { port: 47446, network: 'xhttp', path: '/x', host: 'x.example.com', security: 'none' }),
+      'vless-xhttp-reality': inb('vless', { port: 47456, network: 'xhttp', path: '/x', host: '', security: 'reality', reality }),
+      'vmess-ws-none': inb('vmess', { port: 47447, network: 'ws', path: '/v', host: '' }),
+      'vmess-tcp-tls': inb('vmess', { port: 47457, network: 'tcp', security: 'tls', tls }),
+      'trojan-tcp-tls': inb('trojan', { port: 47448, security: 'tls', tls }),
+      'trojan-ws-tls': inb('trojan', { port: 47458, network: 'ws', path: '/t', security: 'tls', tls }),
+      'ss-2022-128': inb('shadowsocks', { port: 47388, ss: { method: '2022-blake3-aes-128-gcm', password: X.randomKeyFor('2022-blake3-aes-128-gcm') } }),
+      'ss-2022-256': inb('shadowsocks', { port: 47389, ss: { method: '2022-blake3-aes-256-gcm', password: X.randomKeyFor('2022-blake3-aes-256-gcm') } }),
+      'ss-aes-256-gcm': inb('shadowsocks', { port: 47390, ss: { method: 'aes-256-gcm', password: '' } }),
+      'ss-chacha20': inb('shadowsocks', { port: 47391, ss: { method: 'chacha20-ietf-poly1305', password: '' } })
+    };
+    // Client names are unique across a server, so the combined models below can hold every golden inbound at once.
+    for (const [name, i] of Object.entries(golden)) i.clients[0].email = name;
+    const model = (over) => X.normalizeModel(Object.assign({ publicAddress: '203.0.113.9', blockPrivate: true, blockTorrent: true }, over));
+    const build = (m, over) => X.buildServerConfig(m, Object.assign({ apiPort: 47095, servers: [F.VLESS_WS_TLS, F.TROJAN_TCP_TLS], geoAvailable: true }, over || {}));
+    const out = [];
+    for (const [name, i] of Object.entries(golden)) {
+      const m = model({ inbounds: [i] });
+      const v = X.validateModel(m, { servers: [] });
+      if (!v.ok) throw new Error(`server shape ${name} does not validate: ${JSON.stringify(v.errors)}`);
+      out.push([name, build(m)]);
+      // the client that this inbound's link produces, dialling it
+      out.push(['client-' + name, buildTestConfig(parseLink(X.clientLink(i, i.clients[0], m)), 47001)]);
+    }
+    const all = Object.values(golden);
+    out.push(['all-nogeo', build(model({ inbounds: all }), { geoAvailable: false })]);
+    out.push(['exit-server-pinned', build(model({ inbounds: [golden['vless-xhttp-none']], exit: { type: 'server', serverId: 'sv-vless' } }),
+      { servers: [Object.assign({}, F.VLESS_WS_TLS, { certPin: 'ab11bf7ac877baa539294f5a3c864b8ed43e6fe3a9a8230fc2db7fff85c27fde' })] })]);
+    out.push(['exit-server-fragment', build(model({ inbounds: [golden['vless-xhttp-none']], exit: { type: 'server', serverId: 'sv-frag' } }),
+      { servers: [F.vlessWithMarkers('sv-frag', { _fragment: 'tlshello,100-200,10-20' })] })]);
+    // bridges: a plain portal link, a reality+vision one, one with the anti-DPI dialer, a stored ws+tls config
+    const uuid = X.newClient('vless').uuid;
+    const sid = X.randomShortId();
+    out.push(['bridge-link', build(model({ inbounds: [golden['vless-ws-tls']], reverse: { role: 'bridge', bridge: { via: 'link', link: `vless://${uuid}@203.0.113.9:47450?encryption=none&type=tcp&security=none#portal` } } }))]);
+    out.push(['bridge-link-reality-vision', build(model({ reverse: { role: 'bridge', bridge: { via: 'link', link: `vless://${uuid}@203.0.113.9:47443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUB}&sid=${sid}#portal` } } }))]);
+    out.push(['bridge-link-fragment', build(model({ reverse: { role: 'bridge', bridge: { via: 'link', link: `vless://${uuid}@203.0.113.9:47450?encryption=none&type=tcp&security=none&fragment=tlshello,100-200,10-20#portal` } } }))]);
+    out.push(['bridge-server', build(model({ reverse: { role: 'bridge', bridge: { via: 'server', serverId: 'sv-vless' } } }))]);
+    // portal: a reality+vision interconn with two bridge clients, three user inbounds, one inbound left local
+    const interconn = inb('vless', { port: 47450, security: 'reality', reality }, [alice('vless', { email: 'bridge1', flow: 'xtls-rprx-vision' }), alice('vless', { email: 'bridge2' })]);
+    const users = [golden['vless-ws-tls'], golden['vless-grpc-tls'], golden['trojan-tcp-tls']];
+    const local = golden['ss-2022-128'];
+    const portal = model({ inbounds: [interconn, ...users, local], reverse: { role: 'portal', portal: { interconnInboundId: interconn.id, userInboundIds: users.map(u => u.id) } } });
+    const pv = X.validateModel(portal, { servers: [] });
+    if (!pv.ok) throw new Error('portal shape does not validate: ' + JSON.stringify(pv.errors));
+    out.push(['portal', build(portal)]);
+    out.push(['portal-nogeo-exit-server', build(Object.assign({}, portal, { exit: { type: 'server', serverId: 'sv-trojan' } }), { geoAvailable: false })]);
+    // the other side's snippets, wrapped into runnable configs
+    const bridgeHere = model({ reverse: { role: 'bridge', bridge: { via: 'link', link: `vless://${uuid}@203.0.113.9:47443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUB}&sid=${sid}#portal` } } });
+    const forPortal = X.otherSideSnippet(bridgeHere).snippet;
+    forPortal.inbounds[0].tag = 'interconn-in'; forPortal.inbounds[0].listen = '127.0.0.1';
+    forPortal.inbounds[0].streamSettings.realitySettings.privateKey = PRIV;
+    forPortal.routing.rules[0].inboundTag = ['users-in'];
+    forPortal.inbounds.push({ tag: 'users-in', listen: '127.0.0.1', port: 47461, protocol: 'vless', settings: { clients: [{ id: uuid, email: 'u' }], decryption: 'none' }, streamSettings: { network: 'tcp', security: 'none' } });
+    out.push(['other-side-for-portal', Object.assign({ log: { loglevel: 'warning' }, outbounds: [{ tag: 'direct', protocol: 'freedom' }] }, forPortal)]);
+    const forBridge = X.otherSideSnippet(portal).snippet;
+    out.push(['other-side-for-bridge', Object.assign({ log: { loglevel: 'warning' } }, forBridge)]);
+    return out;
+  }
+}
+
 // sing-box TUN configs (phase 3): ipv6 × strict × exclusions (a v4 and a v6
 // entry → /32 and /128), plus the darwin shape — no interface_name, because
 // sing-tun there only accepts utun<N> and names the device itself.
@@ -184,6 +286,6 @@ if (sb) {
   }
 }
 
-const by = path.basename(exe) + (sb ? ` + ${path.basename(sb)} (${sbTotal - sbFailed}/${sbTotal} TUN configs)` : '');
+const by = path.basename(exe) + ` (${srvTotal - srvFailed}/${srvTotal} server shapes)` + (sb ? ` + ${path.basename(sb)} (${sbTotal - sbFailed}/${sbTotal} TUN configs)` : '');
 console.log(`\n${total - failed}/${total} configs accepted by ${by}`);
 process.exit(failed ? 1 : 0);

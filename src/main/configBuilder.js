@@ -912,3 +912,4 @@ function fragRange(v, def, floor) {
 }
 
 module.exports = { buildConfig, buildPoolConfig, buildTestConfig, buildMultiTestConfig, buildRoutingRules, buildChainOutbounds, resolverBypassIps, resolverBypassIpsOf, wgResolvers, wgEndpointHosts };
+Object.assign(module.exports, { cloneOut, applyFragments, PRIVATE_IPS }); // plus
