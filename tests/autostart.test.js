@@ -9,20 +9,23 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { schtasksCreateArgs, schtasksDeleteArgs, schtasksQueryArgs, autostartExe, TASK } = require('../src/main/autostart');
 
-const INSTALLED = 'C:\\Program Files\\IRNetFree\\IRNetFree.exe';
+const INSTALLED = 'C:\\Program Files\\IRNetFree Plus\\IRNetFree Plus.exe';
 
 test('the logon task runs the exe hidden with highest privileges, replacing any older task', () => {
   assert.deepEqual(schtasksCreateArgs(INSTALLED), [
-    '/Create', '/TN', 'IRNetFree', '/SC', 'ONLOGON', '/RL', 'HIGHEST', '/IT', '/F',
+    '/Create', '/TN', 'IRNetFreePlus', '/SC', 'ONLOGON', '/RL', 'HIGHEST', '/IT', '/F',
     '/TR', '"' + INSTALLED + '" --hidden'
   ]);
-  assert.deepEqual(schtasksDeleteArgs(), ['/Delete', '/TN', 'IRNetFree', '/F']);
-  assert.deepEqual(schtasksQueryArgs(), ['/Query', '/TN', 'IRNetFree']);
-  assert.equal(TASK, 'IRNetFree', 'a fixed name: a reinstall replaces the task instead of adding one');
+  assert.deepEqual(schtasksDeleteArgs(), ['/Delete', '/TN', 'IRNetFreePlus', '/F']);
+  assert.deepEqual(schtasksQueryArgs(), ['/Query', '/TN', 'IRNetFreePlus']);
+  // plus: a fixed name, and NOT the original's 'IRNetFree' — the two apps
+  // install side by side and must each keep their own logon task.
+  assert.equal(TASK, 'IRNetFreePlus', 'a fixed name: a reinstall replaces the task instead of adding one');
+  assert.notEqual(TASK, 'IRNetFree', 'the original IRNetFree owns that task name');
 });
 
 test('the portable build names its real file; the installed build is its own exe', () => {
-  const portable = 'D:\\apps\\IRNetFree-Portable.exe';
-  assert.equal(autostartExe({ PORTABLE_EXECUTABLE_FILE: portable }, 'C:\\Temp\\extracted\\IRNetFree.exe'), portable);
+  const portable = 'D:\\apps\\IRNetFree-Plus-Portable.exe';
+  assert.equal(autostartExe({ PORTABLE_EXECUTABLE_FILE: portable }, 'C:\\Temp\\extracted\\IRNetFree Plus.exe'), portable);
   assert.equal(autostartExe({}, INSTALLED), INSTALLED);
 });

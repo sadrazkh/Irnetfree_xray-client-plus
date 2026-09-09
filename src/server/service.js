@@ -45,8 +45,10 @@ const { createXServer } = require('../main/xserver');   // plus: the Server tab
 const { createScan } = require('../main/scan');         // plus: the IP-scan tab
 
 const DEFAULT_SETTINGS = {
-  socksPort: 10808,
-  httpPort: 10809,
+  // Plus: shifted so it can run next to the original IRNetFree, which holds
+  // 10808/10809/10085 on the same machine.
+  socksPort: 10818,
+  httpPort: 10819,
   allowLan: false,           // loopback only, like the desktop. `ssh -L` reaches a loopback
                              // bind fine; 0.0.0.0 would make the auth-less SOCKS port an
                              // open relay on a VPS. The user opts in under Settings → LAN.
@@ -61,7 +63,7 @@ const DEFAULT_SETTINGS = {
   dnsDirect: ['178.22.122.100', '185.51.200.2'],
   ipv6: false,
   logLevel: 'warning',
-  apiPort: 10085,
+  apiPort: 10095,            // Plus: shifted, same reason as the two ports above
   systemProxy: false,        // headless: no desktop session to set a system proxy for
   // Whole-system tunnelling is the point of the app, so it is the default.
   // It needs a backend (sing-box, or the legacy tun2socks) and admin rights;
@@ -110,10 +112,12 @@ const DEFAULT_SETTINGS = {
 };
 
 function defaultDataDir() {
+  // plus: its own folder, so a headless Plus does not read and rewrite the
+  // original IRNetFree's store on a machine that runs both.
   const base = process.env.IRNETFREE_DATA
     || (process.platform === 'win32'
-      ? path.join(process.env.APPDATA || os.homedir(), 'IRNetFree')
-      : path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'irnetfree'));
+      ? path.join(process.env.APPDATA || os.homedir(), 'IRNetFree Plus')
+      : path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'irnetfree-plus'));
   fs.mkdirSync(base, { recursive: true });
   return base;
 }

@@ -1,7 +1,7 @@
 {
-  "name": "irnetfree",
-  "version": "1.5.0",
-  "description": "IRNetFree — a clean, modern desktop VPN client for Xray configs (proxy, tunnel, routing, ping & IP check)",
+  "name": "irnetfree-plus",
+  "version": "2.0.0",
+  "description": "IRNetFree Plus — a clean, modern desktop VPN client for Xray configs (proxy, tunnel, routing, ping & IP check) that adds a local Xray server tab (reverse proxy, inbounds, clients) and an IP scanner",
   "main": "src/main/main.js",
   "author": {
     "name": "IRNetFree",
@@ -26,8 +26,8 @@
     "pack": "electron-builder --dir"
   },
   "build": {
-    "appId": "com.irnetfree.client",
-    "productName": "IRNetFree",
+    "appId": "com.irnetfree.plus",
+    "productName": "IRNetFree Plus",
     "copyright": "Copyright © IRNetFree",
     "files": [
       "src/**/*",
@@ -55,13 +55,13 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "IRNetFree",
+      "shortcutName": "IRNetFree Plus",
       "installerIcon": "assets/icon.ico",
       "uninstallerIcon": "assets/icon.ico",
-      "artifactName": "IRNetFree-Setup-${version}.${ext}"
+      "artifactName": "IRNetFree-Plus-Setup-${version}.${ext}"
     },
     "portable": {
-      "artifactName": "IRNetFree-Portable-${version}.${ext}"
+      "artifactName": "IRNetFree-Plus-Portable-${version}.${ext}"
     },
     "mac": {
       "icon": "assets/icon.icns",
@@ -76,7 +76,7 @@
       ]
     },
     "dmg": {
-      "artifactName": "IRNetFree-${version}-${arch}.${ext}"
+      "artifactName": "IRNetFree-Plus-${version}-${arch}.${ext}"
     },
     "linux": {
       "icon": "assets/icon.png",
@@ -87,7 +87,7 @@
         { "target": "AppImage", "arch": ["x64"] },
         { "target": "deb", "arch": ["x64"] }
       ],
-      "artifactName": "IRNetFree-${version}-${arch}.${ext}"
+      "artifactName": "IRNetFree-Plus-${version}-${arch}.${ext}"
     }
   },
   "devDependencies": {

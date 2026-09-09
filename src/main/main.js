@@ -102,12 +102,15 @@ let appliedSettings = null;
 // than asking the OS again — with the tunnel up, the default route IS the tunnel.
 let liveDirectInterface = null;
 
-// GitHub repo used for the in-app update check (see app:checkUpdate).
-const GITHUB_REPO = 'sadrazkh/Irnetfree_xray-client';
+// GitHub repo used for the in-app update check (see app:checkUpdate) and by the
+// guard that decides which download URL is a release asset of THIS app.
+const APP_REPO = 'sadrazkh/Irnetfree_xray-client-plus';   // plus: Plus publishes its own releases
 
 const DEFAULT_SETTINGS = {
-  socksPort: 10808,
-  httpPort: 10809,
+  // Plus: shifted so it can run next to the original IRNetFree, which holds
+  // 10808/10809/10085 on the same machine.
+  socksPort: 10818,
+  httpPort: 10819,
   allowLan: false,
   routingMode: 'global',
   blockAds: true,
@@ -120,7 +123,7 @@ const DEFAULT_SETTINGS = {
   dnsDirect: ['178.22.122.100', '185.51.200.2'],
   ipv6: false,
   logLevel: 'warning',
-  apiPort: 10085,
+  apiPort: 10095,   // Plus: shifted, same reason as the two ports above
   systemProxy: true,
   // Whole-system tunnelling is the point of the app, so it is the default.
   // It needs a backend (sing-box, or the legacy tun2socks) and admin rights;
@@ -2099,7 +2102,7 @@ function registerIpc() {
   ipcMain.handle('app:checkUpdate', async () => {
     const current = app.getVersion();
     try {
-      const rel = await getJSON(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`);
+      const rel = await getJSON(`https://api.github.com/repos/${APP_REPO}/releases/latest`);
       const latest = String(rel.tag_name || '').replace(/^v/i, '').trim();
       if (!latest) return { ok: false, current, error: 'no release found' };
       const asset = pickUpdateAsset(rel.assets);
@@ -2108,7 +2111,7 @@ function registerIpc() {
         current,
         latest,
         hasUpdate: cmpVersion(latest, current) > 0,
-        url: rel.html_url || `https://github.com/${GITHUB_REPO}/releases/latest`,
+        url: rel.html_url || `https://github.com/${APP_REPO}/releases/latest`,
         // the installer for this machine, and the checksum files published beside it
         asset: asset ? { name: asset.name, url: asset.browser_download_url, size: asset.size } : null,
         sums: (rel.assets || []).filter(a => a && /^SHA256SUMS.*\.txt$/i.test(String(a.name))).map(a => a.browser_download_url)
@@ -2123,7 +2126,7 @@ function registerIpc() {
   // With no checksum published for it, the file is shown, never run: opening
   // an unverified installer is exactly the step the user can take themselves.
   // The app keeps running; the installer asks it to close when it is ready.
-  const RELEASE_ASSET_URL = new RegExp(`^https://github\\.com/${GITHUB_REPO.replace(/[.]/g, '\\.')}/releases/download/`, 'i');
+  const RELEASE_ASSET_URL = new RegExp(`^https://github\\.com/${APP_REPO.replace(/[.]/g, '\\.')}/releases/download/`, 'i');
   ipcMain.handle('app:downloadUpdate', async (e, info) => {
     const asset = info && info.asset;
     if (!asset || !asset.url || !asset.name) return { ok: false, error: 'no installer for this platform' };

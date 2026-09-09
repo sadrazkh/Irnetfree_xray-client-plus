@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# IRNetFree headless (Linux/CLI) one-line installer.
+# IRNetFree Plus headless (Linux/CLI) one-line installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/sadrazkh/Irnetfree_xray-client/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sadrazkh/Irnetfree_xray-client-plus/main/install.sh | bash
 #
 # Installs the SAME app the desktop uses, but serves its web UI on a local port
 # so you can drive it from a GUI-less server (forward the port with `ssh -L`).
@@ -13,12 +13,14 @@
 #   --service         install & enable a systemd service (needs sudo/root)
 #   --port <n>        web UI port (default 6969)
 #   --host <addr>     bind address (default 127.0.0.1; use 0.0.0.0 to expose)
-#   --dir <path>      install dir (default ~/.irnetfree)
+#   --dir <path>      install dir (default ~/.irnetfree-plus)
 set -euo pipefail
 
-REPO="sadrazkh/Irnetfree_xray-client"
+# plus: the fork's own repository and its own install dir, so this can be
+# installed next to a headless original IRNetFree without overwriting it.
+REPO="sadrazkh/Irnetfree_xray-client-plus"
 BRANCH="main"
-DIR="${HOME}/.irnetfree"
+DIR="${HOME}/.irnetfree-plus"
 PORT="6969"
 HOST="127.0.0.1"
 DO_START=0
@@ -71,12 +73,12 @@ fi
 say "Using Node: $($NODE -v)  ($NODE)"
 
 # ----------------------------- app source -----------------------------
-say "Fetching IRNetFree source (${BRANCH})…"
+say "Fetching IRNetFree Plus source (${BRANCH})…"
 tmp="$(mktemp -d)"
 TARURL="https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}"
 if have curl; then curl -fsSL "$TARURL" -o "$tmp/src.tgz"; else wget -qO "$tmp/src.tgz" "$TARURL"; fi
 tar -xzf "$tmp/src.tgz" -C "$tmp"
-SRCDIR="$(find "$tmp" -maxdepth 1 -type d -name 'Irnetfree_xray-client-*' | head -n1)"
+SRCDIR="$(find "$tmp" -maxdepth 1 -type d -name 'Irnetfree_xray-client-plus-*' | head -n1)"
 [ -n "$SRCDIR" ] || err "could not extract source"
 rm -rf "$APP"; mkdir -p "$APP"
 cp -a "$SRCDIR/." "$APP/"
@@ -96,7 +98,7 @@ EOF
 chmod +x "$DIR/run.sh"
 
 # convenience symlink if ~/.local/bin is on PATH
-if [ -d "$HOME/.local/bin" ]; then ln -sf "$DIR/run.sh" "$HOME/.local/bin/irnetfree" 2>/dev/null || true; fi
+if [ -d "$HOME/.local/bin" ]; then ln -sf "$DIR/run.sh" "$HOME/.local/bin/irnetfree-plus" 2>/dev/null || true; fi
 
 echo ""
 say "Installed to: $DIR"
@@ -114,10 +116,10 @@ echo ""
 if [ "$DO_SERVICE" = "1" ]; then
   if [ "$(id -u)" != "0" ] && ! have sudo; then err "--service needs root (or sudo)"; fi
   SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
-  say "Installing systemd service irnetfree.service…"
-  $SUDO tee /etc/systemd/system/irnetfree.service >/dev/null <<EOF
+  say "Installing systemd service irnetfree-plus.service…"
+  $SUDO tee /etc/systemd/system/irnetfree-plus.service >/dev/null <<EOF
 [Unit]
-Description=IRNetFree headless server
+Description=IRNetFree Plus headless server
 After=network-online.target
 Wants=network-online.target
 
@@ -132,8 +134,8 @@ User=$(id -un)
 WantedBy=multi-user.target
 EOF
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now irnetfree.service
-  say "Service enabled. Status:  systemctl status irnetfree"
+  $SUDO systemctl enable --now irnetfree-plus.service
+  say "Service enabled. Status:  systemctl status irnetfree-plus"
 elif [ "$DO_START" = "1" ]; then
   say "Starting server (Ctrl+C to stop)…"
   exec "$DIR/run.sh"
