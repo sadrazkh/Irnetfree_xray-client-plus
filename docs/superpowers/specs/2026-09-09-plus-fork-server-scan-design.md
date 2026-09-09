@@ -121,9 +121,8 @@ give, reduced to what is practical: no web login, no multi-user panel accounts, 
   blockPrivate: true, blockTorrent: false,
   reverse: {
     role: 'off' | 'bridge' | 'portal',
-    domain: 'reverse.irnetfree.internal',           // must match on both sides
-    bridge: { via: 'server' | 'link', serverId: '', link: '' },   // how this bridge reaches the portal's interconn inbound
-    portal: { interconnInboundId: '', userInboundIds: [] }        // which inbound the bridge dials in on; which inbounds' users are forwarded through the bridge
+    bridge: { via: 'server' | 'link', serverId: '', link: '' },   // how this bridge reaches the portal's interconn inbound (VLESS)
+    portal: { interconnInboundId: '', userInboundIds: [] }        // which VLESS inbound the bridge dials in on; which inbounds' users are forwarded through the bridge
   }
 }
 ```
@@ -155,20 +154,25 @@ give, reduced to what is practical: no web login, no multi-user panel accounts, 
   2. `blockTorrent` → `{ protocol: ['bittorrent'], outboundTag: 'block' }`.
   3. Reverse rules (below).
   4. Everything else falls to the first outbound (`exit`) — no catch-all rule needed.
-- Reverse:
-  - **bridge**: `reverse.bridges: [{ tag: 'bridge', domain }]`; rules
-    `{ inboundTag: ['bridge'], domain: ['full:' + domain], outboundTag: 'interconn' }` then
-    `{ inboundTag: ['bridge'], outboundTag: 'exit' }`.
-  - **portal**: `reverse.portals: [{ tag: 'portal', domain }]`; rules
-    `{ inboundTag: [interconnTag], outboundTag: 'portal' }` and
-    `{ inboundTag: [...userTags], outboundTag: 'portal' }`. Inbounds not selected keep exiting
-    locally. Validation refuses a portal whose interconn inbound is also listed as a user inbound,
-    or has no user inbounds, or whose chosen inbounds are disabled.
+- Reverse — the **VLESS reverse proxy**, not the legacy `reverse.bridges/portals` block: the
+  patterniha 26.9.1 core already refuses the legacy block ("legacy reverse has been removed and
+  migrated to VLESS Reverse Proxy") and the official core carries the same removal, while both
+  cores in `bin/` accept the new form. There is no shared domain; the pairing is the VLESS
+  interconn credential itself.
+  - **bridge**: the `interconn` outbound is a flat VLESS outbound
+    `settings: { address, port, id, flow, encryption, reverse: { tag: 'bridge' } }` (the core refuses
+    `reverse` inside `vnext`); connections the portal hands back arrive as inbound tag `bridge`, and
+    the last rule `{ inboundTag: ['bridge'], outboundTag: 'exit' }` sends them out locally.
+  - **portal**: every enabled client of the interconn inbound carries `reverse: { tag: 'portal' }`;
+    the rule `{ inboundTag: [...userTags], outboundTag: 'portal' }` forwards the chosen inbounds'
+    users through the bridge; inbounds not selected keep exiting locally. Validation refuses a
+    non-VLESS interconn (on either side), a portal whose interconn inbound is also a user inbound
+    or has no user inbounds, disabled chosen inbounds, and a bridge with no target.
 - `validateModel(model)` → `{ ok, errors: [{ path, msg }] }`: unique tags, unique emails, port
   1–65535 and unique per listen address, TLS needs cert+key files, Reality needs private key and at
   least one serverName and shortId, ws/xhttp need a path, at least one enabled client per enabled
   inbound (an inbound with none is emitted with an empty client list and flagged as a warning, not
-  an error), reverse consistency as above, bridge needs a reachable target.
+  an error), reverse consistency as above, bridge needs a reachable VLESS target.
 
 Helpers (pure, tested): `newInbound(protocol)`, `newClient(protocol)`, `slugTag(remark, id)`,
 `randomShortId()`, `parseX25519(stdout)` (accepts the pre-26 `Private key:/Public key:` and the
@@ -241,9 +245,9 @@ Both mirrors call `xserver.stop()` in their teardown, after the client core.
 - **Inbound editor modal** and **client editor modal** with the fields of §2.1; "generate" buttons
   for keys, uuid, password, short id; Reality is the recommended default for a machine without a
   domain (hint text says why).
-- **Reverse card**: role option cards (off / bridge / portal) with a two-node diagram and the
-  domain field; bridge → stored-server picker or link paste; portal → interconn inbound select and
-  user inbound checklist; "copy the other side" button (§2.2 `otherSideSnippet`).
+- **Reverse card**: role option cards (off / bridge / portal) with a two-node diagram; bridge →
+  stored VLESS-server picker or link paste; portal → interconn (VLESS) inbound select and user
+  inbound checklist; "copy the other side" button (§2.2 `otherSideSnippet`).
 - **Exit card**: direct / through a stored config (picker), block private, block torrent.
 - Log panel (last lines, follows).
 - The nav item is `pro-only` (hidden in simple mode). Every mutation goes through `xserver:set`;
@@ -354,9 +358,10 @@ its own state in its `plusInit` hook.
   `tests/renderer.test.js` extended to the `plus/` files and i18n extensions.
 - `npm run validate` gains the server shapes (portal, bridge, reality, ws+tls, grpc, xhttp, ss)
   and runs them through `xray run -test` on both cores.
-- Live, local-only, in the implementing session: a portal core and a bridge core on 127.0.0.1,
-  a throwaway client core dialling the portal's user inbound, an HTTP fetch that succeeds only if
-  the bridge carried it; the scanner run against a local inbound with a local byte server. No
+- Live, local-only, in the implementing session: a portal core and a bridge core on 127.0.0.1
+  (VLESS reverse proxy), a throwaway client core dialling the portal's user inbound, an HTTP fetch
+  that succeeds only if the bridge carried it; the scanner run against a local inbound with a
+  local byte server. No
   firewall rule, no 0.0.0.0 bind, no system change on the owner's machine.
 
 ## 6. Out of scope (this release)
