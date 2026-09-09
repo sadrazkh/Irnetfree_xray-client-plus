@@ -71,7 +71,10 @@ function inboundDefaults() {
     network: 'tcp', path: '/', host: '', serviceName: '',
     security: 'none',
     tls: { certFile: '', keyFile: '', serverName: '', alpn: ['h2', 'http/1.1'] },
-    reality: { dest: 'www.microsoft.com:443', serverNames: ['www.microsoft.com'], privateKey: '', publicKey: '', shortIds: [] },
+    // www.cloudflare.com: www.microsoft.com fails the REALITY handshake on both
+    // cores from here ("processed invalid connection"), and the 26.9 core warns
+    // against it; Cloudflare's front answers every fingerprint the same way.
+    reality: { dest: 'www.cloudflare.com:443', serverNames: ['www.cloudflare.com'], privateKey: '', publicKey: '', shortIds: [] },
     ss: { method: '2022-blake3-aes-128-gcm', password: '' },
     sniffing: true,
     clients: []
