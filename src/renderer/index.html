@@ -463,6 +463,172 @@
       <!-- plus: SERVER (the local Xray server, src/renderer/plus/xserver.js) -->
       <section class="view" id="view-xserver">
         <div class="view-head"><h2 data-i18n="xs.title">سرور Xray</h2></div>
+        <p class="hint" data-i18n="xs.intro"></p>
+
+        <!-- 1. is it running, on what, and the buttons that decide -->
+        <div class="card xs-card">
+          <div class="xs-status-row">
+            <span class="xs-pill" id="xsState" data-state="stopped"></span>
+            <span class="xs-run-meta" id="xsEngine"></span>
+            <span class="xs-run-meta xs-uptime" id="xsUptime"></span>
+            <div class="head-actions xs-run-actions">
+              <button class="btn primary small" id="btnXsStart" data-i18n="xs.start">شروع</button>
+              <button class="btn ghost small" id="btnXsStop" data-i18n="xs.stop">توقف</button>
+              <button class="btn ghost small" id="btnXsRestart" data-i18n="xs.restart">اجرای دوباره</button>
+              <button class="btn ghost small" id="btnXsPreview" data-i18n="xs.preview">دیدن کانفیگ</button>
+            </div>
+          </div>
+          <div class="grid2 xs-head-grid">
+            <div>
+              <label class="field-label" for="xsEngineSelect" data-i18n="xs.engine">هسته</label>
+              <select id="xsEngineSelect" class="select"></select>
+            </div>
+            <div>
+              <label class="field-label" for="xsLogLevel" data-i18n="xs.logLevel">سطح لاگ</label>
+              <select id="xsLogLevel" class="select">
+                <option value="debug">debug</option>
+                <option value="info">info</option>
+                <option value="warning">warning</option>
+                <option value="error">error</option>
+                <option value="none">none</option>
+              </select>
+            </div>
+          </div>
+          <label class="field-label xs-sub-label" for="xsPublicAddr" data-i18n="xs.publicAddr">آدرس عمومی</label>
+          <input type="text" id="xsPublicAddr" class="input fixed" spellcheck="false" data-i18n-ph="xs.publicAddrPh" />
+          <p class="hint" data-i18n="xs.publicAddrHint"></p>
+          <div class="switch-row">
+            <div>
+              <div class="switch-title" data-i18n="xs.autoStart">با برنامه بالا بیاید</div>
+              <div class="switch-sub" data-i18n="xs.autoStartSub"></div>
+            </div>
+            <label class="switch"><input type="checkbox" id="xsAutoStart" /><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <!-- 2. the inbounds, each folded open over its own users -->
+        <div class="card xs-card" id="xsInboundsCard">
+          <div class="sec">
+            <span class="sec-label" data-i18n="xs.inbounds">ورودی‌ها</span>
+            <div class="head-actions">
+              <button class="btn primary small" id="btnXsAddInbound" data-i18n="xs.addInbound">ورودی تازه</button>
+            </div>
+          </div>
+          <div class="xs-inbounds" id="xsInbounds"></div>
+          <div class="empty" id="xsInboundsEmpty" data-i18n="xs.noInbounds"></div>
+          <p class="hint" id="xsFirewallHint" data-i18n="xs.firewallHint" hidden></p>
+        </div>
+
+        <!-- 3. the reverse proxy: off, this end is the bridge, this end is the portal -->
+        <div class="card xs-card" id="xsReverseCard">
+          <div class="sec"><span class="sec-label" data-i18n="xs.reverse">ریورس‌پراکسی</span></div>
+          <p class="hint" data-i18n="xs.reverseIntro"></p>
+          <!-- the <select> stays the value holder, out of sight, the way the
+               settings option-cards do; #xsReverseCards is its face -->
+          <select id="xsReverseRole" class="select vis-hidden" tabindex="-1" aria-hidden="true">
+            <option value="off" data-i18n="xs.role.off">خاموش</option>
+            <option value="bridge" data-i18n="xs.role.bridge">پل</option>
+            <option value="portal" data-i18n="xs.role.portal">پورتال</option>
+          </select>
+          <div class="opt-cards" id="xsReverseCards"></div>
+
+          <div class="xs-diagram" id="xsDiagram" hidden>
+            <span class="xs-node">
+              <span class="xs-node-ico">🖧</span>
+              <span class="xs-node-name" data-i18n="xs.diag.here">این دستگاه</span>
+              <span class="xs-node-role" id="xsDiagHere"></span>
+            </span>
+            <span class="xs-arrow">➜</span>
+            <span class="xs-node">
+              <span class="xs-node-ico">🌐</span>
+              <span class="xs-node-name" id="xsDiagThere"></span>
+              <span class="xs-node-role" id="xsDiagThereRole"></span>
+            </span>
+          </div>
+
+          <div id="xsBridgeBody" hidden>
+            <label class="field-label xs-sub-label" data-i18n="xs.bridgeVia">پورتال را چطور صدا بزند</label>
+            <div class="seg xs-seg" id="xsBridgeVia">
+              <button type="button" class="seg-btn active" data-via="server" data-i18n="xs.viaServer">یکی از کانفیگ‌های ذخیره‌شده</button>
+              <button type="button" class="seg-btn" data-via="link" data-i18n="xs.viaLink">جای‌گذاری لینک</button>
+            </div>
+            <div id="xsBridgeServerWrap">
+              <label class="field-label xs-sub-label" data-i18n="xs.bridgeServer">کانفیگ VLESS پورتال</label>
+              <div class="xs-mount" id="xsBridgeServerMount"></div>
+            </div>
+            <div id="xsBridgeLinkWrap" hidden>
+              <label class="field-label xs-sub-label" for="xsBridgeLink" data-i18n="xs.bridgeLink">لینک VLESS پورتال</label>
+              <textarea id="xsBridgeLink" class="textarea" rows="3" dir="ltr" spellcheck="false" data-i18n-ph="xs.bridgeLinkPh"></textarea>
+            </div>
+          </div>
+
+          <div id="xsPortalBody" hidden>
+            <label class="field-label xs-sub-label" for="xsPortalInterconn" data-i18n="xs.interconn">ورودی‌ای که پل روی آن وصل می‌شود</label>
+            <select id="xsPortalInterconn" class="select"></select>
+            <p class="hint" data-i18n="xs.interconnHint"></p>
+            <label class="field-label xs-sub-label" data-i18n="xs.userInbounds">کاربران کدام ورودی‌ها از پل بیرون بروند</label>
+            <div class="xs-checks" id="xsPortalUsers"></div>
+            <p class="hint" data-i18n="xs.userInboundsHint"></p>
+          </div>
+
+          <div class="row-gap xs-rev-actions" id="xsRevActions" hidden>
+            <button class="btn ghost small" id="btnXsOtherSide" data-i18n="xs.otherSide">کپی تنظیمات آن سر</button>
+          </div>
+          <div id="xsOtherWrap" hidden>
+            <label class="field-label xs-sub-label" for="xsOtherLink" data-i18n="xs.otherLink">لینک پل</label>
+            <div class="xs-row">
+              <input type="text" id="xsOtherLink" class="input fixed" readonly dir="ltr" />
+              <button class="icon-btn" id="btnXsOtherCopy" data-i18n-title="xs.copyLink">⧉</button>
+              <button class="icon-btn" id="btnXsOtherQr" data-i18n-title="xs.qr">▦</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4. where the users' traffic leaves, and what never leaves at all -->
+        <div class="card xs-card" id="xsExitCard">
+          <div class="sec"><span class="sec-label" data-i18n="xs.exit">خروج ترافیک</span></div>
+          <select id="xsExitType" class="select vis-hidden" tabindex="-1" aria-hidden="true">
+            <option value="direct" data-i18n="xs.exit.direct">از همین دستگاه</option>
+            <option value="server" data-i18n="xs.exit.server">از یک کانفیگ ذخیره‌شده</option>
+          </select>
+          <div class="opt-cards" id="xsExitCards"></div>
+          <div id="xsExitServerWrap" hidden>
+            <label class="field-label xs-sub-label" data-i18n="xs.exitServer">کانفیگ خروجی</label>
+            <div class="xs-mount" id="xsExitServerMount"></div>
+          </div>
+          <div class="switch-row">
+            <div>
+              <div class="switch-title" data-i18n="xs.blockPrivate">بستن شبکهٔ محلی</div>
+              <div class="switch-sub" data-i18n="xs.blockPrivateSub"></div>
+            </div>
+            <label class="switch"><input type="checkbox" id="xsBlockPrivate" /><span class="slider"></span></label>
+          </div>
+          <div class="switch-row">
+            <div>
+              <div class="switch-title" data-i18n="xs.blockTorrent">بستن تورنت</div>
+              <div class="switch-sub" data-i18n="xs.blockTorrentSub"></div>
+            </div>
+            <label class="switch"><input type="checkbox" id="xsBlockTorrent" /><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <!-- 5. what the core itself says -->
+        <div class="card xs-card">
+          <div class="sec">
+            <span class="sec-label" data-i18n="xs.log">لاگ سرور</span>
+            <div class="head-actions">
+              <button class="btn ghost small" id="btnXsClearLog" data-i18n="xs.clearLog">پاک کردن</button>
+            </div>
+          </div>
+          <pre class="logbox xs-log" id="xsLog"></pre>
+        </div>
+
+        <!-- 6. why the last change was refused -->
+        <div class="card xs-card xs-errors-card" id="xsErrorsCard" hidden>
+          <div class="sec"><span class="sec-label" data-i18n="xs.errors">ایرادهای کانفیگ</span></div>
+          <ul class="xs-errors" id="xsErrors"></ul>
+          <p class="hint" data-i18n="xs.errorsHint"></p>
+        </div>
       </section>
 
       <!-- plus: IP SCAN (src/renderer/plus/scan.js) -->
@@ -1182,6 +1348,219 @@
       </div>
     </div>
   </div>
+  <!-- plus: the Server tab's three modals (src/renderer/plus/xserver.js) -->
+  <div class="modal-overlay" id="xsInboundModal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-title" data-i18n="xs.in.title">ورودی</span>
+        <button class="tb-btn" id="xiClose">&#x2715;</button>
+      </div>
+      <div class="modal-body">
+        <div class="grid2">
+          <div>
+            <label class="field-label" for="xiRemark" data-i18n="xs.in.remark">نام</label>
+            <input type="text" id="xiRemark" class="input" data-i18n-ph="xs.in.remarkPh" />
+          </div>
+          <div>
+            <label class="field-label" for="xiProtocol" data-i18n="xs.in.protocol">پروتکل</label>
+            <select id="xiProtocol" class="select">
+              <option value="vless">vless</option>
+              <option value="vmess">vmess</option>
+              <option value="trojan">trojan</option>
+              <option value="shadowsocks">shadowsocks</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid2">
+          <div>
+            <label class="field-label" for="xiListen" data-i18n="xs.in.listen">آدرس شنود</label>
+            <input type="text" id="xiListen" class="input fixed" spellcheck="false" />
+          </div>
+          <div>
+            <label class="field-label" for="xiPort" data-i18n="xs.in.port">پورت</label>
+            <input type="number" id="xiPort" class="input" dir="ltr" min="1" max="65535" />
+          </div>
+        </div>
+        <div class="grid2" id="xiTransportRow">
+          <div>
+            <label class="field-label" for="xiNetwork" data-i18n="xs.in.network">ترنسپورت</label>
+            <select id="xiNetwork" class="select">
+              <option value="tcp">tcp</option>
+              <option value="ws">ws</option>
+              <option value="grpc">grpc</option>
+              <option value="xhttp">xhttp</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" for="xiSecurity" data-i18n="xs.in.security">امنیت</label>
+            <select id="xiSecurity" class="select">
+              <option value="none">none</option>
+              <option value="tls">tls</option>
+              <option value="reality">reality</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid2" id="xiPathRow" hidden>
+          <div>
+            <label class="field-label" for="xiPath" data-i18n="xs.in.path">مسیر</label>
+            <input type="text" id="xiPath" class="input fixed" spellcheck="false" />
+          </div>
+          <div>
+            <label class="field-label" for="xiHost" data-i18n="xs.in.host">Host</label>
+            <input type="text" id="xiHost" class="input fixed" spellcheck="false" />
+          </div>
+        </div>
+        <div id="xiServiceRow" hidden>
+          <label class="field-label" for="xiService" data-i18n="xs.in.service">serviceName</label>
+          <input type="text" id="xiService" class="input fixed" spellcheck="false" />
+        </div>
+        <div id="xiTlsRow" hidden>
+          <div class="grid2">
+            <div>
+              <label class="field-label" for="xiCert" data-i18n="xs.in.cert">فایل گواهی</label>
+              <input type="text" id="xiCert" class="input fixed" spellcheck="false" />
+            </div>
+            <div>
+              <label class="field-label" for="xiKey" data-i18n="xs.in.key">فایل کلید</label>
+              <input type="text" id="xiKey" class="input fixed" spellcheck="false" />
+            </div>
+          </div>
+          <label class="field-label xs-sub-label" for="xiSni" data-i18n="xs.in.sni">نام سرور</label>
+          <input type="text" id="xiSni" class="input fixed" spellcheck="false" />
+        </div>
+        <div id="xiRealityRow" hidden>
+          <p class="hint" data-i18n="xs.in.realityHint"></p>
+          <div class="grid2">
+            <div>
+              <label class="field-label" for="xiRealityDest" data-i18n="xs.in.realityDest">مقصد پوشش</label>
+              <input type="text" id="xiRealityDest" class="input fixed" spellcheck="false" />
+            </div>
+            <div>
+              <label class="field-label" for="xiRealityNames" data-i18n="xs.in.realityNames">نام‌های سرور</label>
+              <input type="text" id="xiRealityNames" class="input fixed" spellcheck="false" />
+            </div>
+          </div>
+          <div class="grid2">
+            <div>
+              <label class="field-label" for="xiRealityPriv" data-i18n="xs.in.realityPriv">کلید خصوصی</label>
+              <input type="text" id="xiRealityPriv" class="input fixed" spellcheck="false" />
+            </div>
+            <div>
+              <label class="field-label" for="xiRealityPub" data-i18n="xs.in.realityPub">کلید عمومی</label>
+              <input type="text" id="xiRealityPub" class="input fixed" spellcheck="false" />
+            </div>
+          </div>
+          <div class="row-gap xs-gen-row">
+            <button class="btn ghost small" id="btnXiGenKeys" data-i18n="xs.in.genKeys">ساختن جفت‌کلید</button>
+          </div>
+          <label class="field-label xs-sub-label" for="xiRealityShort" data-i18n="xs.in.shortIds">شناسه‌های کوتاه</label>
+          <div class="xs-row">
+            <input type="text" id="xiRealityShort" class="input fixed" spellcheck="false" />
+            <button class="btn ghost small" id="btnXiGenShort" data-i18n="xs.in.genShort">ساختن</button>
+          </div>
+        </div>
+        <div id="xiSsRow" hidden>
+          <label class="field-label" for="xiSsMethod" data-i18n="xs.in.ssMethod">روش رمزنگاری</label>
+          <select id="xiSsMethod" class="select">
+            <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
+            <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
+            <option value="aes-256-gcm">aes-256-gcm</option>
+            <option value="aes-128-gcm">aes-128-gcm</option>
+            <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305</option>
+          </select>
+          <label class="field-label xs-sub-label" for="xiSsPassword" data-i18n="xs.in.ssPassword">کلید سرور</label>
+          <div class="xs-row">
+            <input type="text" id="xiSsPassword" class="input fixed" spellcheck="false" />
+            <button class="btn ghost small" id="btnXiGenSsPass" data-i18n="xs.gen">ساختن</button>
+          </div>
+        </div>
+        <div class="switch-row">
+          <div>
+            <div class="switch-title" data-i18n="xs.in.sniffing">تشخیص مقصد</div>
+            <div class="switch-sub" data-i18n="xs.in.sniffingSub"></div>
+          </div>
+          <label class="switch"><input type="checkbox" id="xiSniffing" /><span class="slider"></span></label>
+        </div>
+        <ul class="xs-errors" id="xiErrors" hidden></ul>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" id="btnXiSave" data-i18n="btn.save">ذخیره</button>
+        <button class="btn ghost" id="btnXiCancel" data-i18n="btn.cancel">انصراف</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="xsClientModal" hidden><!-- plus -->
+    <div class="modal modal-sm">
+      <div class="modal-head">
+        <span class="modal-title" data-i18n="xs.cl.title">کاربر</span>
+        <button class="tb-btn" id="xcClose">&#x2715;</button>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="xcEmail" data-i18n="xs.cl.email">نام کاربر</label>
+          <input type="text" id="xcEmail" class="input" data-i18n-ph="xs.cl.emailPh" />
+        </div>
+        <div>
+          <label class="field-label" id="xcSecretLabel" for="xcSecret" data-i18n="xs.cl.uuid">شناسه</label>
+          <div class="xs-row">
+            <input type="text" id="xcSecret" class="input fixed" spellcheck="false" />
+            <button class="btn ghost small" id="btnXcGen" data-i18n="xs.gen">ساختن</button>
+          </div>
+        </div>
+        <div id="xcFlowRow" hidden>
+          <label class="field-label" for="xcFlow" data-i18n="xs.cl.flow">flow</label>
+          <select id="xcFlow" class="select">
+            <option value="">—</option>
+            <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+          </select>
+        </div>
+        <div class="grid2">
+          <div>
+            <label class="field-label" for="xcExpiry" data-i18n="xs.cl.expiry">تاریخ انقضا</label>
+            <input type="date" id="xcExpiry" class="input" dir="ltr" />
+          </div>
+          <div>
+            <label class="field-label" for="xcQuotaGb" data-i18n="xs.cl.quota">سهمیهٔ ترافیک</label>
+            <input type="number" id="xcQuotaGb" class="input" dir="ltr" min="0" step="0.1" />
+          </div>
+        </div>
+        <p class="hint" data-i18n="xs.cl.expiryHint"></p>
+        <p class="hint" data-i18n="xs.cl.quotaHint"></p>
+        <div>
+          <label class="field-label" for="xcNote" data-i18n="xs.cl.note">یادداشت</label>
+          <input type="text" id="xcNote" class="input" />
+        </div>
+        <div class="switch-row">
+          <div><div class="switch-title" data-i18n="xs.cl.enabled">فعال</div></div>
+          <label class="switch"><input type="checkbox" id="xcEnabled" /><span class="slider"></span></label>
+        </div>
+        <ul class="xs-errors" id="xcErrors" hidden></ul>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" id="btnXcSave" data-i18n="btn.save">ذخیره</button>
+        <button class="btn ghost" id="btnXcCancel" data-i18n="btn.cancel">انصراف</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="xsPreviewModal" hidden><!-- plus -->
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-title" data-i18n="xs.preview.title">کانفیگ سرور</span>
+        <button class="tb-btn" id="xsPreviewX">&#x2715;</button>
+      </div>
+      <div class="modal-body">
+        <p class="hint" data-i18n="xs.preview.hint"></p>
+        <pre class="logbox xs-preview" id="xsPreviewJson"></pre>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" id="btnXsPreviewCopy" data-i18n="xs.preview.copy">کپی JSON</button>
+        <button class="btn ghost" id="btnXsPreviewClose" data-i18n="xs.close">بستن</button>
+      </div>
+    </div>
+  </div>
+
   <script src="vendor/qrcode.js"></script>
   <script src="i18n.js"></script>
   <script src="plus/xserver.i18n.js"></script><!-- plus -->
