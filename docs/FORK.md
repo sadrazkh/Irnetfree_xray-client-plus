@@ -47,6 +47,7 @@ npm test && npm run validate
 
 - `npm test` باید کامل سبز باشد.
 - `npm run validate` کانفیگ‌های ساخته‌شده را با `xray run -test` روی هستهٔ رسمی می‌آزماید؛ برای هستهٔ PattN همان دستور را با `IRNF_XRAY_EXE=bin/xray-pattn.exe` هم اجرا کنید.
+- `npm run probe:reverse` زوج ریورس‌پراکسی (portal + bridge + کلاینت) را روی `127.0.0.1` روی هر دو هسته اجرا می‌کند و باید `2 pass` بدهد؛ `node scripts/probe-dns-leak.js` و `npm run probe:wg` هم مثل مخزن اصلی.
 - تا وقتی این دو سبز نشده‌اند، merge را commit نکنید.
 
 Run the merge on `main` of this repository (Plus has no long-lived feature branches for upstream syncs). If `npm test` or `npm run validate` fails after a merge, fix it in the merge commit — a red merge that is pushed makes every later sync harder to reason about.
