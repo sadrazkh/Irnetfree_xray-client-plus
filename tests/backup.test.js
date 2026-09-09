@@ -60,3 +60,19 @@ test('a foreign or malformed file is refused', () => {
   assert.throws(() => importBundle(null, current), /not an IRNetFree backup/);
   assert.throws(() => importBundle([], current), /not an IRNetFree backup/);
 });
+
+// plus: Plus runs next to the original IRNetFree; a restore of the ORIGINAL's
+// backup must not take its ports, while a Plus backup keeps carrying them
+test('plus: restoring an original backup keeps the current ports; a Plus backup overlays them', () => {
+  const b = exportBundle({ version: '1.5.0', store: Object.assign({}, current, { settings: { lang: 'en', socksPort: 10808, httpPort: 10809, apiPort: 10085 } }), usage: {} });
+  const cur = Object.assign({}, current, { settings: { lang: 'fa', socksPort: 10818, httpPort: 10819, apiPort: 10095 } });
+  assert.equal(b.plus, true, 'Plus marks what it exports');
+  const fromPlus = importBundle(b, cur);
+  assert.equal(fromPlus.next.settings.socksPort, 10808, 'a Plus backup carries its ports');
+  const original = Object.assign({}, b); delete original.plus;
+  const r = importBundle(original, cur);
+  assert.equal(r.next.settings.lang, 'en', 'other settings are still overlaid');
+  assert.equal(r.next.settings.socksPort, 10818);
+  assert.equal(r.next.settings.httpPort, 10819);
+  assert.equal(r.next.settings.apiPort, 10095);
+});

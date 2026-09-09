@@ -306,6 +306,12 @@ test('bridge via link: the interconn outbound is the flat VLESS form with revers
     { type: 'field', inboundTag: ['bridge'], outboundTag: 'exit' }
   ]);
   assert.equal(c.reverse, undefined, 'no legacy reverse block: the 26.9 fork refuses it');
+  // the 26.9 core blocks reversed traffic in freedom unless a final rule allows it (probe-reverse.js)
+  assert.deepEqual(c.outbounds[0].settings, { finalRules: [{ action: 'allow' }] }, 'a bridge exit opts in to carrying the portal traffic');
+});
+
+test('only a bridge exit carries the freedom allow rule; a plain server or a portal does not', () => {
+  assert.deepEqual(build(model({ inbounds: [GOLDEN['vless-ws-tls']] })).outbounds[0].settings, {});
 });
 
 test('bridge via a stored server clones its stream settings (pin applied, allowInsecure gone) into the flat form', () => {

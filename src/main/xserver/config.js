@@ -475,7 +475,14 @@ function exitOutbound(m, servers) {
     const s = findServer(servers, m.exit.serverId);
     if (s && s.outbound) return cloneOut(s.outbound, EXIT_TAG, s);
   }
-  return { tag: EXIT_TAG, protocol: 'freedom', settings: {} };
+  // A bridge's freedom exit needs an explicit allow: from 26.9 on the core
+  // refuses every destination that arrives through a reverse ("proxy/freedom:
+  // blocked target", then a penalty on the source) unless a final rule says
+  // otherwise — a bridge behind NAT must opt in to what the portal may reach.
+  // The private and torrent blocks above still come first in routing. Older
+  // cores ignore the field (scripts/probe-reverse.js shows both cores pass).
+  const settings = m.reverse.role === 'bridge' ? { finalRules: [{ action: 'allow' }] } : {};
+  return { tag: EXIT_TAG, protocol: 'freedom', settings };
 }
 
 /**
