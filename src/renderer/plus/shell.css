@@ -1,0 +1,20 @@
+/* plus: the rail carries two more tabs (Server, IP scan). At the window's
+   minimum height (600) the advanced rail no longer fits — Settings and the
+   connection pill sat below the bottom edge — so below 760px its items tighten
+   (the console skin's labelled items lose padding, the icon rails lose height
+   and gap) and below 640px a little more; every skin then fits 600px with all
+   ten items and the pill. No scrolling: the icon skins' hover labels live
+   outside the rail and an overflow other than visible would clip them.
+   Tokens and logical properties only. */
+@media (max-height: 760px) {
+  .sidebar { gap: 4px; padding-block: 8px; }
+  .nav-item { height: 36px; }
+  [data-skin="console"] .nav-item { padding-block: 6px; gap: 3px; }
+  [data-skin="legacy"] .nav-item { padding-block: 7px; }
+}
+@media (max-height: 640px) {
+  .sidebar { gap: 3px; padding-block: 6px; }
+  .nav-item { height: 34px; }
+  [data-skin="console"] .nav-item { padding-block: 4px; gap: 2px; }
+  [data-skin="legacy"] .nav-item { padding-block: 5px; }
+}

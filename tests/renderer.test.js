@@ -23,7 +23,7 @@ const HTML = R('index.html');
 const APP = ['app.js', 'plus/xserver.js', 'plus/scan.js'].map(R).join(String.fromCharCode(10));
 // the stylesheet is split by surface (styles/home/lists/routing/settings/skins);
 // the contract is against all of it, so read them as one
-const CSS_FILES = ['styles.css', 'home.css', 'lists.css', 'routing.css', 'settings.css', 'skins.css', 'plus/xserver.css', 'plus/scan.css'];
+const CSS_FILES = ['styles.css', 'home.css', 'lists.css', 'routing.css', 'settings.css', 'skins.css', 'plus/shell.css', 'plus/xserver.css', 'plus/scan.css'];
 const CSS = CSS_FILES.map(R).join(String.fromCharCode(10));
 // plus: the tabs' strings live next to them and are merged through window.i18n.extend
 const I18N = ['i18n.js', 'plus/xserver.i18n.js', 'plus/scan.i18n.js'].map(R).join(String.fromCharCode(10));
