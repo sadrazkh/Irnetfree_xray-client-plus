@@ -813,5 +813,20 @@ function applyI18n(lang) {
   });
 }
 
-window.i18n = { t, applyI18n, get lang() { return currentLang; } };
+/**
+ * plus: extra dictionaries from src/renderer/plus/*.i18n.js, merged into both
+ * languages before app.js runs. A key that already exists is a mistake, not an
+ * override — the contract test counts keys, this only makes it visible live.
+ */
+function extend(dicts) {
+  for (const lang of Object.keys(dicts || {})) {
+    if (!I18N[lang]) I18N[lang] = {};
+    for (const [k, v] of Object.entries(dicts[lang] || {})) {
+      if (k in I18N[lang]) console.error('i18n: duplicate key ' + k);
+      I18N[lang][k] = v;
+    }
+  }
+}
+
+window.i18n = { t, applyI18n, extend, get lang() { return currentLang; } };
 })();

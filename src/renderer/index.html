@@ -14,6 +14,8 @@
   <link rel="stylesheet" href="routing.css" />
   <link rel="stylesheet" href="settings.css" />
   <link rel="stylesheet" href="skins.css" />
+  <link rel="stylesheet" href="plus/xserver.css" /><!-- plus -->
+  <link rel="stylesheet" href="plus/scan.css" /><!-- plus -->
   <!-- Applies the remembered theme before the first paint, so a light-theme user
        does not see a dark flash while app:init is still in flight. -->
   <script src="theme-boot.js"></script>
@@ -67,6 +69,12 @@
       </button>
       <button class="nav-item" data-view="routing" data-i18n-title="nav.routing">
         <span class="nav-ico">🧭</span><span data-i18n="nav.routing">روتینگ</span>
+      </button>
+      <button class="nav-item pro-only" data-view="xserver" data-i18n-title="nav.xserver"><!-- plus -->
+        <span class="nav-ico">🖧</span><span data-i18n="nav.xserver">سرور</span>
+      </button>
+      <button class="nav-item" data-view="scan" data-i18n-title="nav.scan"><!-- plus -->
+        <span class="nav-ico">📡</span><span data-i18n="nav.scan">اسکن IP</span>
       </button>
       <button class="nav-item pro-only" data-view="logs" data-i18n-title="nav.logs">
         <span class="nav-ico">📜</span><span data-i18n="nav.logs">لاگ‌ها</span>
@@ -450,6 +458,16 @@
           </div>
         </aside>
         </div><!-- /routing-cols -->
+      </section>
+
+      <!-- plus: SERVER (the local Xray server, src/renderer/plus/xserver.js) -->
+      <section class="view" id="view-xserver">
+        <div class="view-head"><h2 data-i18n="xs.title">سرور Xray</h2></div>
+      </section>
+
+      <!-- plus: IP SCAN (src/renderer/plus/scan.js) -->
+      <section class="view" id="view-scan">
+        <div class="view-head"><h2 data-i18n="scan.title">اسکن IP</h2></div>
       </section>
 
       <!-- SETTINGS -->
@@ -1045,6 +1063,10 @@
   </div>
   <script src="vendor/qrcode.js"></script>
   <script src="i18n.js"></script>
+  <script src="plus/xserver.i18n.js"></script><!-- plus -->
+  <script src="plus/scan.i18n.js"></script><!-- plus -->
   <script src="app.js"></script>
+  <script src="plus/xserver.js"></script><!-- plus -->
+  <script src="plus/scan.js"></script><!-- plus -->
 </body>
 </html>

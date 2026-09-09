@@ -328,6 +328,9 @@ async function init() {
 
   // prompt to download required files on first run / when essentials are missing
   maybePromptMissingFiles();
+
+  // plus: the Server and IP-scan tabs (src/renderer/plus/*) initialise here
+  for (const fn of (window.plusInit || [])) { try { await fn(data); } catch (e) { console.error(e); } }
 }
 
 /* ----------------------------- core versions ----------------------------- */

@@ -126,6 +126,30 @@
     quit: () => sendOnly('app:quit'),
     openExternal: (url) => { try { window.open(url, '_blank', 'noopener'); } catch {} },
 
+    // plus: the Server tab (src/main/xserver)
+    xserverGet: () => invoke('xserver:get'),
+    xserverSet: (model) => invoke('xserver:set', model),
+    xserverStart: () => invoke('xserver:start'),
+    xserverStop: () => invoke('xserver:stop'),
+    xserverRestart: () => invoke('xserver:restart'),
+    xserverStatus: () => invoke('xserver:status'),
+    xserverLog: () => invoke('xserver:log'),
+    xserverGenKeys: () => invoke('xserver:genKeys'),
+    xserverGenId: (kind) => invoke('xserver:genId', kind),
+    xserverClientLink: (req) => invoke('xserver:clientLink', req),
+    xserverPreview: () => invoke('xserver:preview'),
+    xserverOtherSide: () => invoke('xserver:otherSide'),
+    xserverFirewall: (req) => invoke('xserver:firewall', req),
+    onXServerStatus: (cb) => on('xserver-status', cb),
+    onXServerLog: (cb) => on('xserver-log', cb),
+    // plus: the IP-scan tab (src/main/scan)
+    scanStart: (req) => invoke('scan:start', req),
+    scanStop: () => invoke('scan:stop'),
+    scanPresets: () => invoke('scan:presets'),
+    scanApply: (req) => invoke('scan:apply', req),
+    scanExport: (req) => invoke('scan:export', req),
+    onScanProgress: (cb) => on('scan-progress', cb),
+
     // events
     onLog: (cb) => on('log', cb),
     onStatus: (cb) => on('status', cb),
