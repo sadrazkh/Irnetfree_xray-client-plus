@@ -162,7 +162,11 @@ give, reduced to what is practical: no web login, no multi-user panel accounts, 
   - **bridge**: the `interconn` outbound is a flat VLESS outbound
     `settings: { address, port, id, flow, encryption, reverse: { tag: 'bridge' } }` (the core refuses
     `reverse` inside `vnext`); connections the portal hands back arrive as inbound tag `bridge`, and
-    the last rule `{ inboundTag: ['bridge'], outboundTag: 'exit' }` sends them out locally.
+    the last rule `{ inboundTag: ['bridge'], outboundTag: 'exit' }` sends them out locally. A
+    bridge's `freedom` exit carries `finalRules: [{ action: 'allow' }]`: from 26.9 on the core
+    refuses every destination that arrives through a reverse unless a final rule allows it (a
+    bridge behind NAT opts in to what the portal may reach); older cores ignore the field.
+    `npm run probe:reverse` proves the pair end to end on both cores, on 127.0.0.1 only.
   - **portal**: every enabled client of the interconn inbound carries `reverse: { tag: 'portal' }`;
     the rule `{ inboundTag: [...userTags], outboundTag: 'portal' }` forwards the chosen inbounds'
     users through the bridge; inbounds not selected keep exiting locally. Validation refuses a

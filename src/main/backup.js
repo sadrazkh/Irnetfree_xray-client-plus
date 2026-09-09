@@ -16,6 +16,7 @@ function exportBundle({ version, store, usage }) {
   const s = store || {};
   return {
     app: 'IRNetFree',
+    plus: true,   // plus: made by Plus — its ports may be restored into Plus
     format: 1,
     version: version || '',
     exportedAt: new Date().toISOString(),
@@ -51,11 +52,25 @@ function importBundle(bundle, current) {
       subscriptions: subscriptions.list,
       chains: chains.list,
       pool: pool.list,
-      settings: Object.assign({}, isObj(c.settings) ? c.settings : {}, isObj(bundle.settings) ? bundle.settings : {}),
+      settings: keepPlusPorts(Object.assign({}, isObj(c.settings) ? c.settings : {}, isObj(bundle.settings) ? bundle.settings : {}), c.settings, bundle),   // plus
       usage: Object.assign({}, isObj(c.usage) ? c.usage : {}, isObj(bundle.usage) ? bundle.usage : {})
     },
     added: { servers: servers.n, subscriptions: subscriptions.n, chains: chains.n, pool: pool.n }
   };
+}
+
+/**
+ * plus: a backup made by the original IRNetFree carries the original's ports,
+ * and Plus lives next to the original on the same machine, so restoring one
+ * must not move Plus onto ports the original is holding. Plus marks its own
+ * bundles (`plus: true`); only those may carry ports across.
+ */
+const PLUS_PORT_KEYS = ['socksPort', 'httpPort', 'apiPort'];
+function keepPlusPorts(merged, current, bundle) {
+  if (bundle && bundle.plus === true) return merged;
+  const cur = isObj(current) ? current : {};
+  for (const k of PLUS_PORT_KEYS) if (k in cur) merged[k] = cur[k];
+  return merged;
 }
 
 module.exports = { exportBundle, importBundle };
