@@ -41,6 +41,8 @@ const { migrateSettings } = require('../main/settingsMigrate');
 const { NetWatcher, fingerprint } = require('../main/netWatcher');
 const { exportBundle, importBundle } = require('../main/backup');
 const { AssetUpdater } = require('../main/assetUpdater');
+const { createXServer } = require('../main/xserver');   // plus: the Server tab
+const { createScan } = require('../main/scan');         // plus: the IP-scan tab
 
 const DEFAULT_SETTINGS = {
   socksPort: 10808,
@@ -1609,6 +1611,20 @@ function createService(opts = {}) {
     'app:quit': () => { shutdown(); }
   };
 
+  // plus: the Server and IP-scan tabs register their own channels through a
+  // context both mirrors build the same way (docs/superpowers/specs/2026-09-09-plus-fork-server-scan-design.md, section 4)
+  const plusCtx = {
+    handle: (channel, fn) => { handlers[channel] = fn; },
+    send, notify, store, dataDir, getSettings, xray,
+    getServers: () => store.get('servers', []),
+    addServer: (server) => { const existing = store.get('servers', []); existing.push(server); store.set('servers', existing); return server; },
+    resolveTarget,
+    log: (line, level = 'info') => send('log', { line, level }),
+    platform: process.platform, isElectron: false
+  };
+  const xserver = createXServer(plusCtx); xserver.register();
+  const scanner = createScan(plusCtx); scanner.register();
+
   async function invoke(channel, arg) {
     const h = handlers[channel];
     if (!h) throw new Error('unknown channel: ' + channel);
@@ -1629,6 +1645,8 @@ function createService(opts = {}) {
     await stopAllTuns();   // every instance a connect started, not just the last
     try { await setSystemProxy(false, {}); } catch {}
     try { if (xray) await xray.stop(); } catch {}
+    try { await xserver.stop(); } catch {}   // plus
+    try { await scanner.stop(); } catch {}   // plus
   }
 
   // kick off auto-update if enabled
@@ -1643,6 +1661,7 @@ function createService(opts = {}) {
       setTimeout(() => doConnect(lastId).catch((e) => send('log', { line: 'Auto-connect failed: ' + e.message, level: 'error' })), 1000);
     }
   }
+  xserver.autoStart();   // plus: the local server, when asked to start with the app
 
   return { invoke, onEvent, shutdown, dataDir, getSettings, assetStatus, version: appVersion };
 }

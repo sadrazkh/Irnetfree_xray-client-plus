@@ -35,6 +35,8 @@ const { schtasksCreateArgs, schtasksDeleteArgs, autostartExe } = require('./auto
 const { trayGroups } = require('./trayMenu');
 const { exportBundle, importBundle } = require('./backup');
 const { AssetUpdater, cmpVersion } = require('./assetUpdater');
+const { createXServer } = require('./xserver');   // plus: the Server tab
+const { createScan } = require('./scan');         // plus: the IP-scan tab
 const https = require('https');
 
 let mainWindow = null;
@@ -71,6 +73,8 @@ function statsCadence() {
 let lastUsageSend = 0;
 let downloader = null;
 let assetUpdater = null;   // the weekly geo/core refresh (assetUpdater.js)
+let xserver = null;        // plus: the local Xray server (src/main/xserver)
+let scanner = null;        // plus: the IP scanner (src/main/scan)
 let procWatcher = null;
 let netWatcher = null;
 const pinWatch = new PinWatch();   // the live plan's pinned servers, for the core's mismatch line
@@ -2256,6 +2260,20 @@ function registerIpc() {
     send('log', { line: 'Removed downloaded files: ' + (removed.join(', ') || '(none)'), level: 'info' });
     return { ok: true, removed, assets: assetStatus(), xrayReady: xray.binExists(), tunAvailable: makeTun(getSettings(), { quiet: true }).isAvailable() };
   });
+
+  // plus: the Server and IP-scan tabs register their own channels through a
+  // context both mirrors build the same way (docs/superpowers/specs/2026-09-09-plus-fork-server-scan-design.md, section 4)
+  const plusCtx = {
+    handle: (channel, fn) => ipcMain.handle(channel, (e, arg) => fn(arg)),
+    send, notify, store, dataDir: dataDir(), getSettings, xray,
+    getServers: () => store.get('servers', []),
+    addServer: (server) => { const existing = store.get('servers', []); existing.push(server); setServers(existing); return server; },
+    resolveTarget,
+    log: (line, level = 'info') => send('log', { line, level }),
+    platform: process.platform, isElectron: true
+  };
+  xserver = createXServer(plusCtx); xserver.register();
+  scanner = createScan(plusCtx); scanner.register();
 }
 
 /** Minimal redirect-following JSON GET (GitHub API). */
@@ -2434,6 +2452,7 @@ app.whenReady().then(() => {
     if (boot.autoConnect && lastId && store.get('servers', []).some(s => s.id === lastId)) {
       setTimeout(() => doConnect(lastId).catch((e) => send('log', { line: 'Auto-connect failed: ' + e.message, level: 'error' })), 1000);
     }
+    if (xserver) xserver.autoStart();   // plus: the local server, when asked to start with the app
   });
 
   // kick off auto-update for subscriptions if enabled
@@ -2467,6 +2486,8 @@ async function teardownForQuit() {
   try { await removeLanFirewall(); } catch {}
   try { await disarmKillSwitch(); } catch {}
   try { if (xray) await xray.stop(); } catch {}
+  try { if (xserver) await xserver.stop(); } catch {}   // plus
+  try { if (scanner) await scanner.stop(); } catch {}   // plus
 }
 
 // A macOS password prompt nobody answers must not hold the quit for ever: past

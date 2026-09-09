@@ -96,6 +96,30 @@ contextBridge.exposeInMainWorld('api', {
   quit: () => ipcRenderer.send('app:quit'),
   openExternal: (url) => ipcRenderer.send('open:external', url),
 
+  // plus: the Server tab (src/main/xserver)
+  xserverGet: () => ipcRenderer.invoke('xserver:get'),
+  xserverSet: (model) => ipcRenderer.invoke('xserver:set', model),
+  xserverStart: () => ipcRenderer.invoke('xserver:start'),
+  xserverStop: () => ipcRenderer.invoke('xserver:stop'),
+  xserverRestart: () => ipcRenderer.invoke('xserver:restart'),
+  xserverStatus: () => ipcRenderer.invoke('xserver:status'),
+  xserverLog: () => ipcRenderer.invoke('xserver:log'),
+  xserverGenKeys: () => ipcRenderer.invoke('xserver:genKeys'),
+  xserverGenId: (kind) => ipcRenderer.invoke('xserver:genId', kind),
+  xserverClientLink: (req) => ipcRenderer.invoke('xserver:clientLink', req),
+  xserverPreview: () => ipcRenderer.invoke('xserver:preview'),
+  xserverOtherSide: () => ipcRenderer.invoke('xserver:otherSide'),
+  xserverFirewall: (req) => ipcRenderer.invoke('xserver:firewall', req),
+  onXServerStatus: (cb) => ipcRenderer.on('xserver-status', (e, d) => cb(d)),
+  onXServerLog: (cb) => ipcRenderer.on('xserver-log', (e, d) => cb(d)),
+  // plus: the IP-scan tab (src/main/scan)
+  scanStart: (req) => ipcRenderer.invoke('scan:start', req),
+  scanStop: () => ipcRenderer.invoke('scan:stop'),
+  scanPresets: () => ipcRenderer.invoke('scan:presets'),
+  scanApply: (req) => ipcRenderer.invoke('scan:apply', req),
+  scanExport: (req) => ipcRenderer.invoke('scan:export', req),
+  onScanProgress: (cb) => ipcRenderer.on('scan-progress', (e, d) => cb(d)),
+
   // events
   onLog: (cb) => ipcRenderer.on('log', (e, d) => cb(d)),
   onStatus: (cb) => ipcRenderer.on('status', (e, d) => cb(d)),
