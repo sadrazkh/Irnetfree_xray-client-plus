@@ -1,7 +1,7 @@
 name: Build & Release
 
-# Builds IRNetFree for Windows, macOS (Intel + Apple Silicon) and Linux, then
-# attaches every installer to the GitHub Release for the pushed tag.
+# Builds IRNetFree Plus for Windows, macOS (Intel + Apple Silicon) and Linux,
+# then attaches every installer to the GitHub Release for the pushed tag.
 #
 # Trigger: push a version tag, e.g.
 #   git tag v0.5.0
@@ -75,21 +75,42 @@ jobs:
 
       # The app verifies an in-app update against these before it opens the
       # installer (src/main/appUpdate.js). One file per runner; the app reads
-      # every SHA256SUMS-*.txt on the release. shasum is on all three runners.
+      # every SHA256SUMS-*.txt on the release.
+      #
+      # Upstream's v1.5.0 release shipped without its Windows installers: this
+      # step failed on the windows runner and, being a normal step, took the
+      # whole job with it. The sums are a convenience — without them the app
+      # says "unverified" and only reveals the download — so losing them must
+      # never cost the installers. Hence: `sha256sum` (a native msys binary,
+      # always in Git for Windows) before the Perl `shasum`, `nullglob` so an
+      # unmatched pattern is not passed to the hasher, a listing of dist so the
+      # next run explains itself, `continue-on-error`, and a final `exit 0`.
       - name: Checksums
+        continue-on-error: true
         shell: bash
         run: |
-          cd dist
-          : > "SHA256SUMS-${{ matrix.os }}.txt"
+          cd dist || exit 0
+          ls -la
+          if command -v sha256sum >/dev/null 2>&1; then HASH="sha256sum"
+          elif command -v shasum >/dev/null 2>&1; then HASH="shasum -a 256"
+          else echo "no sha256 tool on this runner — skipping the sums"; exit 0; fi
+          echo "hashing with: $HASH"
+          shopt -s nullglob
+          out="SHA256SUMS-${{ matrix.os }}.txt"
+          : > "$out"
           for f in *.exe *.dmg *.zip *.AppImage *.deb; do
-            [ -f "$f" ] && shasum -a 256 "$f" >> "SHA256SUMS-${{ matrix.os }}.txt"
+            [ -f "$f" ] || continue
+            $HASH "$f" >> "$out" || echo "could not hash $f"
           done
-          cat "SHA256SUMS-${{ matrix.os }}.txt"
+          # an empty file would tell the app there are sums and then match none
+          [ -s "$out" ] || rm -f "$out"
+          cat "$out" 2>/dev/null || echo "(no sums were produced)"
+          exit 0
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: IRNetFree-${{ matrix.os }}
+          name: IRNetFree-Plus-${{ matrix.os }}
           path: |
             dist/*.exe
             dist/*.dmg
@@ -221,7 +242,7 @@ jobs:
           if [ -z "$src" ]; then echo "No APK was produced" >&2; exit 1; fi
           ver="${GITHUB_REF_NAME#v}"
           [ "${GITHUB_REF_TYPE:-}" = "tag" ] || ver="ci"
-          out="IRNetFree-${ver}.apk"
+          out="IRNetFree-Plus-${ver}.apk"
           cp "$src" "$out"
           echo "file=android/$out" >> "$GITHUB_OUTPUT"
           echo "Built $out from $src"
@@ -229,13 +250,13 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: IRNetFree-Android
-          path: android/IRNetFree-*.apk
+          name: IRNetFree-Plus-Android
+          path: android/IRNetFree-Plus-*.apk
           if-no-files-found: error
 
       - name: Publish APK to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: android/IRNetFree-*.apk
+          files: android/IRNetFree-Plus-*.apk
           fail_on_unmatched_files: false

@@ -64,3 +64,44 @@ test('parseSha256Sums and sha256File agree; malformed lines are ignored; names k
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * plus: the release pipeline's own contract, checked without a runner.
+ *
+ * The in-app updater matches release assets by name, electron-builder names
+ * them from package.json, and the workflow both publishes them and writes the
+ * sums. Nothing connects those three, and a mismatch only shows on a real
+ * release: upstream shipped one whose Windows installers were missing because
+ * this part of the pipeline failed unnoticed.
+ */
+const render = (pattern, version, arch, ext) => pattern
+  .replace('${version}', version)
+  .replace('${arch}', arch)
+  .replace('${ext}', ext);
+
+test('plus: electron-builder\'s artifact names are the names the updater looks for', () => {
+  const build = require('../package.json').build;
+  const v = '2.3.4';
+  const setup = render(build.nsis.artifactName, v, '', 'exe');
+  const dmgX64 = render(build.dmg.artifactName, v, 'x64', 'dmg');
+  const dmgArm = render(build.dmg.artifactName, v, 'arm64', 'dmg');
+  const appImage = render(build.linux.artifactName, v, 'x86_64', 'AppImage');
+  const assets = [setup, dmgX64, dmgArm, appImage].map((name) => ({ name }));
+
+  assert.equal(pickUpdateAsset(assets, 'win32', 'x64').name, setup);
+  assert.equal(pickUpdateAsset(assets, 'darwin', 'x64').name, dmgX64);
+  assert.equal(pickUpdateAsset(assets, 'darwin', 'arm64').name, dmgArm);
+  assert.equal(pickUpdateAsset(assets, 'linux', 'x64').name, appImage);
+});
+
+test('plus: the release workflow publishes every asset the updater reads, and its checksums cannot sink a build', () => {
+  const yml = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'release.yml'), 'utf8');
+  for (const glob of ['dist/*.exe', 'dist/*.dmg', 'dist/*.AppImage', 'dist/*.deb', 'dist/SHA256SUMS-*.txt']) {
+    assert.ok(yml.includes(glob), 'the release does not publish ' + glob);
+  }
+  const step = yml.slice(yml.indexOf('- name: Checksums'), yml.indexOf('- name: Upload build artifacts'));
+  assert.match(step, /continue-on-error:\s*true/, 'a failed checksum step must not cost the installers');
+  assert.match(step, /command -v sha256sum/, 'prefer the hasher that is always on the Windows runner');
+  assert.match(step, /shopt -s nullglob/, 'an unmatched pattern must not reach the hasher');
+  assert.ok(step.includes('SHA256SUMS-${{ matrix.os }}.txt'), 'one sums file per runner');
+});
