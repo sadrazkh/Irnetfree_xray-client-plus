@@ -94,14 +94,14 @@ test('plus: electron-builder\'s artifact names are the names the updater looks f
   assert.equal(pickUpdateAsset(assets, 'linux', 'x64').name, appImage);
 });
 
-test('plus: the release workflow publishes every asset the updater reads, and its checksums cannot sink a build', () => {
+test('plus: the release publishes every asset the updater reads, under the Plus names', () => {
+  // The step's own behaviour is covered by tests/releaseWorkflow.test.js, which
+  // runs it; this is the part that is Plus's: an original-app artifact name here
+  // would put an installer on the release that this app refuses to recognise.
   const yml = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'release.yml'), 'utf8');
   for (const glob of ['dist/*.exe', 'dist/*.dmg', 'dist/*.AppImage', 'dist/*.deb', 'dist/SHA256SUMS-*.txt']) {
     assert.ok(yml.includes(glob), 'the release does not publish ' + glob);
   }
-  const step = yml.slice(yml.indexOf('- name: Checksums'), yml.indexOf('- name: Upload build artifacts'));
-  assert.match(step, /continue-on-error:\s*true/, 'a failed checksum step must not cost the installers');
-  assert.match(step, /command -v sha256sum/, 'prefer the hasher that is always on the Windows runner');
-  assert.match(step, /shopt -s nullglob/, 'an unmatched pattern must not reach the hasher');
-  assert.ok(step.includes('SHA256SUMS-${{ matrix.os }}.txt'), 'one sums file per runner');
+  assert.ok(yml.includes('android/IRNetFree-Plus-*.apk'), 'the APK is published under the Plus name');
+  assert.deepEqual(yml.match(/IRNetFree-(?!Plus)[A-Za-z*${]/g), null, 'an artifact still carries the original app name');
 });
