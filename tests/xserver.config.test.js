@@ -86,7 +86,7 @@ test('normalizeModel fills every missing inbound and client field and is idempot
   assert.equal(i.network, 'tcp');
   assert.equal(i.security, 'none');
   assert.deepEqual(i.tls, { certFile: '', keyFile: '', serverName: '', alpn: ['h2', 'http/1.1'] });
-  assert.deepEqual(i.reality, { dest: 'www.microsoft.com:443', serverNames: ['www.microsoft.com'], privateKey: '', publicKey: '', shortIds: [] });
+  assert.deepEqual(i.reality, { dest: 'www.cloudflare.com:443', serverNames: ['www.cloudflare.com'], privateKey: '', publicKey: '', shortIds: [] });
   assert.deepEqual(i.ss, { method: '2022-blake3-aes-128-gcm', password: '' });
   assert.equal(i.sniffing, true);
   const c = i.clients[0];

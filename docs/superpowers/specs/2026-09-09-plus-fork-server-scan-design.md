@@ -101,7 +101,7 @@ give, reduced to what is practical: no web login, no multi-user panel accounts, 
     path: '/', host: '', serviceName: '',
     security: 'none' | 'tls' | 'reality',
     tls: { certFile: '', keyFile: '', serverName: '', alpn: ['h2','http/1.1'] },
-    reality: { dest: 'www.microsoft.com:443', serverNames: ['www.microsoft.com'],
+    reality: { dest: 'www.cloudflare.com:443', serverNames: ['www.cloudflare.com'],   // microsoft.com fails the REALITY handshake from here on both cores
                privateKey: '', publicKey: '', shortIds: ['<8-byte hex>'] },
     ss: { method: '2022-blake3-aes-128-gcm' | 'aes-256-gcm' | 'chacha20-ietf-poly1305', password: '' },
     sniffing: true,

@@ -333,7 +333,11 @@ async function init() {
   // prompt to download required files on first run / when essentials are missing
   maybePromptMissingFiles();
 
-  // plus: the Server and IP-scan tabs (src/renderer/plus/*) initialise here
+  // plus: the Server and IP-scan tabs (src/renderer/plus/*) initialise here —
+  // once the page has finished loading, because the scripts after app.js can
+  // arrive later than app:init answers (over HTTP in the headless server they
+  // regularly do) and would otherwise miss their turn.
+  if (document.readyState !== 'complete') await new Promise((r) => window.addEventListener('load', r, { once: true }));
   for (const fn of (window.plusInit || [])) { try { await fn(data); } catch (e) { console.error(e); } }
 }
 
