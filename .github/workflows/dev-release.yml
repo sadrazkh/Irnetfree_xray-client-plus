@@ -1,0 +1,140 @@
+name: Dev build (rolling)
+
+# plus: a downloadable build from every push, without waiting for a version tag.
+#
+# release.yml only fires on a tag — and GitHub triggers a tag run for at most
+# three tags when several are pushed at once, so a push can easily leave you
+# with nothing to download. This workflow closes that gap: every push to main
+# builds the Windows installers and keeps them on one rolling pre-release
+# called "dev", whose assets are replaced each time. The same files are also
+# attached to the run itself (Actions → the run → Artifacts), so a build is
+# downloadable even if the release step is ever unavailable.
+#
+# Why a pre-release: the in-app update check reads /releases/latest, and GitHub
+# excludes pre-releases from that. So a dev build is never offered to users as
+# an update — only the tagged releases from release.yml are.
+#
+# Windows only on a push (it is the platform the owner runs, and a private
+# repository's Actions minutes are finite). Use "Run workflow" on the Actions
+# tab with "all platforms" to also build macOS, Linux and the APK.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      all_platforms:
+        description: 'Build macOS and Linux as well, not just Windows'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# A newer push makes an older dev build pointless; let it cancel.
+concurrency:
+  group: dev-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Dev build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `inputs` is empty on a push, so that reads as false and only Windows builds.
+        os: ${{ fromJSON(inputs.all_platforms && '["windows-latest","macos-latest","ubuntu-latest"]' || '["windows-latest"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # 22, not release.yml's 20: the Tests step below runs
+          # `node --test "tests/*.test.js"`, and that glob needs Node 21+.
+          node-version: '22'
+
+      - name: Install Linux packaging tools
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot dpkg
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2 || true
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Tests
+        # A dev build that fails its own suite is not worth downloading. The
+        # suite is Node core only and takes seconds.
+        run: npm test
+
+      - name: Generate icons
+        run: npm run gen-icons
+
+      - name: Build
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        # The version in package.json is kept as it is, so the file names stay
+        # stable and each dev build REPLACES the last one's assets instead of
+        # piling up. Which commit a file came from is in the release body.
+        run: |
+          npx electron-builder --publish never ${{ matrix.os == 'windows-latest' && '--win' || matrix.os == 'macos-latest' && '--mac' || '--linux' }}
+
+      # Same reasoning as release.yml: the Windows runner's profile-less bash
+      # has no perl `shasum`, and a checksum hiccup must never cost the build.
+      - name: Checksums
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd dist
+          out="SHA256SUMS-${{ matrix.os }}.txt"
+          : > "$out"
+          for f in *.exe *.dmg *.zip *.AppImage *.deb; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" >> "$out" 2>/dev/null || shasum -a 256 "$f" >> "$out"
+          done
+          cat "$out"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRNetFree-Plus-dev-${{ matrix.os }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to the rolling "dev" pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: Dev build (latest push to main)
+          body: |
+            Built from `${{ github.sha }}` on ${{ github.ref_name }} by run [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+            A pre-release: the in-app update check reads `/releases/latest`, which excludes pre-releases, so this build is never offered to users as an update. Tagged releases come from `release.yml`.
+
+            Windows: install `IRNetFree-Plus-Setup-*.exe`, or run `IRNetFree-Plus-Portable-*.exe` without installing. Verify a download against `SHA256SUMS-*.txt`.
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/SHA256SUMS-*.txt
+          fail_on_unmatched_files: false

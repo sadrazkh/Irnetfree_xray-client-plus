@@ -20,6 +20,21 @@ This repository is the **Plus** fork of IRNetFree: the same client, plus two new
 
 ---
 
+### دانلود نسخهٔ آماده (Downloads)
+
+هر push روی `main` ورک‌فلوی «Dev build (rolling)» را اجرا می‌کند: نسخهٔ ویندوز ساخته می‌شود و روی یک
+pre-release به نام **dev** می‌نشیند که فایل‌هایش هر بار جای قبلی را می‌گیرند — یعنی همیشه آخرین بیلد
+قابل دانلود است. همان فایل‌ها زیر Actions ← آن اجرا ← Artifacts هم هستند. برای مک و لینوکس، همان
+ورک‌فلو را از تب Actions با گزینهٔ «all platforms» دستی اجرا کنید. نسخه‌های رسمی با تگ (`v2.0.0` و
+بعدی‌ها) از `release.yml` منتشر می‌شوند و فقط همان‌ها به‌روزرسانی درون‌برنامه‌ای را فعال می‌کنند؛ بیلد
+dev چون pre-release است هرگز به‌عنوان به‌روزرسانی پیشنهاد نمی‌شود.
+
+Every push to `main` runs the "Dev build (rolling)" workflow: it builds the Windows installers and
+keeps them on a **dev** pre-release whose assets are replaced each run, so the latest build is always
+downloadable — the same files are attached to the run as well. For macOS and Linux, run that workflow
+manually from the Actions tab with "all platforms". Tagged releases come from `release.yml`, and only
+those drive the in-app update: a dev build is a pre-release, which `/releases/latest` excludes.
+
 ## 📑 فهرست (Table of Contents)
 
 - [امکانات کامل](#-امکانات-کامل-features)
