@@ -105,3 +105,30 @@ test('plus: the release publishes every asset the updater reads, under the Plus 
   assert.ok(yml.includes('android/IRNetFree-Plus-*.apk'), 'the APK is published under the Plus name');
   assert.deepEqual(yml.match(/IRNetFree-(?!Plus)[A-Za-z*${]/g), null, 'an artifact still carries the original app name');
 });
+
+/**
+ * plus: the rolling dev build (.github/workflows/dev-release.yml). release.yml
+ * only fires on a tag, and GitHub triggers a tag run for at most three tags
+ * when several are pushed at once — so without this workflow a push can leave
+ * nothing to download. Two properties matter and neither is visible without a
+ * runner: a push to main must produce a downloadable build, and that build must
+ * never be offered to users as an update (the in-app check reads
+ * /releases/latest, which excludes pre-releases).
+ */
+test('plus: the dev workflow builds on every push and its build cannot pose as an update', () => {
+  const yml = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'dev-release.yml'), 'utf8');
+  const on = yml.slice(yml.indexOf('on:'), yml.indexOf('permissions:'));
+  assert.match(on, /push:/, 'a push must produce a downloadable build');
+  assert.match(on, /branches: \[main\]/);
+  assert.match(yml, /prerelease: true/, 'a dev build must stay out of /releases/latest');
+  assert.match(yml, /make_latest: false/);
+  assert.match(yml, /tag_name: dev/, 'one rolling release, whose assets are replaced each run');
+  assert.ok(/permissions:\s+contents: write/.test(yml), 'publishing a release needs contents: write');
+  // the suite runs inside the build, and `node --test "tests/*.test.js"` needs Node 21+
+  assert.match(yml, /node-version: '22'/);
+  assert.match(yml, /run: npm test/);
+  for (const glob of ['dist/*.exe', 'dist/SHA256SUMS-*.txt']) {
+    assert.ok(yml.includes(glob), 'the dev release does not publish ' + glob);
+  }
+  assert.deepEqual(yml.match(/IRNetFree-(?!Plus)[A-Za-z*${]/g), null, 'an artifact still carries the original app name');
+});
