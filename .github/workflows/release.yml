@@ -99,6 +99,7 @@ jobs:
           cat "$out"
 
       - name: Upload build artifacts
+        continue-on-error: true   # plus: an artifact hiccup must not skip the publish step below
         uses: actions/upload-artifact@v4
         with:
           name: IRNetFree-Plus-${{ matrix.os }}
