@@ -103,7 +103,15 @@ jobs:
           done
           cat "$out"
 
+      # A second copy of the same files, for when the release step is not
+      # available. It must never gate the release: the first dev build failed
+      # here with the installers already built (two 117 MB files — an artifact
+      # upload can hit an account's artifact storage limit or a transient
+      # 5xx), and the publish step below was skipped, so nothing was
+      # downloadable. Hence continue-on-error, `warn` instead of `error`, and a
+      # short retention so dev builds do not accumulate storage.
       - name: Upload build artifacts
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: IRNetFree-Plus-dev-${{ matrix.os }}
@@ -114,8 +122,10 @@ jobs:
             dist/*.AppImage
             dist/*.deb
             dist/SHA256SUMS-*.txt
-          if-no-files-found: error
-          retention-days: 30
+          if-no-files-found: warn
+          retention-days: 7
+          # the installers are already compressed; zipping them again buys nothing
+          compression-level: 0
 
       - name: Publish to the rolling "dev" pre-release
         uses: softprops/action-gh-release@v2
