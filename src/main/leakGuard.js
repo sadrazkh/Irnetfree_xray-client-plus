@@ -52,6 +52,7 @@
  */
 
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -251,6 +252,37 @@ function parseWinSnapshot(json) {
     if (typeof a.dhcp4 === 'boolean') rec.dhcp4 = a.dhcp4;
     if (typeof a.dhcp6 === 'boolean') rec.dhcp6 = a.dhcp6;
     out.push(rec);
+  }
+  return out;
+}
+
+/**
+ * `netsh interface ipv4|ipv6 show dnsservers` → Map<alias (lower-case), [addresses]>.
+ *
+ * The cheap half of a refresh: one native process, tens of milliseconds,
+ * against the second or two of CPU every PowerShell start costs — which
+ * v1.7.1 paid every 30 s of a session for an answer that was "unchanged"
+ * nearly every time. Only the quoted alias of each block and the addresses in
+ * it are read; the headings are localized and never matched. IPv6 scope ids
+ * (`fe80::1%22`) are dropped so a peer compares equal to what was written.
+ */
+function parseNetshDnsServers(text) {
+  const out = new Map();
+  let cur = null;
+  for (const raw of String(text == null ? '' : text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const head = line.match(/"([^"]*)"/);
+    if (head) {
+      cur = head[1].trim().toLowerCase();
+      if (cur && !out.has(cur)) out.set(cur, []);
+      continue;
+    }
+    if (!cur) continue;
+    for (const tok of line.split(/\s+/)) {
+      const ip = tok.replace(/%.*$/, '');
+      if (net.isIP(ip)) out.get(cur).push(ip.toLowerCase());
+    }
   }
   return out;
 }
@@ -476,15 +508,10 @@ function macRestoreLines(services) {
   ];
 }
 
-/** The same orphan hunt as on Windows. `[-]device` keeps pgrep off its own argv. */
-function macOrphanLines() {
-  const hunt = (pattern, label) =>
-    `for p in $(pgrep -f ${sh(pattern)} 2>/dev/null); do echo "killed ${label} (pid $p)"; kill -TERM "$p" 2>/dev/null || true; done`;
-  return [
-    hunt('sing-box run -c .*irnf-sb-', 'sing-box'),
-    hunt('[-]device utun', 'tun2socks')
-  ];
-}
+/** macOS tunnel recovery belongs to the backend's persisted, verified session.
+ * A generic utun/argv match cannot establish ownership (other VPNs use both).
+ */
+function macOrphanLines() { return []; }
 
 /* ----------------------------- macOS: the pf anchor ----------------------------- */
 
@@ -606,6 +633,20 @@ const macRepairScript = (services) => macReleaseScript(services, { orphans: true
  * empty here is read as "it was on DHCP", so the worst this can do is restore
  * too little.
  */
+function macOriginalSnapshot(fresh, peers, originals) {
+  const peerSet = new Set(peers.filter(Boolean));
+  const known = new Map((Array.isArray(originals) ? originals : [])
+    .filter(s => s && typeof s.name === 'string' && Array.isArray(s.dns))
+    .map(s => [s.name, s]));
+  return withoutPeers(fresh.map(s => {
+    const original = known.get(s.name);
+    // Only replace the contaminated snapshot. A later externally changed DNS
+    // list is authoritative; persisted prior-session originals win in mergeTargets.
+    return original && s.dns.some(d => peerSet.has(d))
+      ? { name: s.name, dns: addrList(original.dns) } : s;
+  }), peers);
+}
+
 function withoutPeers(list, peers) {
   const drop = new Set((peers || []).filter(Boolean).map(p => String(p).toLowerCase()));
   const keep = (arr) => addrList(arr).filter(a => !drop.has(String(a).toLowerCase()));
@@ -746,19 +787,19 @@ class LeakGuard {
   clearState() { try { fs.unlinkSync(this.statePath()); } catch {} }
 
   /** Run a generated script as root (macOS): a temp file, then one prompt. */
-  async _privileged(name, text) {
+  async _privileged(name, text, options) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-lg-'));
     const file = path.join(dir, `${name}.sh`);
     try {
       fs.writeFileSync(file, text, { mode: 0o700 });
-      return await this.runScriptPrivileged(file);
+      return await this.runScriptPrivileged(file, options);
     } finally {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
     }
   }
 
-  _powershell(script) {
-    return this.run('powershell', [...PS_FLAGS, '-Command', script]);
+  _powershell(script, options) {
+    return this.run('powershell', [...PS_FLAGS, '-Command', script], options);
   }
 
   /** One log line per tunnel process the repair killed. */
@@ -781,7 +822,7 @@ class LeakGuard {
    * tunnel (`tun.excludeIps`). Without the entry IPs among them a strict block
    * would cut the tunnel it exists to protect.
    */
-  engage({ level, peer4, peer6, tunAlias, backend, excludes } = {}) {
+  engage({ level, peer4, peer6, tunAlias, backend, excludes, originalMacServices } = {}) {
     // Claimed before the call is even queued: repairAtLaunch is fired and not
     // awaited, so it can land after this one and must not read the file we are
     // about to write as "a previous session's".
@@ -848,7 +889,8 @@ class LeakGuard {
       } else {
         const services = mergeTargets(
           (live && live.mac && live.mac.services) || [],
-          withoutPeers(parseMacSnapshot(await this.run('/bin/bash', ['-c', macSnapshotScript()])), [peer4, peer6]),
+          macOriginalSnapshot(parseMacSnapshot(await this.run('/bin/bash', ['-c', macSnapshotScript()])),
+            [peer4, peer6], originalMacServices),
           (s) => s.name);
         count = services.length;
         state.mac = { services };
@@ -914,28 +956,63 @@ class LeakGuard {
   }
 
   /**
-   * Hold the guard across a reconnect.
+   * Repair DNS drift without restarting the tunnel. The caller runs this only
+   * while its tunnel is active. Newly connected adapters are journaled before
+   * changing them; known adapters retain their pre-connect originals. An
+   * unchanged snapshot causes no writes, cache flushes, or privileged prompts.
+   * Firewall rules are intentionally not reloaded by this DNS-only operation.
    *
-   * The gap between the old tunnel going down and the new one coming up is the
-   * whole of a rebuild — a core restart, an adapter that takes seconds to appear,
-   * on a bad day half a minute. Releasing the guard first and engaging again
-   * afterwards puts every physical adapter back on the ISP's resolver for that
-   * whole window and takes the strict firewall down with it: the machine is
-   * unprotected for exactly as long as it takes to protect it again. That is the
-   * leak the owner asked about, and the answer is not to release at all.
-   *
-   * What DOES have to change across the gap is the strict firewall's holes: they
-   * were cut for the old tunnel's server addresses, and the core is about to
-   * dial a new one from the physical NIC. So this widens them to cover both —
-   * the union, never a release — and the engage on the far side narrows them
-   * back to the new tunnel's own list. `excludes` are the addresses the next
-   * connect must be able to reach directly (its resolved server entry IPs).
-   *
-   * The DNS override is deliberately NOT touched. During the gap it points at a
-   * tunnel peer that routes nowhere, so name resolution fails — which is the
-   * safe answer. The alternative is the ISP answering every query the machine
-   * makes while its user believes they are on a VPN.
+   * Windows pays for the snapshot in two halves. `netsh` lists every
+   * interface's resolvers in tens of milliseconds; when each adapter this
+   * session owns still names the peer(s), that is the whole tick. Only a
+   * drift — or `full`, which the watch sets on its first tick and every Nth
+   * after — takes the PowerShell snapshot that can also see an adapter that
+   * came up since (netsh cannot tell ours from the machine's).
    */
+  refresh({ token, full = false } = {}) {
+    return this._queue(async () => {
+      // Unlike user Disconnect, a background refresh must have an exact live
+      // receipt. An old timer must never reclaim DNS after release/reconnect.
+      if (!token || token !== this._token || !this._ownSession) return { refreshed: false, skipped: true };
+      const st = this.readState();
+      if (!st || !st.peer4 || !st.level || st.level === 'off') return { refreshed: false, skipped: true };
+      const options = { timeout: 15000 };
+      const peers = [st.peer4, st.peer6].filter(Boolean);
+      const same = (a, b) => a.length === b.length && a.every(v => b.includes(v));
+      let changed;
+      if (this.platform === 'win32' && st.win) {
+        if (!full && (st.win.adapters || []).length) {
+          const owned = st.win.adapters.map(a => String(a.alias || '').toLowerCase()).filter(Boolean);
+          const lists = (map, alias, peer) => (map.get(alias) || []).includes(String(peer).toLowerCase());
+          const v4 = parseNetshDnsServers(await this.run('netsh', ['interface', 'ipv4', 'show', 'dnsservers'], options));
+          const v6 = st.peer6 ? parseNetshDnsServers(await this.run('netsh', ['interface', 'ipv6', 'show', 'dnsservers'], options)) : null;
+          // An alias netsh no longer lists is an adapter that is gone, not a
+          // drift; an empty listing is not trusted and falls through.
+          const drifted = owned.some(alias => (v4.has(alias) && !lists(v4, alias, st.peer4))
+            || (v6 && v6.has(alias) && !lists(v6, alias, st.peer6)));
+          if (v4.size && !drifted) return { refreshed: false, adapters: 0, quick: true };
+        }
+        const fresh = parseWinSnapshot(await this._powershell(winSnapshotScript(st.tunAlias), options));
+        changed = fresh.filter(a => !same(a.v4, [st.peer4]) || (st.peer6 && !same(a.v6, [st.peer6])));
+        if (!changed.length) return { refreshed: false, adapters: 0 };
+        st.win.adapters = mergeTargets(st.win.adapters, withoutPeers(fresh, peers), a => a.alias);
+        this.writeState(st);
+        await this._powershell(winApplyScript(changed, st.peer4, st.peer6), options);
+      } else if (this.platform === 'darwin' && st.mac) {
+        const fresh = parseMacSnapshot(await this.run('/bin/bash', ['-c', macSnapshotScript()], options));
+        changed = fresh.filter(s => !same(s.dns, peers));
+        if (!changed.length) return { refreshed: false, adapters: 0 };
+        st.mac.services = mergeTargets(st.mac.services, withoutPeers(fresh, peers), s => s.name);
+        this.writeState(st);
+        await this._privileged('refresh', macApplyScript(changed, st.peer4, st.peer6), options);
+      } else return { refreshed: false, skipped: true };
+      this.onLog(`Leak guard: repaired DNS drift on ${changed.length} adapters`, 'warn');
+      return { refreshed: true, adapters: changed.length };
+    });
+  }
+
+  // Keep DNS pointed at the tunnel throughout reconnect, and widen only the
+  // strict firewall's server exceptions until the next engage narrows them.
   holdForReconnect({ excludes, token } = {}) {
     return this._queue(async () => {
       if (!this._owns(token)) return { held: false, adapters: 0, stale: true };
@@ -1137,7 +1214,7 @@ class LeakGuard {
 
 module.exports = {
   LeakGuard, STATE_FILE, FW_GROUP, GUARD_EXCLUDES, withoutPeers,
-  psQuote, parseWinSnapshot, parseMacSnapshot, rangeComplement,
+  psQuote, parseWinSnapshot, parseMacSnapshot, parseNetshDnsServers, rangeComplement,
   winSnapshotScript, winApplyScript, winRestoreScript, winOrphanKillScript, winRepairScript,
   winStrictApplyScript, winGroupRemoveScript, winUdpBlockApplyScript, winReleaseScript,
   macSnapshotScript, macApplyScript, macRestoreScript, macOrphanKillScript, macRepairScript,

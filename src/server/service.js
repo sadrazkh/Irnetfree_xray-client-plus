@@ -15,11 +15,12 @@ const fs = require('fs');
 const os = require('os');
 
 const { parseMany, parseLink, makeWireguardServer, makeProxyServer, applyServerEdits, buildShareLink, migrateStoredServer, parseWireguardConf } = require('../main/parser');
-const { buildConfig, buildTestConfig, buildMultiTestConfig, resolverBypassIpsOf, wgEndpointHosts } = require('../main/configBuilder');
-const { adapterDnsServers } = require('../main/dnsBuilder');
+const { buildConfig, buildTestConfig, buildMultiTestConfig, resolverBypassIpsOf, wgEndpointHosts, wgResolverAddresses } = require('../main/configBuilder');
+const { adapterDnsServers, guardPeers } = require('../main/dnsBuilder');
 const { buildSingboxConfig } = require('../main/singboxBuilder');
 const { engineFormat } = require('../main/engines');
-const { chooseEngine, testEngineFor, needsWgEndpointIp } = require('../main/engineChoice');
+const { chooseEngine, testEngineFor } = require('../main/engineChoice');
+const { resolveHost } = require('../main/trustedDns');
 const { fetchLeafPin, pinTargets, directServers, staleCertPins, recheckDue, PinWatch } = require('../main/certPin');
 const { assetStatus: scanAssets, downloadedFileNames } = require('../main/assets');
 const { geoTokensOf, checkGeoTokens, geoCodeHint } = require('../main/geoCheck');
@@ -30,8 +31,13 @@ const { Store } = require('../main/store');
 const { SubscriptionManager } = require('../main/subscription');
 const { TunManager, isOwnTunInterface, TUN_GW } = require('../main/tunManager');
 const { TunSingbox } = require('../main/tunSingbox');
+const { NativeMacTun } = require('../main/nativeMacTun');
+const { collectDiagnostics } = require('../main/connectionDiagnostics');
+const { stopTrackedTunnels, releaseGuardChecked } = require('../main/tunnelCleanup');
 const tunPlatform = require('../main/tunPlatform');
+const { appsForTun } = require('../main/tunApps');
 const { LeakGuard } = require('../main/leakGuard');
+const { DnsGuardWatch } = require('../main/dnsGuardWatch');
 const { StatsPoller, SilenceWatch } = require('../main/stats');
 const { UsageMeter, grandTotal } = require('../main/usage');
 const { Downloader } = require('../main/downloader');
@@ -71,13 +77,22 @@ const DEFAULT_SETTINGS = {
   // to install rather than silently falling back to proxy-only, which looked
   // like it had worked while half the machine was still outside the tunnel.
   tunMode: true,
-  // TUN backend: sing-box (auto_route, v4+v6) when installed, else tun2socks
+  // TUN backend: sing-box (auto_route, v4+v6) when installed, else tun2socks.
+  // 'native-macos' is opt-in only, on every platform and every build: its root
+  // LaunchDaemon is registered from Settings, never by a default that would
+  // change under a Mac user who never opened this page.
   tunBackend: 'sing-box',
   // leak guard under TUN: 'off' | 'standard' (adapter DNS override) | 'strict'
   // (+ strict_route and a firewall for everything off the tunnel)
   leakGuard: 'standard',
   // proxy mode only: block outbound UDP except :53 on physical adapters (WebRTC)
   blockUdpInProxyMode: false,
+  // per-app split under the sing-box TUN (see tunApps.js): 'off' | 'exclude'
+  // (these apps go around the tunnel) | 'only' (only these apps use it), over
+  // process names as the OS shows them. Refused without sing-box, and refused
+  // at the strict guard level, which promises nothing leaves outside the tunnel.
+  tunAppMode: 'off',
+  tunApps: [],
   autoUpdateSubs: true,
   autoUpdateInterval: 60,
   customRules: [],
@@ -165,6 +180,12 @@ function createService(opts = {}) {
   // doConnect); null when not under TUN. rebuildActiveConfig() reuses it rather
   // than asking the OS again — with the tunnel up, the default route IS the tunnel.
   let liveDirectInterface = null;
+  let liveDiagnostics = null;
+  let macRepairPromise = Promise.resolve();
+  let macRepairError = null;
+  let networkRepairing = false;
+  // A disconnect whose teardown threw; network recovery may then run even though the core is still up.
+  let cleanupFailed = false;
 
   const store = new Store(path.join(dataDir, 'store.json'), {
     servers: [], subscriptions: [], settings: DEFAULT_SETTINGS, activeServerId: null, xrayPath: null
@@ -208,16 +229,23 @@ function createService(opts = {}) {
    * one with `quiet`, so the fallback line is logged once per connect, not per poll.
    */
   function makeTun(settings, { quiet = false } = {}) {
-    const opts = { binDir: bundledBinDir, extraDirs: [userBinDir], onLog: (line, level) => send('log', { line, level }), lang: settings.lang };
+    let selected;
+    const opts = { binDir: bundledBinDir, extraDirs: [userBinDir], onLog: (line, level) => send('log', { line, level }), lang: settings.lang, userData: dataDir,
+      onUnexpectedExit: () => {
+        if (userDisconnecting || isQuitting || tun !== selected) return;
+        send('log', { line: 'The macOS tunnel exited unexpectedly; checking recovery', level: 'error' });
+        recoverFromNetworkChange('tunnel-exited').catch(e => send('log', { line: e.message, level: 'error' }));
+      } };
+    if (process.platform === 'darwin' && settings.tunBackend === 'native-macos') return (selected = new NativeMacTun(opts));
     const sb = new TunSingbox(opts);
     const legacy = new TunManager(opts);
-    if (settings.tunBackend === 'tun2socks') return legacy;
-    if (sb.isAvailable()) return sb;
+    if (settings.tunBackend === 'tun2socks') return (selected = legacy);
+    if (sb.isAvailable()) return (selected = sb);
     if (legacy.isAvailable()) {
       if (!quiet) send('log', { line: 'sing-box not installed — TUN falls back to tun2socks', level: 'warn' });
-      return legacy;
+      return (selected = legacy);
     }
-    return sb;   // neither: the sing-box error message names what to install
+    return (selected = sb);   // neither: the sing-box error message names what to install
   }
 
   const xray = new XrayManager({
@@ -344,7 +372,29 @@ function createService(opts = {}) {
     runScriptPrivileged: tunPlatform.runScriptPrivileged,
     platform: process.platform
   });
-  leakGuard.repairAtLaunch().catch((e) => send('log', { line: 'Leak guard repair failed: ' + e.message, level: 'error' }));
+  const dnsGuardWatch = new DnsGuardWatch({
+    guard: leakGuard,
+    isActive: () => !!tun?.active && !tun.managesDns && !userDisconnecting && !isQuitting && !xrayReloading,
+    onError: () => send('log', { line: 'DNS guard refresh failed; check network protection or reconnect.', level: 'warn' })
+  });
+  if (process.platform === 'darwin') {
+    macRepairPromise = (async () => {
+      // First, because it is the one recovery that can be holding the system's
+      // DNS right now: the root daemon outlives the app, so a force quit leaves
+      // it with a live session no journal of ours can undo. A no-op when the
+      // bridge is not there (isAvailable() false), which is every non-packaged
+      // build and the headless server.
+      await new NativeMacTun({ userData: dataDir }).recoverMacSessions();
+      const repair = new TunSingbox({ userData: dataDir });
+      await repair.recoverMacSessions();
+      await new TunManager({ userData: dataDir }).recoverMacSessions();
+      const result = await leakGuard.repairAtLaunch();
+      if (leakGuard.readState()) throw new Error('Saved DNS recovery is incomplete');
+      return result;
+    })().catch(e => { macRepairError = e; send('log', { line: 'Network recovery required', level: 'error' }); });
+  } else {
+    leakGuard.repairAtLaunch().catch((e) => send('log', { line: 'Leak guard repair failed: ' + e.message, level: 'error' }));
+  }
 
   // A hard `kill -9` of the headless server runs no shutdown path at all, so the
   // override would outlive it. This is the same sync, best-effort cleanup the
@@ -641,28 +691,36 @@ function createService(opts = {}) {
   /**
    * The settings for this connect, with every WireGuard peer endpoint that is a
    * NAME resolved to an address (see configBuilder.wgEndpointHosts for why).
-   * A name we cannot resolve is left as it is — the core's own error is clearer
+   * A name nobody can resolve is left as it is — the core's own error is clearer
    * than anything invented here.
    *
-   * Only for the core that needs it (see engineChoice.needsWgEndpointIp): this
-   * resolves through the MACHINE's resolver, which on a filtered connection is
-   * the answer the app exists to avoid trusting. The official core does its own
-   * lookup over DoH and must keep doing it.
+   * For EVERY core, not just the fork any more: a core that has to resolve the
+   * endpoint itself and fails takes the whole process down with it (see
+   * engineChoice.js). The lookup goes through trustedDns, so a network that
+   * answers every name with a fake-IP address does not get to place the peer.
    */
   async function withWgEndpointIps(serverId, settings) {
     let hosts = [];
     try {
-      const { plan } = buildPlan(serverId, settings);
-      if (!needsWgEndpointIp(xray.resolveEngine(chooseEngine(plan, settings.defaultEngine), { quiet: true }).id)) return settings;
-      hosts = wgEndpointHosts(plan);
+      hosts = wgEndpointHosts(buildPlan(serverId, settings).plan);
     } catch { return settings; }
     if (!hosts.length) return settings;
     const map = {};
+    const notes = [];
     await Promise.all(hosts.map(async (h) => {
-      const ips = await tunPlatform.resolveServerIps(h).catch(() => []);
-      if (ips.length) map[h] = ips[0];
-      else send('log', { line: `Could not resolve the WireGuard endpoint ${h} — leaving it to the core`, level: 'warn' });
+      const r = await resolveHost(h, { ipv6: !!settings.ipv6, doh: settings.dnsRemote }).catch(() => null);
+      if (!r || !r.ips.length) {
+        send('log', { line: `Could not resolve the WireGuard endpoint ${h} — leaving it to the core`, level: 'warn' });
+        return;
+      }
+      map[h] = r.ips[0];
+      if (r.source === 'doh') {
+        notes.push(`this network answered ${h} with ${r.suspect.join(', ')}; using ${r.ips[0]} from DoH instead`);
+      } else if (r.source === 'os-suspect') {
+        notes.push(`${h} resolves to ${r.ips[0]}, which no public server can be — if the endpoint is not on this LAN, the network is answering for it`);
+      }
     }));
+    for (const n of notes) send('log', { line: 'WireGuard endpoint: ' + n, level: 'warn' });
     const named = Object.keys(map);
     if (!named.length) return settings;
     send('log', { line: 'WireGuard endpoint: ' + named.map(h => `${h} → ${map[h]}`).join(', '), level: 'info' });
@@ -670,6 +728,7 @@ function createService(opts = {}) {
   }
 
   async function doConnect(serverId) {
+    if (networkRepairing) throw new Error('Network recovery is still running');
     // Every await below is a window in which the operator can hit disconnect.
     // doDisconnect() then stops the core and clears activeServerId, but THIS call
     // would carry on to start both watchers again and emit 'connected' — leaving
@@ -679,6 +738,11 @@ function createService(opts = {}) {
     const gen = ++connGen;
     const stale = () => gen !== connGen;
     const abandoned = { ok: false, stale: true };
+    if (process.platform === 'darwin') {
+      await macRepairPromise;
+      if (stale()) return abandoned;
+      if (macRepairError) throw new Error('Network recovery is required before connecting');
+    }
 
     // The watcher only starts once this connect has FINISHED (see the end of
     // this function), so a network that moves while the tunnel is being built
@@ -717,6 +781,10 @@ function createService(opts = {}) {
     // Ours stays in hand, and startedTuns is what disconnect/quit/exit sweep.
     const myTun = tun;
     startedTuns.add(myTun);
+  if (settings.tunMode && myTun.prepare) {
+    await myTun.prepare({ strict: settings.leakGuard === 'strict' });
+    if (stale()) return abandoned;
+  }
 
     // Under TUN the OS default route is the tunnel, so every dial Xray makes
     // itself (direct, the anti-DPI dialers, the first hop of a chain) must be
@@ -740,6 +808,18 @@ function createService(opts = {}) {
     }
 
     const { plan, label, entryAddrs, config, geoWarn, engine } = buildActive(serverId, settings);
+    // Managed DNS off drops every resolver a routing target brings — a
+    // corporate WireGuard's own DNS above all. The names inside that network
+    // then never resolve, and nothing else in the log says why.
+    if (settings.dnsManaged === false) {
+      const corp = wgResolverAddresses(plan);
+      if (corp.length) {
+        send('log', {
+          line: `Managed DNS is off, so the resolver of your WireGuard (${corp.join(', ')}) is not in this config and names inside that network will not resolve — turn Settings → DNS → "DNS managed by the app" back on`,
+          level: 'warn'
+        });
+      }
+    }
 
     send('status', { state: 'connecting', serverId });
 
@@ -771,6 +851,7 @@ function createService(opts = {}) {
     xrayReloading = true;
     try {
       await xray.start(config, runEngine);
+      if (!stale()) liveDiagnostics = JSON.parse(JSON.stringify({ config, plan, socksPort: settings.socksPort, tunRequested: !!settings.tunMode }));
     } catch (e) {
       // start() watches for 1.2 s to catch a config that crashes the core on
       // startup. A disconnect landing inside that grace KILLS the process, so
@@ -805,6 +886,11 @@ function createService(opts = {}) {
     let guardError = null;
     let guardEngaged = false;
     let guardToken = null;      // receipt for this connect's guard session
+    // What the TUN adapter's own resolver was set to. The leak guard points the
+    // PHYSICAL adapters at the same thing (see dnsBuilder.guardPeers): when the
+    // core hijacks port 53 that is the tunnel peer, and when it does not, the
+    // peer answers nothing and the machine must not be sent to it.
+    let tunAdapterDns = null;
     if (settings.tunMode) {
       if (!myTun.isAvailable()) {
         tunError = settings.lang === 'en'
@@ -834,24 +920,47 @@ function createService(opts = {}) {
           // whole rebuild, with no tunnel; holding keeps the override and only
           // widens the firewall's holes to the server about to be dialled.
           try {
-            await leakGuard.holdForReconnect({
+            if (!tun?.managesDns) await leakGuard.holdForReconnect({
               excludes: await tunPlatform.resolveServerIps(entryAddrs, { ipv6: true }).catch(() => []),
               token: guardToken
             });
           } catch {}
-          try { await myTun.stop(); } catch {}
+          if (process.platform === 'darwin') await myTun.stop();
+          else { try { await myTun.stop(); } catch {} }
         }
         try {
           myTun.lang = settings.lang || 'fa';
+          // The per-app split, decided once and told to the user when it is
+          // refused — a rule that is silently dropped looks exactly like a rule
+          // that is working (see tunApps.js for the order of the reasons).
+          // The native macOS service calls itself 'sing-box' (a sing-box is what
+          // it runs), but the app never writes that config — it hands the daemon
+          // a fixed set of fields with no process rule in it. So the decision is
+          // told what this really is, not what the backend calls itself.
+          const { apps: tunApps, warn: tunAppsWarn } = appsForTun(settings, myTun.native ? 'native-macos' : myTun.backendId);
+          if (tunAppsWarn) send('log', { line: tunAppsWarn, level: 'warn' });
           // from the running config, not rebuilt from the plan — see main.js
-          await myTun.start(settings.socksPort, [...entryAddrs, ...resolverBypassIpsOf(config)],
-            adapterDnsServers(settings, hijacks ? dnsPeer : null),
-            { ipv6: !!settings.ipv6, strict: settings.leakGuard === 'strict' });   // tun2socks ignores the 4th
+          tunAdapterDns = adapterDnsServers(settings, hijacks ? dnsPeer : null);
+          // The WireGuard endpoints this connect resolved itself are addresses the
+          // core will dial DIRECTLY (a peer dialled through a chain rides the hop
+          // and needs nothing here, but one dialled on its own would loop back
+          // into the tunnel it is building).
+          const wgEndpoints = Object.values(settings.wgEndpointIps || {});
+          await myTun.start(settings.socksPort, [...entryAddrs, ...resolverBypassIpsOf(config), ...wgEndpoints],
+            tunAdapterDns,
+            { ipv6: !!settings.ipv6, strict: settings.leakGuard === 'strict', apps: tunApps });   // tun2socks ignores the 4th
           send('log', { line: 'TUN mode active (whole system)', level: 'info' });
+          if (tunApps) {
+            send('log', {
+              line: `Per-app routing: ${tunApps.mode === 'exclude' ? 'these apps go around the tunnel' : 'only these apps use the tunnel'} — ${tunApps.names.join(', ')}`,
+              level: 'info'
+            });
+          }
         if (settings.leakGuard === 'strict' && myTun.backendId !== 'sing-box') {
-          send('log', { line: 'Strict guard on the tun2socks backend: no strict_route and no IPv6 route — install sing-box for the guard the setting promises', level: 'warn' });
+          send('log', { line: 'Strict guard on the tun2socks backend: no strict_route and IPv4-only firewall rules — install sing-box for the guard the setting promises', level: 'warn' });
         }
-        } catch (e) { tunError = e.message; send('log', { line: 'TUN start failed: ' + e.message, level: 'error' }); }
+        } catch (e) { tunError = e.message;
+        if (process.platform === 'darwin' && myTun.active) throw e; send('log', { line: 'TUN start failed: ' + e.message, level: 'error' }); }
       }
       // The leak guard (standard): the TUN adapter's own resolver is ours, but
       // Windows asks the resolvers of EVERY connected adapter in parallel and
@@ -859,14 +968,15 @@ function createService(opts = {}) {
       // adapters still hand every name to the ISP. Only for a tunnel that
       // actually came up: with no tunnel there is nothing to point them at, and
       // doing it anyway would leave the machine unable to resolve at all.
-      if (myTun.active && settings.leakGuard !== 'off') {
+      if (myTun.active && !myTun.managesDns && settings.leakGuard !== 'off') {
         try {
           const res = await leakGuard.engage({
+            originalMacServices: myTun.macState && myTun.macState.service
+              ? [{ name: myTun.macState.service, dns: myTun.macState.savedDns }] : [],
             level: settings.leakGuard,
-            peer4: myTun.dnsPeer || TUN_GW,
             // not gated on the ipv6 setting — see main.js: the peer answers on
             // either family, and gating it left the ISP owning IPv6 resolution
-            peer6: myTun.dnsPeer6 || null,
+            ...guardPeers(tunAdapterDns, { peer4: myTun.dnsPeer || TUN_GW, peer6: myTun.dnsPeer6 || null }),
             // macOS: the strict level's pf anchor has to name the REAL tunnel
             // device (the utun the backend was given at start), not the Windows
             // adapter name — a ruleset that cannot name the tunnel would block
@@ -883,6 +993,7 @@ function createService(opts = {}) {
           // the receipt for THIS session, so an overtaken connect can only ever
           // undo its own guard
           guardToken = (res && res.token) || guardToken;
+        dnsGuardWatch?.start(guardToken);
         } catch (e) {
           // Not fatal — the tunnel is up and carrying traffic, the adapters just
           // kept their own resolvers. Deliberately NOT tunError: that one means
@@ -1011,7 +1122,7 @@ function createService(opts = {}) {
         if (leakGuard) {
           let entries = [];
           try { entries = buildPlan(serverId, getSettings()).entryAddrs || []; } catch { /* fall back to what is held */ }
-          await leakGuard.holdForReconnect({
+          if (!tun?.managesDns) await leakGuard.holdForReconnect({
             excludes: await tunPlatform.resolveServerIps(entries, { ipv6: true }).catch(() => [])
           });
         }
@@ -1058,7 +1169,8 @@ function createService(opts = {}) {
     try {
       const check = await xray.validateWithFallback(config, engine);
       if (!check.ok) throw new Error(check.error);
-      await xray.start(config, check.engine);   // start() stops the old instance first
+      await xray.start(config, check.engine);
+      liveDiagnostics = JSON.parse(JSON.stringify({ config, plan, socksPort: settings.socksPort, tunRequested: !!settings.tunMode }));   // start() stops the old instance first
       watchWgSilence(config);   // the plan may have changed under the live tunnel
       if (usage) { usage.reset(); usage.setPlan(plan, serverId); }
     } finally { xrayReloading = prevReloading; }
@@ -1261,10 +1373,8 @@ function createService(opts = {}) {
    * routes with nothing else pointing at it (see startedTuns).
    */
   async function stopAllTuns() {
-    const all = new Set(startedTuns);
-    if (tun) all.add(tun);
-    startedTuns.clear();
-    for (const t of all) { try { await t.stop(); } catch {} }
+  dnsGuardWatch?.stop();
+    await stopTrackedTunnels(startedTuns, tun);
   }
 
   /** The same sweep for the exit hook, where nothing can be awaited. */
@@ -1276,34 +1386,49 @@ function createService(opts = {}) {
 
   async function doDisconnect() {
     userDisconnecting = true;
-    // Anything already in flight stops speaking for the service from this line
-    // on: a doConnect() past xray.start() must not emit 'connected' or restart
-    // the watchers, and a recovery that hung (a stuck privileged shell) must not
-    // keep its lock and park every future trigger.
-    connGen++;
-    recoverGen++;
-    recovering = false;
-    stopProcWatcher();
-    stopNetWatcher();                // nothing live to recover any more
-    if (stats) stats.stop();
-    // Flush before the counters go away, then reset: the next core starts at
-    // zero and must not be read as growth on this one.
-    if (usage) { usage.tick(null); if (usage.dirty) { usageStore.set('totals', usage.totals); usage.markSaved(); } usage.reset(); }
-    if (usage) send('usage', { totals: usage.totals });   // settle the UI on the final figure
-    // The adapters point at real resolvers again BEFORE the tunnel goes: in
-    // between they would be pointing at an address that no longer routes anywhere.
-    try { if (leakGuard) await leakGuard.release(); } catch {}
-    // `tun` is the instance doConnect() started (makeTun), whichever backend
-    // it chose — the same one shutdown() tears down.
-    await stopAllTuns();
-    try { await setSystemProxy(false, {}); } catch {}
-    if (xray) await xray.stop();
-    store.set('activeServerId', null);
-    pinWatch.clear();
-    appliedSettings = null;          // nothing live to be out of sync with
-    liveDirectInterface = null;
-    send('status', { state: 'disconnected' });
-    userDisconnecting = false;
+    try {
+      // Anything already in flight stops speaking for the service from this line
+      // on: a doConnect() past xray.start() must not emit 'connected' or restart
+      // the watchers, and a recovery that hung (a stuck privileged shell) must not
+      // keep its lock and park every future trigger.
+      connGen++;
+      recoverGen++;
+      recovering = false;
+      stopProcWatcher();
+      stopNetWatcher();                // nothing live to recover any more
+      if (stats) stats.stop();
+      // Flush before the counters go away, then reset: the next core starts at
+      // zero and must not be read as growth on this one.
+      if (usage) { usage.tick(null); if (usage.dirty) { usageStore.set('totals', usage.totals); usage.markSaved(); } usage.reset(); }
+      if (usage) send('usage', { totals: usage.totals });   // settle the UI on the final figure
+      // The adapters point at real resolvers again BEFORE the tunnel goes: in
+      // between they would be pointing at an address that no longer routes anywhere.
+      if (process.platform === 'darwin') {
+        // Stop the owned process before removing the guard, retaining recovery on failure.
+        await stopAllTuns();
+        await releaseGuardChecked(leakGuard);
+      } else {
+        try { if (leakGuard) await leakGuard.release(); } catch {}
+      }
+      // `tun` is the instance doConnect() started (makeTun), whichever backend
+      // it chose — the same one shutdown() tears down.
+      await stopAllTuns();
+      try { await setSystemProxy(false, {}); } catch {}
+      if (xray) await xray.stop();
+      store.set('activeServerId', null);
+      liveDiagnostics = null;
+      pinWatch.clear();
+      appliedSettings = null;          // nothing live to be out of sync with
+      liveDirectInterface = null;
+      cleanupFailed = false;
+      send('status', { state: 'disconnected' });
+    } catch (e) {
+      // A CODE, not a sentence: the desktop says this one in the user's language
+      // (net.cleanupFailed) and a headless consumer gets something it can branch on.
+      cleanupFailed = true;
+      send('status', { state: 'cleanup-failed', error: 'cleanup-failed' });
+      throw e;
+    } finally { userDisconnecting = false; }
   }
 
   /* ----------------------------- LAN address ----------------------------- */
@@ -1344,7 +1469,61 @@ function createService(opts = {}) {
   // ping:realMany — one throwaway core per engine for up to REAL_BATCH targets,
   // REAL_PARALLEL requests in flight (see main.js for the reasoning)
   const REAL_BATCH = 20, REAL_PARALLEL = 6;
+  async function connectionDiagnostics(probe) {
+    return collectDiagnostics(Object.assign({}, liveDiagnostics || {}, {
+      coreRunning: !!(xray && xray.running), tunActive: !!(tun && tun.active), cleanupFailed, probe
+    }));
+  }
+
+  async function nativeService(command) {
+    if (!['status', 'register', 'unregister', 'settings'].includes(command)) throw new Error('Unsupported native service command');
+    const manager = new NativeMacTun();
+    if (command === 'unregister') {
+      await doDisconnect();
+      await manager.recoverMacSessions();
+    }
+    return manager.service(command);
+  }
+
+  /**
+   * Undo what a CRASHED session left behind — never what a live one is using.
+   *
+   * It used to open with doDisconnect(), which made a button sitting between
+   * "Refresh state" and "Copy report" drop the VPN with no warning (and on
+   * Windows and Linux, where the darwin block below is skipped, that was the
+   * whole of what it did). Recovery is for an app that is not connected, so a
+   * connected one is a refusal — a code, so the renderer can say it in the
+   * user's own language. The one exception is a disconnect whose teardown threw:
+   * the core is then still up AND the network half undone, and refusing there
+   * would leave the cleanup-failed toast pointing at a button that is never shown.
+   */
+  async function repairNetwork() {
+    if (networkRepairing) return { ok: false, error: 'Network recovery is already running' };
+    if (xray && xray.running && !cleanupFailed) return { ok: false, error: 'connected' };
+    networkRepairing = true;
+    try {
+      await macRepairPromise;
+      // The teardown that failed, once more, before the recoveries.
+      if (cleanupFailed) { try { await doDisconnect(); } catch { /* the recoveries below are the point */ } }
+      if (process.platform === 'darwin') {
+        await new NativeMacTun().recoverMacSessions();
+        const repair = new TunSingbox({ userData: dataDir });
+        await repair.recoverMacSessions();
+        await new TunManager({ userData: dataDir }).recoverMacSessions();
+      }
+      await releaseGuardChecked(leakGuard);
+      macRepairError = null;
+      cleanupFailed = false;
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: 'Network recovery incomplete. Retry and allow the macOS administrator prompt.' };
+    } finally { networkRepairing = false; }
+  }
+
   const handlers = {
+    'diagnostics:connection': connectionDiagnostics,
+    'network:repair': repairNetwork,
+    'native:service': nativeService,
     'app:init': () => ({
       servers: store.get('servers', []),
       subscriptions: store.get('subscriptions', []),
@@ -1645,8 +1824,13 @@ function createService(opts = {}) {
     try { stopNetWatcher(); } catch {}
     try { if (stats) stats.stop(); } catch {}
     try { if (usage) { usage.tick(null); usageStore.set('totals', usage.totals); usage.markSaved(); } } catch {}
-    try { if (leakGuard) await leakGuard.release(); } catch {}   // adapters first, then the tunnel
-    await stopAllTuns();   // every instance a connect started, not just the last
+    if (process.platform === 'darwin') {
+      try { await stopAllTuns(); await releaseGuardChecked(leakGuard); }
+      catch { send('log', { line: 'Network cleanup pending; recovery retained for next launch', level: 'error' }); }
+    } else {
+      try { if (leakGuard) await leakGuard.release(); } catch {}
+      await stopAllTuns();
+    }
     try { await setSystemProxy(false, {}); } catch {}
     try { if (xray) await xray.stop(); } catch {}
     try { await xserver.stop(); } catch {}   // plus

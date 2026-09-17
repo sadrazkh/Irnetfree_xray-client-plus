@@ -72,7 +72,8 @@ test('darwin: the sing-box backend finds `sing-box`, ignores `sing-box.exe`, and
     touch(d, ['sing-box']);
     assert.equal(mac.singboxPath(), path.join(d, 'sing-box'));
     assert.equal(mac.isAvailable(), true, 'no wintun.dll asked for off Windows');
-    assert.equal(win.isAvailable(), false, 'Windows still wants wintun next to it');
+    win.dirs = () => [d];   // no other known dir to copy a wintun.dll from
+    assert.equal(win.isAvailable(), false, 'Windows still wants a wintun.dll it can put next to it');
     assert.equal(mac.isElevated(), true, 'the osascript prompt stands in for admin rights');
   } finally { rm(d); }
 });
@@ -113,7 +114,7 @@ test('darwin: the setup script quotes a service name with a space and writes bot
     logFile: '/tmp/x/l', pidFile: '/tmp/x/p', devFile: '/tmp/x/d',
     service: 'Thunderbolt Bridge', dnsServers: [TUN_PEER4, TUN_PEER6]
   });
-  assert.ok(s.includes(`networksetup -setdnsservers 'Thunderbolt Bridge' ${TUN_PEER4} ${TUN_PEER6} 2>/dev/null || true`));
+  assert.ok(s.includes(`networksetup -setdnsservers 'Thunderbolt Bridge' '${TUN_PEER4}' '${TUN_PEER6}' || exit 14`));
 });
 
 test('darwin: the self-check script carries the same peers and state file, in bash 3.2', () => {

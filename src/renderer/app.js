@@ -74,33 +74,50 @@ function fmtSpeed(n) { return fmtBytes(n) + '/s'; }
 // 60-point polyline costs and no more. Declared up here, before the theme and
 // skin appliers that redraw it, so no caller can reach `hist` before it exists.
 const SPARK_N = 60;
-const hist = { down: [], up: [] };
+const hist = { down: [], up: [], time: [] };
 function pushHist(down, up) {
-  hist.down.push(Number(down) || 0);
-  hist.up.push(Number(up) || 0);
-  if (hist.down.length > SPARK_N) { hist.down.shift(); hist.up.shift(); }
+  const speed = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+  hist.down.push(speed(down)); hist.up.push(speed(up)); hist.time.push(Date.now());
+  while (hist.time.length > 120 || (hist.time.length > 1 && hist.time[0] < Date.now() - 60000)) {
+    hist.down.shift(); hist.up.shift(); hist.time.shift();
+  }
 }
 function drawSpark() {
   const c = $('#speedSpark');
   if (!c || !c.getContext) return;
+  const box = c.getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  const ratio = Math.min(window.devicePixelRatio || 1, 3);
+  const W = box.width, H = box.height;
+  c.width = Math.round(W * ratio); c.height = Math.round(H * ratio);
   const ctx = c.getContext('2d');
-  const W = c.width, H = c.height;
-  ctx.clearRect(0, 0, W, H);
-  if (hist.down.length < 2) return;
+  if (!ctx) return;
+  ctx.scale(ratio, ratio);
   const css = getComputedStyle(document.documentElement);
-  const max = Math.max(1, ...hist.down, ...hist.up);
-  for (const [arr, token] of [[hist.down, '--accent'], [hist.up, '--ok']]) {
-    ctx.beginPath();
-    ctx.strokeStyle = css.getPropertyValue(token).trim() || '#888';
-    ctx.lineWidth = 1.5;
-    arr.forEach((v, i) => {
-      const x = (i / (SPARK_N - 1)) * W;
-      const y = H - 1 - (v / max) * (H - 2);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
+  const peak = Math.max(1024, ...hist.down, ...hist.up);
+  const order = Math.pow(10, Math.floor(Math.log10(peak)));
+  const max = Math.ceil(peak / order) * order;
+  $('#chartScale').textContent = fmtSpeed(max);
+  const top = 20, bottom = H - 6, height = bottom - top;
+  ctx.strokeStyle = css.getPropertyValue('--line').trim(); ctx.lineWidth = 1;
+  ctx.setLineDash([3, 5]);
+  for (let n = 0; n <= 2; n++) { const y = top + height * n / 2; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  ctx.setLineDash([]);
+  const now = hist.time.at(-1) || Date.now();
+  for (const [arr, token, dashed] of [[hist.down, '--accent', false], [hist.up, '--ok', true]]) {
+    if (!arr.length) continue;
+    const points = arr.map((v,i) => [Math.max(0, 1 - (now - hist.time[i]) / 60000) * W, bottom - (v / max) * height]);
+    const color = css.getPropertyValue(token).trim() || '#888';
+    ctx.beginPath(); points.forEach(([x,y],i) => i ? ctx.lineTo(x,y) : ctx.moveTo(x,y));
+    ctx.lineTo(points.at(-1)[0],bottom); ctx.lineTo(points[0][0],bottom); ctx.closePath();
+    const wash = ctx.createLinearGradient(0,top,0,bottom); wash.addColorStop(0,color); wash.addColorStop(1,'transparent');
+    ctx.globalAlpha = dashed ? .06 : .16; ctx.fillStyle = wash; ctx.fill(); ctx.globalAlpha = 1;
+    ctx.beginPath(); points.forEach(([x,y],i) => i ? ctx.lineTo(x,y) : ctx.moveTo(x,y));
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.setLineDash(dashed ? [5,3] : []); ctx.stroke(); ctx.setLineDash([]);
+    const [x,y] = points.at(-1); ctx.beginPath(); ctx.arc(Math.min(W-3,x),y,2.5,0,Math.PI*2); ctx.fillStyle=color; ctx.fill();
   }
 }
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(drawSpark).observe($('#speedSpark'));
 
 /** Human duration from seconds (days / hours / minutes). */
 function fmtDuration(sec) {
@@ -373,6 +390,11 @@ function applySettingsToUI() {
   $('#optSysProxy').checked = !!s.systemProxy;
   $('#optTun').checked = !!s.tunMode;
   $('#optTunBackend').value = s.tunBackend || 'sing-box';
+  $('#optTunAppMode').value = s.tunAppMode || 'off';
+  // stored as a list, typed as lines
+  $('#optTunApps').value = (Array.isArray(s.tunApps) ? s.tunApps : []).join('\n');
+  $('#optTunBackend option[value="native-macos"]').hidden = state.platform !== 'darwin';
+  $('#nativeMacControls').hidden = state.platform !== 'darwin';
   $('#optLeakGuard').value = s.leakGuard || 'standard';
   $('#optBlockUdpProxy').checked = !!s.blockUdpInProxyMode;
   $('#optAllowLan').checked = !!s.allowLan;
@@ -393,6 +415,7 @@ function applySettingsToUI() {
   syncPreset('#dnsRemotePreset', '#dnsRemoteInput');
   syncPreset('#dnsDirectPreset', '#dnsDirectInput');
   updateGuardRows();
+  updateTunAppRows();
 }
 
 /**
@@ -425,6 +448,7 @@ function renderOptionCards(selectId, hostId, icons) {
   if (!sel || !host) return;
   host.innerHTML = '';
   for (const opt of [...sel.options]) {
+    if (opt.hidden) continue;
     const raw = opt.textContent.trim();
     const cut = raw.indexOf('—');
     const title = cut > 0 ? raw.slice(0, cut).trim() : raw;
@@ -451,23 +475,27 @@ function renderOptionCards(selectId, hostId, icons) {
 }
 
 const GUARD_ICONS = { off: '⚪', standard: '🛡', strict: '🔒' };
-const BACKEND_ICONS = { 'sing-box': '📦', tun2socks: '🧩' };
+const BACKEND_ICONS = { 'native-macos': '🍎', 'sing-box': '📦', tun2socks: '🧩' };
+const TUNAPP_ICONS = { off: '⚪', exclude: '↩', only: '🎯' };
 
-/** Both card groups, from whatever the selects currently hold. */
+/** Every card group, from whatever the selects currently hold. */
 function renderSettingCards() {
   renderOptionCards('#optLeakGuard', '#leakGuardCards', GUARD_ICONS);
   renderOptionCards('#optTunBackend', '#tunBackendCards', BACKEND_ICONS);
+  renderOptionCards('#optTunAppMode', '#tunAppModeCards', TUNAPP_ICONS);
 }
 
 function updateGuardRows() {
   const tunOn = !!($('#optTun') && $('#optTun').checked);
+  const nativeSelected = state.platform === 'darwin' && $('#optTunBackend').value === 'native-macos';
+  $('#nativeMacStrict').hidden = !nativeSelected;
   const guardRow = $('#leakGuardRow');
   if (guardRow) {
     guardRow.classList.toggle('disabled', !tunOn);
     $('#optLeakGuard').disabled = !tunOn;
     $('#guardNeedsTun').hidden = tunOn;
     // the pf anchor behind "strict" has never run on a real Mac (phase 3)
-    $('#guardMacNote').hidden = (state.assets || {}).platform !== 'darwin';
+    $('#guardMacNote').hidden = state.platform !== 'darwin' || nativeSelected;
     // Strict blocks everything that does not go through the tunnel — and a
     // "direct" route is exactly that. Say so where the two are chosen, not in a
     // log line the user reads after their bank stops loading.
@@ -489,6 +517,31 @@ function updateGuardRows() {
     $('#optBlockUdpProxy').disabled = tunOn;
     $('#udpBlockNote').hidden = !tunOn;
   }
+}
+
+/**
+ * The per-app row: the list only exists once a mode is chosen, and each warning
+ * appears only while it is actually true.
+ *
+ * Both warnings are about a choice made a few centimetres away, so they belong
+ * here and not in a log line read after the fact. Strict promises that nothing
+ * leaves outside the tunnel — which is precisely what "send these apps around
+ * it" asks for, so one of the two has to give. And only sing-box can see the
+ * process behind a packet; under tun2socks the list is simply not applied.
+ *
+ * Values come from the controls, not from state.settings, so the row is right
+ * the moment a card is clicked and still right after the save comes back.
+ */
+function updateTunAppRows() {
+  const row = $('#tunAppRow');
+  if (!row) return;                     // the settings view is not built yet
+  const on = ($('#optTunAppMode').value || 'off') !== 'off';
+  $('#tunAppsBlock').hidden = !on;
+  $('#tunAppStrictNote').hidden = !(on && $('#optLeakGuard').value === 'strict');
+  // Every backend that is not sing-box, not just tun2socks: the native macOS
+  // service runs a sing-box of its own, but the app never writes that config,
+  // so the rule would never reach it either.
+  $('#tunAppNeedsSingbox').hidden = !(on && $('#optTunBackend').value !== 'sing-box');
 }
 
 /** Reflect an input's value in its preset dropdown (or "custom"). */
@@ -536,6 +589,8 @@ function readSettingsForm() {
     systemProxy: $('#optSysProxy').checked,
     tunMode: $('#optTun').checked,
     tunBackend: $('#optTunBackend').value,
+    tunAppMode: $('#optTunAppMode').value,
+    tunApps: readTunApps(),
     leakGuard: $('#optLeakGuard').value,
     blockUdpInProxyMode: $('#optBlockUdpProxy').checked,
     allowLan: $('#optAllowLan').checked,
@@ -549,6 +604,21 @@ function readSettingsForm() {
 }
 function listFromInput(sel) {
   return $(sel).value.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * The per-app textarea → the list that is stored: one name per line, trimmed,
+ * blank lines dropped, repeats dropped, typing order kept. A name repeated in
+ * a routing rule set is not an error the user should be told about — it is
+ * just the same name twice — so it is quietly folded away instead.
+ */
+function readTunApps() {
+  const apps = [];
+  for (const line of $('#optTunApps').value.split(/\r?\n/)) {
+    const name = line.trim();
+    if (name && !apps.includes(name)) apps.push(name);
+  }
+  return apps;
 }
 
 /**
@@ -706,10 +776,79 @@ $('#dnsDirectInput').oninput = () => syncPreset('#dnsDirectPreset', '#dnsDirectI
 $('#optDnsManaged').onchange = () => saveSettings({ dnsManaged: $('#optDnsManaged').checked });
 $('#optIpv6').onchange = () => saveSettings({ ipv6: $('#optIpv6').checked });
 
-/* TUN backend / leak guard / proxy-mode UDP block — each saves only its own key */
-$('#optTunBackend').onchange = () => saveSettings({ tunBackend: $('#optTunBackend').value });
-$('#optLeakGuard').onchange = () => { saveSettings({ leakGuard: $('#optLeakGuard').value }); updateGuardRows(); };
+/* TUN backend / leak guard / proxy-mode UDP block — each saves only its own key.
+   The backend and the guard both decide whether the per-app row's warnings are
+   true, so each of them refreshes that row too. */
+$('#optTunBackend').onchange = () => { saveSettings({ tunBackend: $('#optTunBackend').value }); updateGuardRows(); updateTunAppRows(); };
+$$('[data-native-service]').forEach(button => {
+  button.onclick = async () => {
+    const buttons = $$('[data-native-service]');
+    buttons.forEach(item => { item.disabled = true; });
+    const output = $('#nativeMacStatus');
+    output.textContent = t('native.working');
+    try {
+      const reply = await window.api.nativeService(button.dataset.nativeService);
+      if (!reply || !reply.ok) throw new Error(reply?.error || t('native.failed'));
+      const known = ['enabled', 'requiresApproval', 'notRegistered', 'notFound'];
+      output.textContent = known.includes(reply.status) ? t(`native.${reply.status}`) : t('native.unknown');
+      if (reply.active === true) output.textContent += ' · ' + t('native.active');
+    } catch (error) {
+      // The daemon's words are English and technical. They go on a line of their
+      // own, UNDER a sentence the user can read — never glued to the end of it.
+      output.replaceChildren(t('native.failed'));
+      if (error.message) output.append(document.createElement('br'), error.message);
+      toast(t('native.failed'), 'err');
+    } finally { buttons.forEach(item => { item.disabled = false; }); }
+  };
+});
+$('#optLeakGuard').onchange = () => { saveSettings({ leakGuard: $('#optLeakGuard').value }); updateGuardRows(); updateTunAppRows(); };
 $('#optBlockUdpProxy').onchange = () => saveSettings({ blockUdpInProxyMode: $('#optBlockUdpProxy').checked });
+
+/* per-app routing — the mode saves itself, the list is cleaned up before it is stored */
+$('#optTunAppMode').onchange = () => { saveSettings({ tunAppMode: $('#optTunAppMode').value }); updateTunAppRows(); };
+$('#optTunApps').onchange = () => saveTunApps();
+
+/** Store the app list, and show back exactly what was stored. */
+function saveTunApps() {
+  const apps = readTunApps();
+  $('#optTunApps').value = apps.join('\n');
+  return saveSettings({ tunApps: apps });
+}
+
+/**
+ * Pick a name instead of typing it. The list is the apps that currently have an
+ * open connection — not every running app — and what goes into the box is each
+ * one's `exe`: the image file's leaf name (`chrome.exe`, `Google Chrome`),
+ * which is the only string sing-box's `process_name` rule matches. The name the
+ * OS calls the process by ('chrome') is a different string that matches nothing
+ * here — the routing page's picker goes on storing that one, which is why the
+ * two ask processOptions() for different values.
+ */
+$('#btnTunAppsPick').onclick = async () => {
+  let res = null;
+  try { res = await window.api.listProcesses(); } catch { res = null; }
+  // the enumeration itself failed: say what went wrong instead of claiming the
+  // machine is running nothing
+  if (res && res.error) { toast(res.error, 'err'); return; }
+  const procs = (res && res.ok) ? (res.processes || []) : [];
+  // nothing to offer: say so rather than opening an empty menu. The list the
+  // routing page already loaded is left alone — this failure says nothing about it.
+  if (!procs.length) { toast(t('tunapp.pickNone'), 'warn'); return; }
+  state.procList = procs;
+  const pick = $('#tunAppsPick');
+  pick.innerHTML = processOptions('', { exe: true });   // escapes every name it puts in
+  pick.value = '';
+  pick.hidden = false;
+};
+
+$('#tunAppsPick').onchange = () => {
+  const name = $('#tunAppsPick').value;
+  const ta = $('#optTunApps');
+  $('#tunAppsPick').hidden = true;      // picked or dismissed, the menu is done
+  if (!name) return;
+  ta.value = ta.value.trim() ? ta.value.trimEnd() + '\n' + name : name;
+  saveTunApps();                        // a duplicate name folds away in here
+};
 
 /* kill switch toggle — read live when a drop happens, so it needs no reconnect */
 $('#optKillSwitch').onchange = async () => {
@@ -1392,6 +1531,7 @@ async function checkIp(retries = 0, quiet = false) {
   }
   return info;
 }
+$('#btnDiagnostics').onclick = () => window.IRNFDiagnostics.open();
 $('#btnCheckIp').onclick = () => checkIp(1);
 
 function showGeo(info) {
@@ -1426,7 +1566,7 @@ async function connect(id) {
 }
 
 async function disconnect() {
-  await window.api.disconnect();
+  try { await window.api.disconnect(); } catch (e) { toast(e.message, 'err'); }
 }
 
 $('#powerBtn').onclick = () => {
@@ -1844,6 +1984,9 @@ window.api.onStatus((d) => {
       setConnUI('error');
       toast(t('net.failed'), 'err', 8000);
     }
+  } else if (d.state === 'cleanup-failed') {
+    // The state IS the code; `d.error` carries it too, for a headless consumer.
+    toast(t('net.cleanupFailed'), 'err');
   } else if (d.state === 'error') {
     // e.g. a settings reconnect whose new config the core rejected
     state.connected = false;
@@ -3244,18 +3387,28 @@ async function loadProcList() {
   renderAdvanced();
 }
 
-/** <option>s for a process <select>, ensuring the current value is present. */
-function processOptions(selected) {
-  const opts = [`<option value="">${escapeHtml(t('proc.pick'))}</option>`];
+/**
+ * <option>s for a process <select>, ensuring the current value is present.
+ *
+ * Two consumers, two different values off the same list. The advanced routing
+ * rules store the process NAME the OS reports ('chrome') — that is what the IP
+ * cache and the saved rules key on, and it must not change. The per-app TUN
+ * list needs the image file's leaf name ('chrome.exe'), because that is the
+ * only thing sing-box's `process_name` rule matches: `{ exe: true }`.
+ */
+function processOptions(selected, opts = {}) {
+  const valueOf = (p) => (opts && opts.exe ? (p.exe || p.name) : p.name);
+  const out = [`<option value="">${escapeHtml(t('proc.pick'))}</option>`];
   for (const p of state.procList) {
-    const label = p.count ? `${p.name} (${p.count})` : p.name;
-    opts.push(`<option value="${escapeHtml(p.name)}"${p.name === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`);
+    const value = valueOf(p);
+    const label = p.count ? `${value} (${p.count})` : value;
+    out.push(`<option value="${escapeHtml(value)}"${value === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`);
   }
   // current value that's no longer running
-  if (selected && !state.procList.some(p => p.name === selected)) {
-    opts.push(`<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}</option>`);
+  if (selected && !state.procList.some(p => valueOf(p) === selected)) {
+    out.push(`<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}</option>`);
   }
-  return opts.join('');
+  return out.join('');
 }
 
 function targetOptions(selected) {
@@ -3648,7 +3801,7 @@ function resetTraffic() {
   $('#sessDown').textContent = '0 B';
   $('#sessUp').textContent = '0 B';
   $('#sessSum').textContent = '0 B';
-  hist.down.length = 0; hist.up.length = 0;
+  hist.down.length = 0; hist.up.length = 0; hist.time.length = 0;
   drawSpark();
 }
 function setModeWidget() {

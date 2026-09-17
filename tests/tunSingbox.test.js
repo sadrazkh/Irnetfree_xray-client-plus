@@ -138,6 +138,64 @@ test('buildTunConfig: without an interface name the key is omitted (darwin: sing
   assert.deepEqual(Object.keys(inb), ['type', 'tag', 'address', 'mtu', 'auto_route', 'strict_route', 'stack', 'route_exclude_address']);
 });
 
+/* ------------------------------ buildTunConfig: apps (task 10a) ------------------------------ */
+
+test('buildTunConfig: apps off — null, mode neither exclude/only, or no usable name — is byte-stable with today\'s output', () => {
+  const base = JSON.stringify(buildTunConfig({ socksPort: 10808 }));
+  assert.equal(JSON.stringify(buildTunConfig({ socksPort: 10808, apps: null })), base, 'apps: null');
+  assert.equal(JSON.stringify(buildTunConfig({ socksPort: 10808, apps: { mode: 'exclude', names: [] } })), base, 'no names');
+  assert.equal(JSON.stringify(buildTunConfig({ socksPort: 10808, apps: { mode: 'exclude', names: ['', '  '] } })), base, 'only blank names');
+  assert.equal(JSON.stringify(buildTunConfig({ socksPort: 10808, apps: { mode: 'off', names: ['x.exe'] } })), base, 'unknown mode');
+});
+
+test('buildTunConfig: apps exclude — trims/dedupes names keeping first occurrence and order, DNS rule ahead of it', () => {
+  const cfg = buildTunConfig({ socksPort: 10808, apps: { mode: 'exclude', names: ['Telegram.exe', ' steam.exe ', 'Telegram.exe'] } });
+  assert.deepEqual(cfg.route.rules, [
+    { port: 53, outbound: 'socks-out' },
+    { process_name: ['Telegram.exe', 'steam.exe'], outbound: 'direct' }
+  ]);
+  assert.equal(cfg.route.final, 'socks-out');
+  assert.deepEqual(cfg.outbounds.map(o => o.tag), ['socks-out', 'direct']);
+});
+
+test('buildTunConfig: a name that is not a string is dropped, never stringified into the rule', () => {
+  // '[object Object]' / '42' would be a rule matching nothing while the log says
+  // per-app routing is on — the builder drops them instead of coercing them.
+  const cfg = buildTunConfig({ socksPort: 10808, apps: { mode: 'exclude', names: [{}, 42, 'chrome.exe'] } });
+  assert.deepEqual(cfg.route.rules[1].process_name, ['chrome.exe']);
+});
+
+test('buildTunConfig: apps only — the named apps are the only ones sent into the tunnel', () => {
+  const cfg = buildTunConfig({ socksPort: 10808, apps: { mode: 'only', names: ['chrome.exe'] } });
+  assert.deepEqual(cfg.route.rules, [
+    { port: 53, outbound: 'socks-out' },
+    { process_name: ['chrome.exe'], outbound: 'socks-out' }
+  ]);
+  assert.equal(cfg.route.final, 'direct');
+  assert.deepEqual(cfg.outbounds.map(o => o.tag), ['socks-out', 'direct']);
+});
+
+test('buildTunConfig: with apps active, route key order is final, auto_detect_interface, rules', () => {
+  const cfg = buildTunConfig({ socksPort: 10808, apps: { mode: 'exclude', names: ['chrome.exe'] } });
+  assert.deepEqual(Object.keys(cfg.route), ['final', 'auto_detect_interface', 'rules']);
+});
+
+test('writeConfig: opts.apps rides into buildTunConfig — rules present when set, absent when not', () => {
+  const tun = new TunSingbox({ extraDirs: [], onLog: () => {} });
+  const { cfgFile: withAppsFile } = tun.writeConfig(10808, [], { apps: { mode: 'exclude', names: ['chrome.exe'] } }, 'IRNetFree');
+  const withApps = JSON.parse(fs.readFileSync(withAppsFile, 'utf8'));
+  assert.deepEqual(withApps.route.rules, [
+    { port: 53, outbound: 'socks-out' },
+    { process_name: ['chrome.exe'], outbound: 'direct' }
+  ]);
+  tun.removeWork();
+
+  const { cfgFile: noAppsFile } = tun.writeConfig(10808, [], {}, 'IRNetFree');
+  const noApps = JSON.parse(fs.readFileSync(noAppsFile, 'utf8'));
+  assert.equal('rules' in noApps.route, false, 'no apps opt → no rules');
+  tun.removeWork();
+});
+
 /* ------------------------------ surface ------------------------------ */
 
 test('the surface task 2 wires in', () => {
@@ -156,20 +214,57 @@ test('the surface task 2 wires in', () => {
   }
 });
 
-test('isAvailable: win32 needs wintun.dll NEXT TO sing-box.exe; darwin only the binary', async () => {
-  await withBin(['sing-box.exe'], 'win32', (tun) => assert.equal(tun.isAvailable(), false, 'no wintun'));
+test('isAvailable: win32 needs sing-box.exe and a wintun.dll it can put beside it; darwin only the binary', async () => {
+  await withBin(['sing-box.exe'], 'win32', (tun) => assert.equal(tun.isAvailable(), false, 'no wintun anywhere'));
   await withBin(['sing-box.exe', 'wintun.dll'], 'win32', (tun) => assert.equal(tun.isAvailable(), true));
   await withBin(['sing-box', 'wintun.dll'], 'win32', (tun) => assert.equal(tun.isAvailable(), false, 'win32 wants the .exe'));
   await withBin(['sing-box'], 'darwin', (tun) => assert.equal(tun.isAvailable(), true));
   await withBin(['sing-box.exe'], 'darwin', (tun) => assert.equal(tun.isAvailable(), false));
   await withBin([], 'linux', (tun) => assert.equal(tun.isAvailable(), false));
-  // wintun in ANOTHER known dir does not count: sing-box loads it from its own dir
+  // wintun in ANOTHER known dir counts: start() copies it beside sing-box. That
+  // is the layout every install with a downloaded sing-box (userData/bin) and
+  // the bundled wintun (resources/bin, beside tun2socks) has — v1.7.1 and
+  // earlier read it as "sing-box not installed" and ran tun2socks instead,
+  // whatever the setting said.
   const other = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-sb-other-'));
-  fs.writeFileSync(path.join(other, 'wintun.dll'), '');
+  fs.writeFileSync(path.join(other, 'wintun.dll'), 'dll');
   try {
-    await withBin(['sing-box.exe'], 'win32', (tun, dir) => {
+    await withBin(['sing-box.exe'], 'win32', (tun, dir, logs) => {
       tun.dirs = () => [dir, other];
-      assert.equal(tun.isAvailable(), false);
+      assert.equal(tun.isAvailable(), true);
+      assert.equal(tun.wintunSource(), path.join(other, 'wintun.dll'));
+      assert.equal(fs.existsSync(path.join(dir, 'wintun.dll')), false, 'isAvailable() only looks');
+      assert.equal(tun.ensureWintun(), path.join(dir, 'wintun.dll'));
+      assert.equal(fs.readFileSync(path.join(dir, 'wintun.dll'), 'utf8'), 'dll', 'copied beside the binary');
+      assert.equal(tun.wintunSource(), path.join(dir, 'wintun.dll'), 'beside wins from now on');
+      assert.ok(logs.some(([, l]) => /wintun\.dll copied beside sing-box/.test(l)));
+    });
+  } finally { fs.rmSync(other, { recursive: true, force: true }); }
+});
+
+test('ensureWintun: a no-op beside the binary, nothing to do off Windows, a clear error with no wintun anywhere', async () => {
+  await withBin(['sing-box.exe', 'wintun.dll'], 'win32', (tun, dir, logs) => {
+    assert.equal(tun.ensureWintun(), path.join(dir, 'wintun.dll'));
+    assert.equal(logs.length, 0, 'nothing copied, nothing logged');
+  });
+  await withBin(['sing-box'], 'darwin', (tun) => assert.equal(tun.ensureWintun(), null));
+  await withBin(['sing-box.exe'], 'win32', (tun) => assert.throws(() => tun.ensureWintun(), /wintun\.dll is not next to sing-box\.exe/));
+});
+
+test('win32 start: a wintun.dll from another known dir is copied beside sing-box before the spawn', async () => {
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-sb-other-'));
+  fs.writeFileSync(path.join(other, 'wintun.dll'), 'dll');
+  try {
+    await withBin(['sing-box.exe'], 'win32', async (tun, dir) => {
+      tun.dirs = () => [dir, other];
+      tun.isElevated = () => true;
+      fakeSpawn = () => stubChild();
+      canned([[/Get-NetAdapter -Name 'IRNetFree'.*Status/, 'Up\r\n']]);
+      await tun.start(10808, [], ['172.19.0.2'], {});
+      assert.equal(tun.active, true);
+      assert.equal(fs.readFileSync(path.join(dir, 'wintun.dll'), 'utf8'), 'dll');
+      assert.equal(spawns[0][0], path.join(dir, 'sing-box.exe'));
+      assert.deepEqual(spawns[0][2], { cwd: dir, windowsHide: true });
     });
   } finally { fs.rmSync(other, { recursive: true, force: true }); }
 });
@@ -364,10 +459,11 @@ test('win32 start: adapter never comes Up → stop + throw', async () => {
   });
 });
 
-test('win32 start: refuses without wintun next to the binary, and without elevation', async () => {
+test('win32 start: refuses without a wintun.dll anywhere, and without elevation', async () => {
   await withBin(['sing-box.exe'], 'win32', async (tun) => {
     tun.isElevated = () => true;
     await assert.rejects(() => tun.start(1, [], [], {}), /wintun\.dll/);
+    assert.equal(spawns.length, 0);
   });
   await withBin(['sing-box.exe', 'wintun.dll'], 'win32', async (tun) => {
     tun.isElevated = () => false;
@@ -419,33 +515,16 @@ const macArgs = {
   dnsServers: ['172.19.0.2', 'fdfe:dcba:9876::2']
 };
 
-test('macOS setup script: HUP trap, backgrounded sing-box with a pid file, wait for a NEW utun, DNS, no route lines', () => {
+test('macOS setup rolls back failures and identifies a new addressed utun before DNS', () => {
   const s = buildMacSetupScript(macArgs);
-  const lines = s.split('\n');
-  assert.equal(lines[0], '#!/bin/bash');
-  assert.equal(lines[1], "trap '' HUP");
-  assert.equal(lines[2], "BIN='/Users/a b/Library/Application Support/IRNetFree/bin/sing-box'");
-  assert.equal(lines[3], "CFG='/tmp/irnf-sb-XyZ/sing-box.json'");
-  assert.equal(lines[4], "LOG='/tmp/irnf-sb-XyZ/sing-box.log'");
-  assert.equal(lines[5], "PIDFILE='/tmp/irnf-sb-XyZ/sing-box.pid'");
-  assert.equal(lines[6], "DEVFILE='/tmp/irnf-sb-XyZ/sing-box.dev'");
-  assert.equal(lines[7], 'BEFORE=" $(ifconfig -l 2>/dev/null) "');
-  assert.equal(lines[8], '"$BIN" run -c "$CFG" >"$LOG" 2>&1 </dev/null &');
-  assert.equal(lines[9], 'SBPID=$!');
-  assert.equal(lines[10], 'echo "$SBPID" > "$PIDFILE"');
-  assert.ok(s.includes('while [ $i -lt 50 ]; do'), 'utun wait loop');
-  assert.ok(s.includes('  if ! kill -0 "$SBPID" 2>/dev/null; then break; fi'), 'stops waiting once sing-box is gone');
-  assert.ok(s.includes('      utun*)'), 'looks for utun devices');
-  assert.ok(s.includes('          *" $u "*) ;;'), 'skips the ones that existed before');
-  assert.ok(s.includes('echo "ERR: sing-box did not create a utun device" >&2'));
-  assert.ok(s.includes('  cat "$LOG" >&2 2>/dev/null'), 'prints the sing-box log on failure');
-  assert.ok(s.includes('  exit 11'));
-  assert.ok(s.includes('echo "$ACTUAL" > "$DEVFILE"'));
-  assert.ok(s.includes("networksetup -setdnsservers 'Wi-Fi' 172.19.0.2 fdfe:dcba:9876::2 2>/dev/null || true"));
-  assert.ok(!/^\s*(route|ifconfig "\$ACTUAL")/m.test(s), 'auto_route lays routes and addresses — the script must not');
-  assert.equal(lines.at(-2), 'exit 0');
-  assert.equal(lines.at(-1), '', 'trailing newline');
-  assert.ok(!s.includes('nohup'), 'nohup fails under osascript');
+  assert.match(s, /trap rollback EXIT/);
+  assert.match(s, /ps -ww -p "\$SBPID" -o lstart=/);
+  assert.match(s, /count.*-eq 1/);
+  assert.ok(s.includes('inet 172\\.19\\.0\\.1'));
+  assert.match(s, /tail -c 4096/);
+  assert.match(s, /networksetup -setdnsservers 'Wi-Fi' '172.19.0.2' 'fdfe:dcba:9876::2' \|\| exit 14/);
+  assert.ok(!s.includes('nohup'));
+  assert.ok(!/^\s*(route|ifconfig "\$ACTUAL")/m.test(s));
 });
 
 test('macOS setup script: no service → `true` instead of a DNS line; quotes in paths are escaped', () => {
@@ -455,25 +534,15 @@ test('macOS setup script: no service → `true` instead of a DNS line; quotes in
   assert.ok(s.includes("BIN='/Users/o'\\''brien/sing-box'"));
 });
 
-test('macOS teardown script: kill, wait, pkill by argv, DNS restore (`Empty` when none was saved), exit 0', () => {
-  const s = buildMacTeardownScript({ pid: 4242, cfgFile: '/tmp/irnf-sb-XyZ/sing-box.json', service: 'Wi-Fi', savedDns: [] });
-  assert.equal(s, [
-    '#!/bin/bash',
-    'kill 4242 2>/dev/null || true',
-    'i=0',
-    'while [ $i -lt 20 ] && kill -0 4242 2>/dev/null; do i=$((i+1)); sleep 0.2; done',
-    "pkill -f 'sing-box run -c /tmp/irnf-sb-XyZ/sing-box.json' 2>/dev/null || true",
-    "networksetup -setdnsservers 'Wi-Fi' Empty 2>/dev/null || true",
-    'exit 0',
-    ''
-  ].join('\n'));
-  const saved = buildMacTeardownScript({ pid: null, cfgFile: '/tmp/x/sing-box.json', service: 'Wi-Fi', savedDns: ['1.1.1.1', '9.9.9.9'] });
-  assert.ok(!/^kill /m.test(saved), 'no pid known → no kill line');
-  assert.ok(!saved.includes('kill -0'));
-  assert.ok(saved.includes("pkill -f 'sing-box run -c /tmp/x/sing-box.json' 2>/dev/null || true"));
-  assert.ok(saved.includes("networksetup -setdnsservers 'Wi-Fi' 1.1.1.1 9.9.9.9 2>/dev/null || true"));
-  const noService = buildMacTeardownScript({ pid: 1, cfgFile: '/tmp/x/sing-box.json', service: null, savedDns: [] });
-  assert.ok(!noService.includes('networksetup'));
+test('macOS teardown verifies identity, escalates TERM to KILL, and fails when cleanup fails', () => {
+  const s = buildMacTeardownScript({ ...macArgs, pid: 4242, savedDns: ['9.9.9.9'] });
+  assert.match(s, /-o command=/);
+  assert.match(s, /-o lstart=/);
+  assert.match(s, /kill -TERM/);
+  assert.match(s, /kill -KILL/);
+  assert.match(s, /exit 23/);
+  assert.match(s, /networksetup -setdnsservers 'Wi-Fi' '9.9.9.9' \|\| exit 25/);
+  assert.ok(!s.includes('pkill'));
 });
 
 test('darwin start: config without interface_name, scripts through one privileged run, state and DNS restored on stop', async () => {
@@ -511,19 +580,20 @@ test('darwin start: config without interface_name, scripts through one privilege
       // Both families, ipv6:false and all: macOS resolves per network service,
       // so a service left with only a v4 tunnel resolver keeps asking its v6
       // ones — see adapterDns.
-      assert.ok(setup.includes(`networksetup -setdnsservers 'Wi-Fi' ${TUN_PEER4} ${TUN_PEER6} 2>/dev/null || true`));
+      assert.ok(setup.includes(`networksetup -setdnsservers 'Wi-Fi' '${TUN_PEER4}' '${TUN_PEER6}' || exit 14`));
       assert.equal(tun.macState.macPid, 31337);
       assert.equal(tun.macState.dev, 'utun9');
       assert.deepEqual(tun.macState.savedDns, ['9.9.9.9']);
       assert.ok(logs.some(([, l]) => /TUN device: utun9/.test(l)));
 
+      const savedState = { ...tun.macState };
       await tun.stop();
       assert.equal(tun.active, false);
       assert.equal(tun.macState, null);
       assert.deepEqual(tun.excludeIps, []);
       const [downName, down] = scripts[1];
       assert.equal(downName, 'teardown.sh');
-      assert.equal(down, buildMacTeardownScript({ pid: 31337, cfgFile, service: 'Wi-Fi', savedDns: ['9.9.9.9'] }));
+      assert.equal(down, buildMacTeardownScript({ ...savedState, pid: 31337 }));
       assert.equal(fs.existsSync(path.dirname(cfgFile)), false, 'work dir removed');
     } finally { platform.runScriptPrivileged = realPriv; }
   });
@@ -583,4 +653,69 @@ test('the macOS self-check script checks the config this module actually builds'
   // null for exactly that case.
   const built = buildTunConfig({ socksPort: embedded.outbounds[0].server_port, interfaceName: null });
   assert.deepEqual(embedded, built);
+});
+
+
+test('macOS stop failure retains active state and journal; retry clears it only on success', async () => {
+  const platform = require('../src/main/tunPlatform');
+  const realPriv = platform.runScriptPrivileged;
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-sb-retry-'));
+  const logs = [];
+  const tun = new TunSingbox({ platform: 'darwin', onLog: m => logs.push(m) });
+  tun.work = work;
+  tun.macState = { work, bin: '/bin/sing-box', cfgFile: path.join(work, 'config'), savedDns: ['9.9.9.9'] };
+  tun.saveMacSession(); tun.active = true; tun.excludeIps = ['1.2.3.4'];
+  try {
+    platform.runScriptPrivileged = async () => { throw new Error('User canceled'); };
+    await assert.rejects(tun.stop(), /User canceled/);
+    assert.equal(tun.active, true);
+    assert.ok(tun.macState);
+    assert.ok(fs.existsSync(path.join(work, 'session.json')));
+    assert.deepEqual(tun.excludeIps, ['1.2.3.4']);
+    assert.ok(!logs.some(l => /mode stopped/.test(l)));
+    platform.runScriptPrivileged = async () => {};
+    await tun.stop();
+    assert.equal(tun.macState, null); assert.equal(tun.active, false);
+    assert.equal(fs.existsSync(work), false);
+  } finally { platform.runScriptPrivileged = realPriv; fs.rmSync(work, { recursive: true, force: true }); }
+});
+
+test('macOS log reads stay bounded on a large file and tolerate truncation', () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-sb-log-'));
+  const log = path.join(work, 'log'); const tun = new TunSingbox({ platform: 'darwin' });
+  try {
+    fs.writeFileSync(log, 'a'.repeat(1024 * 1024));
+    const chunk = tun.readMacLogChunk(log);
+    assert.equal(chunk.text.length, 32768); assert.equal(chunk.pos, 1024 * 1024);
+    fs.writeFileSync(log, 'new'); assert.equal(tun.readMacLogChunk(log, chunk.pos).text, 'new');
+  } finally { fs.rmSync(work, { recursive: true, force: true }); }
+});
+
+test('macOS recovery loads durable original DNS and removes only verified session', async () => {
+  const platform = require('../src/main/tunPlatform'); const realPriv = platform.runScriptPrivileged;
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-sb-recovery-'));
+  const tun = new TunSingbox({ platform: 'darwin', userData });
+  const { work, cfgFile } = tun.writeConfig(10808, [], {}, null);
+  const st = { work, cfgFile, bin: '/bin/sing-box', savedDns: ['9.9.9.9'], service: 'Wi-Fi' };
+  for (const key of ['logFile', 'pidFile', 'devFile', 'identityFile', 'dnsFile']) st[key] = path.join(work, key);
+  tun.macState = st; tun.saveMacSession(); tun.macState = null;
+  try {
+    assert.equal(tun.hasPendingMacRecovery(), true);
+    platform.runScriptPrivileged = async p => { assert.match(fs.readFileSync(p, 'utf8'), /'9.9.9.9'/); };
+    assert.equal(await tun.recoverMacSessions(), 1);
+    assert.equal(tun.hasPendingMacRecovery(), false);
+  } finally { platform.runScriptPrivileged = realPriv; fs.rmSync(userData, { recursive: true, force: true }); }
+});
+
+test('macOS health loss notifies once and retains state for DNS recovery', async () => {
+  const platform = require('../src/main/tunPlatform'); const realRun = platform.run;
+  let calls = 0;
+  const tun = new TunSingbox({ platform: 'darwin', onUnexpectedExit: () => calls++ });
+  tun.macState = { macPid: 4242, bin: '/bin/sing-box', cfgFile: '/tmp/config' }; tun.active = true;
+  try {
+    platform.run = async () => { throw new Error('No process'); };
+    await tun.checkMacHealth(); await Promise.resolve();
+    await tun.checkMacHealth();
+    assert.equal(calls, 1); assert.equal(tun.active, false); assert.ok(tun.macState);
+  } finally { platform.run = realRun; }
 });
