@@ -79,29 +79,27 @@ async function runOn(engineId, target) {
 
   const [pInterconn, pUsers, pSocks, apiPortal, apiBridge, pUnused] = await getFreePorts(6);
 
-  // The portal: the bridge dials `interconn`; people connect to `users`.
+  // The portal: the bridge dials `interconn`; people connect to `users`. Both
+  // sides are written by the same wizards the tab runs — that is what is
+  // being proven — on a v2 model with one direct exit and no preset rules
+  // (the page lives on loopback, which the private-address rule would block).
+  const base = () => X.normalizeModel({ schema: 2, publicAddress: '127.0.0.1', outbounds: [X.newOutbound('freedom', { tag: 'direct' })] });
   const interconn = X.newInbound('vless', { remark: 'interconn', listen: '127.0.0.1', port: pInterconn, network: 'tcp', security: 'none' });
   const bridgeClient = X.newClient('vless', { email: 'bridge' });
   interconn.clients = [bridgeClient];
   const users = X.newInbound('vless', { remark: 'users', listen: '127.0.0.1', port: pUsers, network: 'ws', security: 'none', path: '/rev' });
   const alice = X.newClient('vless', { email: 'alice' });
   users.clients = [alice];
-  const portal = X.normalizeModel({
-    publicAddress: '127.0.0.1', blockPrivate: false,
-    inbounds: [interconn, users],
-    reverse: { role: 'portal', portal: { interconnInboundId: interconn.id, userInboundIds: [users.id] } }
-  });
-  const interconnLink = X.clientLink(interconn, bridgeClient, portal, { address: '127.0.0.1' });
+  const wp = X.wizardPortal(Object.assign(base(), { inbounds: [interconn, users] }),
+    { inboundId: interconn.id, clientId: bridgeClient.id, userInboundIds: [users.id], tag: 'bridge-1' });
+  const portal = wp.model;
+  const interconnLink = wp.link;
 
-  // The bridge: reaches the portal with the interconn client's own link; its
-  // one inbound is unused (a core wants at least one).
+  // The bridge: reaches the portal with the link the portal wizard produced;
+  // its one inbound is unused (a core wants at least one).
   const unused = X.newInbound('vless', { remark: 'unused', listen: '127.0.0.1', port: pUnused, network: 'tcp', security: 'none' });
   unused.clients = [X.newClient('vless', { email: 'nobody' })];
-  const bridge = X.normalizeModel({
-    publicAddress: '127.0.0.1', blockPrivate: false,
-    inbounds: [unused],
-    reverse: { role: 'bridge', bridge: { via: 'link', link: interconnLink } }
-  });
+  const bridge = X.wizardBridge(Object.assign(base(), { inbounds: [unused] }), { link: interconnLink }).model;
 
   for (const [name, m] of [['portal', portal], ['bridge', bridge]]) {
     const v = X.validateModel(m, { servers: [] });
@@ -147,8 +145,8 @@ async function runOn(engineId, target) {
     await delay(300);   // let the counters settle
     const b = await metrics(apiBridge);
     const p = await metrics(apiPortal);
-    const bExit = outboundBytes(b, 'exit');
-    const pExit = outboundBytes(p, 'exit');
+    const bExit = outboundBytes(b, 'direct');
+    const pExit = outboundBytes(p, 'direct');
     const ok = !!(r.ok && r.status > 0 && r.status < 500 && bExit.down > 0 && pExit.up === 0 && pExit.down === 0);
     console.log(`${engineId} via ${target.name}: fetch ${r.ok ? `ok ${r.status} in ${r.ms} ms` : `FAILED (${r.error})`}; ` +
       `bridge exit ${bExit.up}/${bExit.down} B, portal exit ${pExit.up}/${pExit.down} B → ${ok ? 'PASS' : 'FAIL'}`);

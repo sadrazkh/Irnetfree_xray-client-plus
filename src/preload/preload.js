@@ -118,6 +118,7 @@ contextBridge.exposeInMainWorld('api', {
   // plus: the IP-scan tab (src/main/scan)
   scanStart: (req) => ipcRenderer.invoke('scan:start', req),
   scanStop: () => ipcRenderer.invoke('scan:stop'),
+  scanRetest: (req) => ipcRenderer.invoke('scan:retest', req),
   scanPresets: () => ipcRenderer.invoke('scan:presets'),
   scanApply: (req) => ipcRenderer.invoke('scan:apply', req),
   scanExport: (req) => ipcRenderer.invoke('scan:export', req),

@@ -25,7 +25,7 @@ const T0 = 1_800_000_000_000;
 const VARS = {
   cmdline: [], memstats: {}, observatory: {},
   stats: {
-    inbound: { 'probe-827b': { downlink: 0, uplink: 126 } },
+    inbound: { 'main-in00': { downlink: 0, uplink: 126 } },
     outbound: { block: { downlink: 0, uplink: 0 }, exit: { downlink: 808, uplink: 86 } },
     user: { alice: { downlink: 808, uplink: 86 } }
   }
@@ -450,8 +450,8 @@ test('a tick adds the /debug/vars user deltas to client.used, marks online, pers
   assert.equal(st.inbounds[0].clients[0].online, true);
   assert.equal(st.inbounds[0].clients[0].up, 86);
   assert.equal(st.inbounds[0].clients[0].down, 808);
-  assert.equal(st.inbounds[0].up, 86);
-  assert.equal(st.inbounds[0].down, 808);
+  assert.equal(st.inbounds[0].up, 126, 'the inbound has its own counter (stats.inbound), not a sum of its clients');
+  assert.equal(st.inbounds[0].down, 0);
   assert.equal(st.inbounds[0].tag, 'main-in00');
   assert.equal(h.events[h.events.length - 1][0], 'xserver-status');
   assert.ok(h.events.length > before);
@@ -556,12 +556,12 @@ test('applyModel: errors come back without persisting; a valid model is persiste
   assert.equal(bad.model.inbounds[0].clients[0].uuid, UUID, 'the rejected model comes back normalised so the form keeps its values');
   assert.equal(h.sets(), 0);
 
-  const good = await h.core.applyModel(Object.assign({}, h.model(), { blockTorrent: true, logLevel: 'debug' }));
+  const good = await h.core.applyModel(Object.assign({}, h.model(), { logLevel: 'debug' }));
   assert.equal(good.ok, true);
   assert.deepEqual(good.errors, []);
   assert.deepEqual(good.warnings, []);
-  assert.equal(good.model.blockTorrent, true);
-  assert.equal(h.model().blockTorrent, true);
+  assert.equal(good.model.logLevel, 'debug');
+  assert.equal(h.model().logLevel, 'debug');
   assert.equal(h.sets(), 1);
   assert.equal(h.spawns.length, 0, 'stopped: nothing to restart');
 
@@ -591,12 +591,12 @@ test('applyModel keeps the meter\'s numbers and clears disabledBy when the user 
   // the renderer's copy is as old as its last fetch: zero bytes, still enabled
   const stale = JSON.parse(JSON.stringify(h.model()));
   stale.inbounds[0].clients[0].used = { up: 0, down: 0 };
-  stale.inbounds[0].clients[0].note = 'edited';
+  stale.inbounds[0].clients[0].comment = 'edited';
   const r = await h.core.applyModel(stale);
   assert.equal(r.ok, true);
   const c1 = h.model().inbounds[0].clients[0];
   assert.deepEqual(c1.used, { up: 86, down: 808 }, 'the store\'s numbers win');
-  assert.equal(c1.note, 'edited');
+  assert.equal(c1.comment, 'edited');
   assert.equal(c1.enabled, false);
   assert.equal(c1.disabledBy, 'quota', 'the reason still holds, so the client stays out');
 
@@ -624,7 +624,7 @@ test('applyModel keeps the meter\'s numbers and clears disabledBy when the user 
 
 test('parseServerVars reads the inbound and user counters as /debug/vars nests them', () => {
   assert.deepEqual(parseServerVars(VARS), {
-    inbounds: { 'probe-827b': { up: 126, down: 0 } },
+    inbounds: { 'main-in00': { up: 126, down: 0 } },
     users: { alice: { up: 86, down: 808 } }
   });
   assert.deepEqual(parseServerVars(null), { inbounds: {}, users: {} });
@@ -640,7 +640,7 @@ test('firewallArgs are the exact netsh argument arrays', () => {
 });
 
 test('status() when nothing ever ran: stopped, and the model\'s lifetime totals', () => {
-  const h = harness({ model: model({ inbounds: [inbound({ clients: [client({ used: { up: 5, down: 7 } }), client({ id: 'c2', email: 'bob', uuid: UUID, used: { up: 1, down: 1 } })] })] }) });
+  const h = harness({ model: model({ inbounds: [inbound({ used: { up: 6, down: 8 }, clients: [client({ used: { up: 5, down: 7 } }), client({ id: 'c2', email: 'bob', uuid: UUID, used: { up: 1, down: 1 } })] })] }) });
   try {
     const st = h.core.status();
     assert.equal(st.state, 'stopped');
@@ -720,7 +720,7 @@ function withChannels(over, fn) {
 }
 
 test('register() installs every channel of spec 2.4', withChannels({}, async (h) => {
-  const want = ['get', 'set', 'start', 'stop', 'restart', 'status', 'log', 'genKeys', 'genId', 'clientLink', 'preview', 'otherSide', 'firewall'].map(c => 'xserver:' + c);
+  const want = ['get', 'set', 'start', 'stop', 'restart', 'status', 'log', 'genKeys', 'genId', 'clientLink', 'preview', 'otherSide', 'firewall', 'wizard', 'coreInfo'].map(c => 'xserver:' + c);
   assert.deepEqual(Object.keys(h.ctx.handlers).sort(), want.sort());
 }));
 
@@ -745,18 +745,18 @@ test('xserver:set — validates, persists through store.setLazy, restarts when r
   assert.equal(bad.status.state, 'stopped');
   assert.deepEqual(h.ctx.lazy, []);
 
-  const good = await h.call('xserver:set', model({ blockTorrent: true }));
+  const good = await h.call('xserver:set', model({ logLevel: 'debug' }));
   assert.equal(good.ok, true);
   assert.deepEqual(h.ctx.lazy, ['xserver']);
-  assert.equal(h.ctx.store.data.xserver.blockTorrent, true);
-  assert.equal(good.model.blockTorrent, true);
+  assert.equal(h.ctx.store.data.xserver.logLevel, 'debug');
+  assert.equal(good.model.logLevel, 'debug');
   assert.equal(good.status.state, 'stopped');
 
   const st = await h.call('xserver:start');
   assert.equal(st.ok, true);
   assert.equal(st.state, 'running');
   assert.equal(h.spawns.length, 1);
-  const again = await h.call('xserver:set', model({ blockTorrent: false }));
+  const again = await h.call('xserver:set', model({ logLevel: 'info' }));
   assert.equal(again.ok, true);
   assert.equal(again.status.state, 'running');
   assert.equal(h.spawns.length, 2);
@@ -839,16 +839,18 @@ test('xserver:preview — the config that would run; the metrics port is a stand
   assert.equal((await h.call('xserver:preview')).config.metrics.listen, '127.0.0.1:41000');
 }));
 
-test('xserver:otherSide — the snippet for the other end of the reverse pair', withChannels({ data: { xserver: model() } }, async (h) => {
-  assert.deepEqual(await h.call('xserver:otherSide'), { role: null, snippet: null, link: null });
-  h.ctx.store.data.xserver = model({ reverse: { role: 'bridge', bridge: { via: 'link', link: '' } } });
-  assert.match((await h.call('xserver:otherSide')).error, /no usable portal target/);
+test('xserver:otherSide — one item per reverse tag, for the other end of each pair', withChannels({ data: { xserver: model() } }, async (h) => {
+  assert.deepEqual(await h.call('xserver:otherSide'), { items: [] });
   const ic = inbound();
-  h.ctx.store.data.xserver = model({ inbounds: [ic, inbound({ id: 'in00000000000002', tag: 'users-in02', port: 44444 })], reverse: { role: 'portal', portal: { interconnInboundId: ic.id, userInboundIds: ['in00000000000002'] } } });
+  ic.clients[0].reverseTag = 'bridge-1';
+  const users = inbound({ id: 'in00000000000002', tag: 'users-in02', port: 44444, clients: [client({ id: 'c000000000000002', email: 'bob' })] });
+  h.ctx.store.data.xserver = model({ inbounds: [ic, users], routing: { rules: [{ inboundTags: ['users-in02'], outboundTag: 'bridge-1' }] } });
   const r = await h.call('xserver:otherSide');
-  assert.equal(r.role, 'bridge');
-  assert.match(r.link, /^vless:\/\//);
-  assert.equal(r.snippet.outbounds[0].settings.reverse.tag, 'bridge');
+  assert.equal(r.items.length, 1);
+  assert.equal(r.items[0].kind, 'bridge-side');
+  assert.equal(r.items[0].tag, 'bridge-1');
+  assert.match(r.items[0].link, /^vless:/);
+  assert.equal(r.items[0].snippet.outbounds[0].settings.reverse.tag, 'bridge-1');
 }));
 
 test('xserver:firewall — netsh on Windows, only when asked; unsupported elsewhere', async () => {
@@ -913,4 +915,93 @@ test('events: xserver-status on every state change and tick, xserver-log per lin
   assert.equal(h.ctx.notes.length, 1);
   assert.equal(h.ctx.notes[0][0], 'IRNetFree Plus');
   await h.xs.stop();
+}));
+
+/* ----------------------------- v2: inbound meters and limits, reset cycles, the wizards, the core channel ----------------------------- */
+
+test('v2: the tick meters the inbound from stats.inbound.<tag>, stamps lastSeenAt, and the status carries the tags', withCore({ vars: varsFor(86, 808) }, async (h) => {
+  await h.core.start();
+  await h.clock.advance(5000);
+  const i = h.model().inbounds[0];
+  assert.deepEqual(i.used, { up: 86, down: 808 }, 'the inbound has its own counter, not a sum of clients');
+  assert.equal(i.clients[0].lastSeenAt, h.clock.now());
+  const st = h.core.status();
+  assert.equal(st.inbounds[0].tag, 'main-in00');
+  assert.deepEqual([st.inbounds[0].up, st.inbounds[0].down], [86, 808]);
+  assert.equal(st.inbounds[0].clients[0].online, true);
+  assert.equal(st.inbounds[0].clients[0].lastSeenAt, h.clock.now());
+}));
+
+test('v2: an inbound past its total or its expiry is disabled with the reason and the core is restarted; raising the limit brings it back', withCore({ vars: varsFor(86, 808), model: model({ inbounds: [inbound({ totalBytes: 500 })] }) }, async (h) => {
+  await h.core.start();
+  await h.clock.advance(5000);
+  let i = h.model().inbounds[0];
+  assert.equal(i.enabled, false);
+  assert.equal(i.disabledBy, 'quota');
+  assert.equal(h.core.status().inbounds[0].disabledBy, 'quota');
+  await h.clock.advance(10000);   // the debounced restart
+  assert.equal(h.configFile().inbounds.length, 0, 'a disabled inbound leaves the config');
+  const bigger = JSON.parse(JSON.stringify(h.model()));
+  bigger.inbounds[0].totalBytes = 1e9;
+  bigger.inbounds[0].enabled = true;
+  const r = await h.core.applyModel(bigger);
+  assert.equal(r.ok, true);
+  i = h.model().inbounds[0];
+  assert.equal(i.enabled, true);
+  assert.equal(i.disabledBy, '');
+  assert.deepEqual(i.used, { up: 86, down: 808 }, 'the meter survives the edit');
+}));
+
+test('v2: a reset cycle zeroes the quota when its date passes and rolls the date forward; changing the cycle length starts over', withCore({ vars: varsFor(86, 808), model: model({ inbounds: [inbound({ clients: [client({ quotaBytes: 500, resetDays: 1 })] })] }) }, async (h) => {
+  await h.core.start();
+  const day = 86400000;
+  let c = h.model().inbounds[0].clients[0];
+  assert.equal(c.resetAt, T0 + day, 'the first tick (at start) sets the cycle');
+  await h.clock.advance(5000);
+  c = h.model().inbounds[0].clients[0];
+  assert.deepEqual(c.used, { up: 86, down: 808 });
+  assert.equal(c.disabledBy, 'quota', 'out until the cycle turns');
+  await h.clock.advance(day);
+  c = h.model().inbounds[0].clients[0];
+  assert.deepEqual(c.used, { up: 0, down: 0 }, 'a new cycle');
+  assert.equal(c.enabled, true);
+  assert.equal(c.disabledBy, '');
+  assert.equal(c.resetAt, T0 + 2 * day);
+  const edited = JSON.parse(JSON.stringify(h.model()));
+  edited.inbounds[0].clients[0].resetDays = 7;
+  await h.core.applyModel(edited);
+  c = h.model().inbounds[0].clients[0];
+  assert.equal(c.resetAt, h.clock.now() + 7 * day, 'a different length starts a fresh cycle from now');
+}));
+
+test('xserver:wizard — portal and bridge go through applyModel and come back with the link and the status', withChannels({ data: { xserver: model({ inbounds: [inbound(), inbound({ id: 'in00000000000002', tag: 'users-in02', port: 44444, clients: [client({ id: 'c000000000000002', email: 'bob' })] })] }) } }, async (h) => {
+  const bad = await h.call('xserver:wizard', { kind: 'portal', inboundId: 'nope', clientId: 'c000000000000001', userInboundIds: ['in00000000000002'] });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /not found/);
+  const r = await h.call('xserver:wizard', { kind: 'portal', inboundId: 'in00000000000001', clientId: 'c000000000000001', userInboundIds: ['in00000000000002'] });
+  assert.equal(r.ok, true);
+  assert.match(r.link, /^vless:/);
+  assert.equal(r.model.inbounds[0].clients[0].reverseTag, 'bridge-1');
+  assert.deepEqual(r.model.routing.rules.at(-1).inboundTags, ['users-in02']);
+  assert.equal(r.model.routing.rules.at(-1).outboundTag, 'bridge-1');
+  assert.equal(r.status.state, 'stopped');
+  assert.deepEqual(h.ctx.lazy, ['xserver'], 'persisted like any edit');
+  const b = await h.call('xserver:wizard', { kind: 'bridge', link: r.link });
+  assert.equal(b.ok, true);
+  const ob = b.model.outbounds.at(-1);
+  assert.equal(ob.tag, 'interconn');
+  assert.equal(ob.reverseTag, 'bridge');
+  assert.deepEqual(b.model.routing.rules.at(-1).inboundTags, ['bridge']);
+}));
+
+test('xserver:coreInfo — the installed core, the channel from the settings, and GitHub only when asked', withChannels({ data: { xserver: model() } }, async (h) => {
+  const off = await h.call('xserver:coreInfo');
+  assert.equal(off.engine, 'xray');
+  assert.equal(off.installed, true);
+  assert.equal(off.channel, 'stable');
+  assert.equal(off.latestAny, null);
+  h.ctx.latestVersion = async (id, channel) => (channel === 'latest' ? '26.9.9' : '26.3.27');
+  const on = await h.call('xserver:coreInfo', { online: true });
+  assert.equal(on.latestStable, '26.3.27');
+  assert.equal(on.latestAny, '26.9.9');
 }));

@@ -188,6 +188,7 @@ const DEFAULT_SETTINGS = {
   // 'off' | 'geo' (the data files only — the default: they cannot break a
   // working config) | 'all' (the installed cores too, when a release is newer)
   autoUpdateAssets: 'geo',
+  coreChannel: 'stable',   // plus: 'latest' follows the official core's 26.9.x pre-releases
   // which surfaces the window shows: 'simple' hides chains, the pool, the log
   // page and the custom-rule editor. A view preference only — renderer-owned,
   // never baked into a config, so it needs no reconnect.
@@ -2431,6 +2432,7 @@ function registerIpc() {
     addServer: (server) => { const existing = store.get('servers', []); existing.push(server); setServers(existing); return server; },
     resolveTarget,
     log: (line, level = 'info') => send('log', { line, level }),
+    latestVersion: (id, channel) => downloader.latestVersion(id, channel),
     platform: process.platform, isElectron: true
   };
   xserver = createXServer(plusCtx); xserver.register();
@@ -2546,6 +2548,7 @@ app.whenReady().then(() => {
   });
 
   downloader = new Downloader({
+    channel: () => getSettings().coreChannel || 'stable',   // plus: the release channel the cores follow
     destDir: ubin,
     onLog: (line, level) => send('log', { line, level }),
     onProgress: (component, pct) => send('asset-progress', { component, pct })

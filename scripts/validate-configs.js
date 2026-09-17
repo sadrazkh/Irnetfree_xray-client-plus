@@ -245,14 +245,38 @@ let srvTotal = 0, srvFailed = 0;
     out.push(['portal-nogeo-exit-server', build(Object.assign({}, portal, { exit: { type: 'server', serverId: 'sv-trojan' } }), { geoAvailable: false })]);
     // the other side's snippets, wrapped into runnable configs
     const bridgeHere = model({ reverse: { role: 'bridge', bridge: { via: 'link', link: `vless://${uuid}@203.0.113.9:47443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${PUB}&sid=${sid}#portal` } } });
-    const forPortal = X.otherSideSnippet(bridgeHere).snippet;
+    const forPortal = X.otherSideSnippet(bridgeHere).items.find(it => it.kind === 'portal-side').snippet;
     forPortal.inbounds[0].tag = 'interconn-in'; forPortal.inbounds[0].listen = '127.0.0.1';
     forPortal.inbounds[0].streamSettings.realitySettings.privateKey = PRIV;
     forPortal.routing.rules[0].inboundTag = ['users-in'];
     forPortal.inbounds.push({ tag: 'users-in', listen: '127.0.0.1', port: 47461, protocol: 'vless', settings: { clients: [{ id: uuid, email: 'u' }], decryption: 'none' }, streamSettings: { network: 'tcp', security: 'none' } });
     out.push(['other-side-for-portal', Object.assign({ log: { loglevel: 'warning' }, outbounds: [{ tag: 'direct', protocol: 'freedom' }] }, forPortal)]);
-    const forBridge = X.otherSideSnippet(portal).snippet;
+    const forBridge = X.otherSideSnippet(portal).items.find(it => it.kind === 'bridge-side').snippet;
     out.push(['other-side-for-bridge', Object.assign({ log: { loglevel: 'warning' } }, forBridge)]);
+    // v2 shapes: what the two wizards write, and a model with three tagged outbounds and the preset rules
+    const model2 = (over) => X.normalizeModel(Object.assign({
+      schema: 2, publicAddress: '203.0.113.9',
+      outbounds: [X.newOutbound('freedom', { tag: 'direct' }), X.newOutbound('blackhole', { tag: 'block' })],
+      routing: { rules: [X.presetRule('private'), X.presetRule('torrent')] }
+    }, over));
+    const wIc = inb('vless', { port: 47470, security: 'reality', reality }, [alice('vless', { email: 'wbridge', flow: 'xtls-rprx-vision' })]);
+    const wUsers = golden['vmess-ws-none'];
+    const wp = X.wizardPortal(model2({ inbounds: [wIc, wUsers] }), { inboundId: wIc.id, clientId: wIc.clients[0].id, userInboundIds: [wUsers.id] });
+    out.push(['wizard-portal', build(wp.model)]);
+    const wb = X.wizardBridge(model2({ inbounds: [golden['trojan-tcp-tls']] }), { link: wp.link });
+    out.push(['wizard-bridge', build(wb.model)]);
+    const wbServer = X.wizardBridge(model2({ inbounds: [golden['vless-grpc-tls']] }), { serverId: 'sv-vless', servers: [F.VLESS_WS_TLS], exitOutboundTag: 'direct' });
+    out.push(['wizard-bridge-stored', build(wbServer.model)]);
+    const three = model2({
+      inbounds: [golden['vless-tcp-reality']],
+      outbounds: [X.newOutbound('freedom', { tag: 'direct' }), X.newOutbound('server', { tag: 'via-proxy', serverId: 'sv-trojan' }), X.newOutbound('blackhole', { tag: 'block' })],
+      routing: { rules: [X.presetRule('private'), X.presetRule('torrent'), X.presetRule('ads'), X.newRule({ inboundTags: [golden['vless-tcp-reality'].tag], domain: ['geosite:google'], outboundTag: 'via-proxy', comment: 'google through the proxy' })] }
+    });
+    out.push(['three-outbounds-presets', build(three)]);
+    for (const [name, m] of [['wizard-portal', wp.model], ['wizard-bridge', wb.model], ['wizard-bridge-stored', wbServer.model], ['three-outbounds-presets', three]]) {
+      const v = X.validateModel(m, { servers: [F.VLESS_WS_TLS, F.TROJAN_TCP_TLS] });
+      if (!v.ok) throw new Error(`server shape ${name} does not validate: ${JSON.stringify(v.errors)}`);
+    }
     return out;
   }
 }

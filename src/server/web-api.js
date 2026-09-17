@@ -148,6 +148,7 @@
     // plus: the IP-scan tab (src/main/scan)
     scanStart: (req) => invoke('scan:start', req),
     scanStop: () => invoke('scan:stop'),
+    scanRetest: (req) => invoke('scan:retest', req),
     scanPresets: () => invoke('scan:presets'),
     scanApply: (req) => invoke('scan:apply', req),
     scanExport: (req) => invoke('scan:export', req),

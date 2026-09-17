@@ -81,4 +81,10 @@ test('each Xray engine downloads from its own GitHub repo', () => {
   assert.equal(Downloader.releaseApiUrl('xray'), 'https://api.github.com/repos/XTLS/Xray-core/releases/latest');
   assert.equal(Downloader.releaseApiUrl('xray-pattn'), 'https://api.github.com/repos/patterniha/Xray-core/releases/latest');
   assert.throws(() => Downloader.releaseApiUrl('sing-box'), /not an Xray-format engine/);
+  // plus: the 'latest' channel lists releases so the pre-releases are seen; the stable one is unchanged
+  assert.equal(Downloader.releaseApiUrl('xray', 'latest'), 'https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5');
+  assert.equal(Downloader.releaseApiUrl('xray', 'stable'), Downloader.releaseApiUrl('xray'));
+  assert.equal(Downloader.pickRelease([{ draft: true, tag_name: 'v0' }, { tag_name: 'v26.9.9', prerelease: true }]).tag_name, 'v26.9.9');
+  assert.equal(Downloader.pickRelease({ tag_name: 'v26.3.27' }).tag_name, 'v26.3.27');
+  assert.equal(Downloader.pickRelease([]), null);
 });
