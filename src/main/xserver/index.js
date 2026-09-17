@@ -70,7 +70,12 @@ function createXServer(ctx, deps = {}) {
   const withStatus = (r) => Object.assign({ ok: !!r.ok, error: r.error || '' }, core.status());
 
   const handlers = {
-    'xserver:get': () => ({ model: getModel(), status: core.status(), engines: engines() }),
+    'xserver:get': () => ({
+      model: getModel(), status: core.status(), engines: engines(),
+      // what the editors offer, from the one place that defines it
+      presets: X.RULE_PRESETS,
+      constants: { PROTOCOLS: X.PROTOCOLS, NETWORKS: X.NETWORKS, SECURITIES: X.SECURITIES, SS_METHODS: X.SS_METHODS, OUTBOUND_KINDS: X.OUTBOUND_KINDS }
+    }),
 
     'xserver:set': async (model) => {
       const r = await core.applyModel(model);
@@ -120,6 +125,38 @@ function createXServer(ctx, deps = {}) {
       const st = core.status();
       const live = st.apiPort && (st.state === 'running' || st.state === 'starting');
       return { config: X.buildServerConfig(model, { apiPort: live ? st.apiPort : PREVIEW_API_PORT, servers: ctx.getServers(), geoAvailable: geoAvailable() }) };
+    },
+
+    /**
+     * The reverse wizards (spec §2.3): pure helpers on the stored model, then
+     * the result goes through applyModel like any other edit — so it is
+     * validated, persisted and applied with a restart when the core runs.
+     */
+    'xserver:wizard': async (arg) => {
+      const a = arg && typeof arg === 'object' ? arg : {};
+      let r;
+      try {
+        r = a.kind === 'bridge'
+          ? X.wizardBridge(getModel(), Object.assign({}, a, { servers: ctx.getServers() }))
+          : X.wizardPortal(getModel(), a);
+      } catch (e) { return { ok: false, error: e.message, errors: [], status: core.status() }; }
+      const applied = await core.applyModel(r.model);
+      return Object.assign(applied, { link: r.link || null, status: core.status() });
+    },
+
+    /** The core the server runs on: what is installed, which channel, and — when asked — what GitHub has. */
+    'xserver:coreInfo': async (arg) => {
+      const a = arg && typeof arg === 'object' ? arg : {};
+      const engine = getModel().engine;
+      const channel = (ctx.getSettings && ctx.getSettings().coreChannel) || 'stable';
+      let version = '';
+      try { version = await ctx.xray.version(engine); } catch { /* not installed */ }
+      const info = { engine, version: version || '', channel, installed: !!ctx.xray.binExists(engine), latestStable: null, latestAny: null };
+      if (a.online && typeof ctx.latestVersion === 'function') {
+        try { info.latestStable = await ctx.latestVersion(engine, 'stable'); } catch { /* offline */ }
+        try { info.latestAny = await ctx.latestVersion(engine, 'latest'); } catch { /* offline */ }
+      }
+      return info;
     },
 
     'xserver:otherSide': () => {

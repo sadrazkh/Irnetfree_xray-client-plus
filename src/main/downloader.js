@@ -128,6 +128,8 @@ function findFile(dir, name) {
 class Downloader {
   /** @param {object} opts { destDir, onLog, onProgress(component, pct) } */
   constructor(opts = {}) {
+    // plus: which release the Xray-format cores follow — 'stable' is /releases/latest, 'latest' the newest pre-release too
+    this.channel = typeof opts.channel === 'function' ? opts.channel : () => 'stable';
     this.destDir = opts.destDir;
     this.onLog = opts.onLog || (() => {});
     this.onProgress = opts.onProgress || (() => {});
@@ -137,10 +139,18 @@ class Downloader {
   log(msg, level = 'info') { this.onLog('[download] ' + msg, level); }
 
   /** GitHub "latest release" endpoint for an Xray-format engine. */
-  static releaseApiUrl(engineId) {
+  static releaseApiUrl(engineId, channel = 'stable') {
     const e = engine(engineId);
     if (e.format !== 'xray' || e.id !== engineId) throw new Error('not an Xray-format engine: ' + engineId);
+    // plus: every 2026 build of the official core is a pre-release, which /releases/latest never shows
+    if (channel === 'latest') return `https://api.github.com/repos/${e.repo}/releases?per_page=5`;
     return `https://api.github.com/repos/${e.repo}/releases/latest`;
+  }
+
+  /** plus: the release object out of either endpoint — the list form yields its first non-draft entry. */
+  static pickRelease(rel) {
+    if (Array.isArray(rel)) return rel.find(r => r && !r.draft) || null;
+    return rel || null;
   }
 
   /*
@@ -214,7 +224,8 @@ class Downloader {
   async getXray(engineId = 'xray') {
     const eng = engine(engineId);
     this.log(`Fetching latest ${eng.label} release info…`);
-    const rel = await getJSON(Downloader.releaseApiUrl(engineId));
+    const rel = Downloader.pickRelease(await getJSON(Downloader.releaseApiUrl(engineId, this.channel())));   // plus
+    if (!rel) throw new Error('no release found for ' + eng.label);
     const want = this.xrayAssetName();
     const asset = (rel.assets || []).find(a => a.name === want);
     if (!asset) throw new Error('asset not found: ' + want);
@@ -239,12 +250,12 @@ class Downloader {
   }
 
   /** The latest release tag of an engine, without a leading v — for the weekly check (assetUpdater.js). */
-  async latestVersion(engineId) {
+  async latestVersion(engineId, channel) {
     const url = engineId === 'sing-box'
       ? 'https://api.github.com/repos/SagerNet/sing-box/releases/latest'
-      : Downloader.releaseApiUrl(engineId);
-    const rel = await getJSON(url);
-    return String(rel.tag_name || '').replace(/^v/i, '').trim();
+      : Downloader.releaseApiUrl(engineId, channel || this.channel());   // plus
+    const rel = Downloader.pickRelease(await getJSON(url));   // plus
+    return String((rel && rel.tag_name) || '').replace(/^v/i, '').trim();
   }
 
   async getGeo() {

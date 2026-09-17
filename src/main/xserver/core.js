@@ -146,6 +146,7 @@ class ServerCore {
     this.ring = [];
     this.recent = '';
     this.last = {};               // email -> the previous /debug/vars reading
+    this.lastIn = {};             // inbound tag -> the previous reading of stats.inbound
     this.online = new Set();      // emails whose counter moved in the last tick
     this.tickTimer = null;
     this.restartTimer = null;     // the debounced restart after an enforcer change
@@ -183,13 +184,13 @@ class ServerCore {
   status() {
     const model = this._model();
     const inbounds = model.inbounds.map((i) => {
-      let up = 0, down = 0;
-      const clients = i.clients.map((c) => {
-        up += c.used.up;
-        down += c.used.down;
-        return { id: c.id, email: c.email, enabled: c.enabled, disabledBy: c.disabledBy, up: c.used.up, down: c.used.down, online: this.online.has(c.email) };
-      });
-      return { id: i.id, tag: i.tag, port: i.port, enabled: i.enabled, up, down, clients };
+      const clients = i.clients.map((c) => ({
+        id: c.id, email: c.email, enabled: c.enabled, disabledBy: c.disabledBy, reverseTag: c.reverseTag,
+        up: c.used.up, down: c.used.down, quotaBytes: c.quotaBytes, expiresAt: c.expiresAt, resetAt: c.resetAt,
+        online: this.online.has(c.email), lastSeenAt: c.lastSeenAt
+      }));
+      // up/down are the inbound's own counters (stats.inbound.<tag>), not a sum of its clients
+      return { id: i.id, tag: i.tag, port: i.port, enabled: i.enabled, disabledBy: i.disabledBy, up: i.used.up, down: i.used.down, totalBytes: i.totalBytes, expiresAt: i.expiresAt, clients };
     });
     return {
       state: this.state,
@@ -291,6 +292,7 @@ class ServerCore {
     this.apiPort = apiPort;
     this.recent = '';
     this.last = {};
+    this.lastIn = {};
     this.online = new Set();
     this._setState('starting', '');
     this.log(`Server core: starting ${path.basename(bin)} (metrics on 127.0.0.1:${apiPort})`, 'info');
@@ -347,6 +349,7 @@ class ServerCore {
     this._clearTick();
     this.online = new Set();
     this.last = {};
+    this.lastIn = {};
     const was = this.state;
     const asked = this.stopping;
     const reason = exitReason(this.recent, code, signal);
@@ -424,6 +427,7 @@ class ServerCore {
     this.since = 0;
     this.online = new Set();
     this.last = {};
+    this.lastIn = {};
     this._setState('stopped', '');
     return this.status();
   }
@@ -446,8 +450,17 @@ class ServerCore {
         const parsed = parseServerVars(vars);
         const model = this._model();
         const online = new Set();
+        const now = this.now();
         let moved = false;
         for (const i of model.inbounds) {
+          // the inbound's own counter, beside its clients' (the core keeps both)
+          const curIn = parsed.inbounds[i.tag];
+          if (curIn) {
+            const prevIn = this.lastIn[i.tag] || { up: 0, down: 0 };
+            const dUp = Math.max(0, curIn.up - prevIn.up);
+            const dDown = Math.max(0, curIn.down - prevIn.down);
+            if (dUp || dDown) { i.used.up += dUp; i.used.down += dDown; moved = true; }
+          }
           for (const c of i.clients) {
             const cur = parsed.users[c.email];
             if (!cur) continue;
@@ -457,12 +470,14 @@ class ServerCore {
             if (dUp || dDown) {
               c.used.up += dUp;
               c.used.down += dDown;
+              c.lastSeenAt = now;
               online.add(c.email);
               moved = true;
             }
           }
         }
         this.last = parsed.users;
+        this.lastIn = parsed.inbounds;
         this.online = online;
         const e = this._enforce(model);
         if (moved || e.changed) this.setModel(model);
@@ -490,6 +505,17 @@ class ServerCore {
     let changed = false, membership = false;
     for (const i of model.inbounds) {
       for (const c of i.clients) {
+        // The reset cycle comes first: a quota renewed today is not "out".
+        if (c.resetDays > 0) {
+          const span = c.resetDays * 86400000;
+          if (!c.resetAt) { c.resetAt = now + span; changed = true; }
+          else if (now >= c.resetAt) {
+            c.used = { up: 0, down: 0 };
+            while (c.resetAt <= now) c.resetAt += span;
+            changed = true;
+            this.log(`Server: client "${c.email}" starts a new quota cycle`, 'info');
+          }
+        } else if (c.resetAt) { c.resetAt = 0; changed = true; }
         const expired = c.expiresAt > 0 && c.expiresAt < now;
         const over = c.quotaBytes > 0 && c.used.up + c.used.down >= c.quotaBytes;
         const reason = expired ? 'expired' : (over ? 'quota' : '');
@@ -507,6 +533,24 @@ class ServerCore {
           changed = membership = true;
           this.log(`Server: client "${c.email}" enabled again`, 'info');
         }
+      }
+      // The inbound itself: its total and its expiry (3x-ui's per-inbound limits).
+      const iExpired = i.expiresAt > 0 && i.expiresAt < now;
+      const iOver = i.totalBytes > 0 && i.used.up + i.used.down >= i.totalBytes;
+      const iReason = iExpired ? 'expired' : (iOver ? 'quota' : '');
+      if (iReason && i.enabled) {
+        i.enabled = false;
+        i.disabledBy = iReason;
+        changed = membership = true;
+        this.log(`Server: inbound "${i.tag}" disabled (${iReason})`, 'warn');
+      } else if (iReason && i.disabledBy && i.disabledBy !== iReason) {
+        i.disabledBy = iReason;
+        changed = true;
+      } else if (!iReason && !i.enabled && i.disabledBy) {
+        i.enabled = true;
+        i.disabledBy = '';
+        changed = membership = true;
+        this.log(`Server: inbound "${i.tag}" enabled again`, 'info');
       }
     }
     return { changed, membership };
@@ -530,12 +574,20 @@ class ServerCore {
   async applyModel(next) {
     const current = this._model();
     const model = normalizeModel(next);
-    const known = new Map();
-    for (const i of current.inbounds) for (const c of i.clients) known.set(c.id, c);
+    const known = new Map(), knownIn = new Map();
+    for (const i of current.inbounds) { knownIn.set(i.id, i); for (const c of i.clients) known.set(c.id, c); }
     for (const i of model.inbounds) {
+      const ki = knownIn.get(i.id);
+      if (ki) i.used = { up: ki.used.up, down: ki.used.down };
+      if (i.enabled) i.disabledBy = '';
       for (const c of i.clients) {
         const k = known.get(c.id);
-        if (k) c.used = { up: k.used.up, down: k.used.down };
+        if (k) {
+          c.used = { up: k.used.up, down: k.used.down };
+          c.lastSeenAt = k.lastSeenAt;
+          // a changed cycle length starts a fresh cycle; the same one keeps its date
+          c.resetAt = k.resetDays === c.resetDays ? k.resetAt : 0;
+        }
         if (c.enabled) c.disabledBy = '';
       }
     }

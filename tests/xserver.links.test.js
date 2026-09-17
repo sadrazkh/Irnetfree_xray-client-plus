@@ -43,7 +43,7 @@ const GOLDEN = {
 };
 
 const ADDR = 'vpn.example.com';
-const m = X.normalizeModel({ publicAddress: ADDR, inbounds: Object.values(GOLDEN) });
+const m = X.normalizeModel({ schema: 2, publicAddress: ADDR, inbounds: Object.values(GOLDEN), outbounds: [{ tag: 'direct', kind: 'freedom' }] });
 const at = (name) => m.inbounds[Object.keys(GOLDEN).indexOf(name)];
 const linkOf = (name) => X.clientLink(at(name), at(name).clients[0], m);
 const back = (name) => parseLink(linkOf(name));
@@ -149,6 +149,23 @@ test('clientServerRecord is a stored-server-shaped record whose outbound is what
   assert.equal(r.port, 8443);
   assert.equal(r.protocol, 'vless');
   assert.deepEqual(parseLink(linkOf('vless-ws-tls')).outbound, r.outbound, 'the link carries the whole outbound');
+});
+
+test('a bridge credential (a client with a reverseTag) links like any other client: the reverse is the portal’s business, not the link’s', () => {
+  const inb = inbound({ security: 'reality', reality: REALITY, clients: [client({ email: 'bridge1', flow: 'xtls-rprx-vision', reverseTag: 'bridge-1', comment: 'the office bridge', resetDays: 30 })] });
+  const mm = X.normalizeModel({ schema: 2, publicAddress: ADDR, inbounds: [inb], outbounds: [{ tag: 'direct', kind: 'freedom' }] });
+  const link = X.clientLink(mm.inbounds[0], mm.inbounds[0].clients[0], mm);
+  const s = parseLink(link);
+  assert.equal(s.address, ADDR);
+  assert.equal(s.port, 443);
+  assert.equal(s.name, 'Golden - bridge1');
+  const u = s.outbound.settings.vnext[0].users[0];
+  assert.deepEqual(u, { id: UUID_A, encryption: 'none', flow: 'xtls-rprx-vision' });
+  assert.equal(/reverse/.test(link), false, 'the reverse tag is not in the link');
+  assert.equal(s.outbound.streamSettings.realitySettings.publicKey, PUB);
+  const r = X.clientServerRecord(mm.inbounds[0], mm.inbounds[0].clients[0], mm);
+  assert.deepEqual(Object.keys(r).sort(), ['address', 'id', 'name', 'outbound', 'port', 'protocol']);
+  assert.equal('reverse' in JSON.parse(JSON.stringify(r.outbound.settings)).vnext[0].users[0], false);
 });
 
 test('the address defaults to the model, an explicit one wins, and an empty one throws', () => {

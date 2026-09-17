@@ -9,8 +9,12 @@
  * tls.connect for https), because http.request cannot ride a socket we
  * already hold and an Agent per port is more machinery than a GET needs. The
  * body is counted as raw bytes after the header terminator, so Content-Length
- * and chunked answers are the same to it. Throughput is first body byte to
- * last body byte — connection setup is a latency, not a bandwidth.
+ * and chunked answers are the same to it. Connection setup is a latency, not
+ * a bandwidth, so `ttfb` is reported apart and the throughput starts at the
+ * first body byte: `mbpsRaw` is first byte to last byte, `mbps` leaves out the
+ * first `warmupMs` after the first byte as well — TCP slow start ramps up
+ * during that time and a mean over the ramp understates every link the same
+ * way a shared one does.
  */
 const net = require('net');
 const tls = require('tls');
@@ -18,7 +22,7 @@ const { socks5Connect, httpThroughProxy } = require('../netutils');
 const { delayStats } = require('./score');
 
 const DELAY_DEFAULTS = { n: 3, host: 'cp.cloudflare.com', port: 80, path: '/', timeout: 8000 };
-const DOWN_DEFAULTS = { host: 'speed.cloudflare.com', port: 443, path: '/__down?bytes=10000000', tls: true, bytes: 10e6, maxMs: 8000, timeout: 8000, rejectUnauthorized: true };
+const DOWN_DEFAULTS = { host: 'speed.cloudflare.com', port: 443, path: '/__down?bytes=10000000', tls: true, bytes: 10e6, maxMs: 6000, timeout: 8000, warmupMs: 300, rejectUnauthorized: true };
 const UP_DEFAULTS = { host: 'speed.cloudflare.com', port: 443, path: '/__up', tls: true, bytes: 2e6, timeout: 20000, rejectUnauthorized: true };
 const UA = 'IRNetFree-scan';
 const MIN_INTERVAL_S = 0.05;     // a one-chunk body would otherwise divide by ~0
@@ -28,7 +32,34 @@ const round2 = (v) => Math.round(v * 100) / 100;
 const mbpsOf = (bytes, ms) => (bytes > 0 ? round2(bytes * 8 / 1e6 / Math.max(MIN_INTERVAL_S, ms / 1000)) : 0);
 
 function failure(error, extra) {
-  return Object.assign({ ok: false, bytes: 0, ms: -1, ttfb: -1, mbps: 0, error }, extra);
+  return Object.assign({ ok: false, bytes: 0, ms: -1, ttfb: -1, mbps: 0, mbpsRaw: 0, warm: false, error }, extra);
+}
+
+/**
+ * throughputMeter(warmupMs) → { add(now, n), bytes, first, last, stats() }
+ * Counts body chunks as they arrive. stats() gives `mbpsRaw` over first byte
+ * to last byte and `mbps` over the bytes that arrived `warmupMs` or later
+ * after the first byte, against that shorter interval (never under 50 ms).
+ * A transfer that ended inside the warm-up has nothing warm to measure, so
+ * `mbps` falls back to `mbpsRaw` and `warm` says so. Pure, so the arithmetic
+ * is tested with made-up arrival times.
+ */
+function throughputMeter(warmupMs) {
+  const warmup = Math.max(0, Number(warmupMs) || 0);
+  const m = { bytes: 0, first: 0, last: 0, started: false };
+  let warmBytes = 0;
+  m.add = (now, n) => {
+    if (!m.started) { m.started = true; m.first = now; }
+    m.last = now;
+    m.bytes += n;
+    if (now - m.first >= warmup) warmBytes += n;
+  };
+  m.stats = () => {
+    const mbpsRaw = mbpsOf(m.bytes, m.last - m.first);
+    const warm = m.started && m.last - m.first >= warmup;
+    return { mbpsRaw, warm, mbps: warm ? mbpsOf(warmBytes, m.last - m.first - warmup) : mbpsRaw };
+  };
+  return m;
 }
 
 /**
@@ -63,18 +94,20 @@ function statusOf(line) {
 }
 
 /**
- * downloadThroughProxy(socksPort, { host, port, path, tls, bytes, maxMs, timeout, rejectUnauthorized })
- *   → { ok, bytes, ms, ttfb, mbps, error }
+ * downloadThroughProxy(socksPort, { host, port, path, tls, bytes, maxMs, timeout, warmupMs, rejectUnauthorized })
+ *   → { ok, bytes, ms, ttfb, mbps, mbpsRaw, warm, error }
  * Stops at `bytes`, at end of stream, or `maxMs` after the first body byte.
  * `timeout` bounds the connect, the wait for headers, and any idle gap.
+ * `ttfb` is the wait for the first body byte; `mbps` and `mbpsRaw` are what
+ * throughputMeter says about the body.
  */
 function downloadThroughProxy(socksPort, opts = {}) {
   const o = Object.assign({}, DOWN_DEFAULTS, opts);
   const start = Date.now();
   return new Promise((resolve) => {
     openStream(socksPort, o).then((stream) => {
-      let done = false, headerDone = false, head = Buffer.alloc(0);
-      let bytes = 0, tFirst = 0, tLast = 0, maxTimer = null;
+      let done = false, headerDone = false, head = Buffer.alloc(0), maxTimer = null;
+      const meter = throughputMeter(o.warmupMs);
       const finish = (r) => {
         if (done) return;
         done = true;
@@ -82,12 +115,12 @@ function downloadThroughProxy(socksPort, opts = {}) {
         try { stream.destroy(); } catch { /* gone */ }
         resolve(r);
       };
-      const stats = (ok, error) => ({
-        ok, bytes, ms: Date.now() - start, ttfb: tFirst ? tFirst - start : -1,
-        mbps: mbpsOf(bytes, tLast - tFirst), error: error || null
-      });
+      const stats = (ok, error) => Object.assign(
+        { ok, bytes: meter.bytes, ms: Date.now() - start, ttfb: meter.started ? meter.first - start : -1 },
+        meter.stats(), { error: error || null }
+      );
       // a failure once the body has started keeps the partial numbers
-      const fail = (error) => finish(bytes ? stats(false, error) : failure(error, { ms: Date.now() - start }));
+      const fail = (error) => finish(meter.bytes ? stats(false, error) : failure(error, { ms: Date.now() - start }));
 
       stream.setTimeout(o.timeout, () => fail('timeout'));
       stream.on('data', (d) => {
@@ -103,13 +136,12 @@ function downloadThroughProxy(socksPort, opts = {}) {
           head = null;
           if (!d.length) return;
         }
-        if (!tFirst) { tFirst = now; maxTimer = setTimeout(() => finish(stats(true)), o.maxMs); }
-        tLast = now;
-        bytes += d.length;
-        if (bytes >= o.bytes) finish(stats(true));
+        if (!meter.started) maxTimer = setTimeout(() => finish(stats(true)), o.maxMs);
+        meter.add(now, d.length);
+        if (meter.bytes >= o.bytes) finish(stats(true));
       });
-      stream.on('end', () => (bytes ? finish(stats(true)) : fail('closed')));
-      stream.on('close', () => (bytes ? finish(stats(true)) : fail('closed')));
+      stream.on('end', () => (meter.bytes ? finish(stats(true)) : fail('closed')));
+      stream.on('close', () => (meter.bytes ? finish(stats(true)) : fail('closed')));
       stream.on('error', (e) => fail(errName(e)));
       stream.write(`GET ${o.path} HTTP/1.1\r\nHost: ${o.host}\r\nUser-Agent: ${UA}\r\nAccept: */*\r\nConnection: close\r\n\r\n`);
     }, (e) => resolve(failure(errName(e), { ms: Date.now() - start })));
@@ -184,4 +216,4 @@ async function delaySeries(socksPort, opts = {}) {
   return delayStats(samples);
 }
 
-module.exports = { downloadThroughProxy, uploadThroughProxy, delaySeries, DELAY_DEFAULTS, DOWN_DEFAULTS, UP_DEFAULTS };
+module.exports = { downloadThroughProxy, uploadThroughProxy, delaySeries, throughputMeter, DELAY_DEFAULTS, DOWN_DEFAULTS, UP_DEFAULTS };

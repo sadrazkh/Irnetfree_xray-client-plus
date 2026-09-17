@@ -7,8 +7,10 @@
  * (the self-signed fixture from certPin.test.js; its expiry does not matter
  * because the TLS tests turn verification off, and one test checks that the
  * default does verify). What matters: byte counts are exact, timings are
- * sane, `maxMs` caps a download that would never end, every failure comes
- * back as a value (never a rejection), and the TLS wrap sends SNI and ALPN.
+ * sane, `maxMs` caps a download that would never end, the warm-up arithmetic
+ * is exact on made-up arrival times and shows up in a real download, every
+ * failure comes back as a value (never a rejection), and the TLS wrap sends
+ * SNI and ALPN.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -19,7 +21,7 @@ const tls = require('node:tls');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { downloadThroughProxy, uploadThroughProxy, delaySeries } = require('../src/main/scan/probes');
+const { downloadThroughProxy, uploadThroughProxy, delaySeries, throughputMeter, DOWN_DEFAULTS } = require('../src/main/scan/probes');
 
 const FIXTURE = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'selfsigned.json'), 'utf8'));
 const CERT = FIXTURE.certificate.join('\n');
@@ -132,21 +134,78 @@ async function withRig(fn) {
   }
 }
 
-const SHAPE = ['ok', 'bytes', 'ms', 'ttfb', 'mbps', 'error'];
-const assertShape = (r) => assert.deepEqual(Object.keys(r).sort(), [...SHAPE].sort(), JSON.stringify(r));
+const DOWN_SHAPE = ['ok', 'bytes', 'ms', 'ttfb', 'mbps', 'mbpsRaw', 'warm', 'error'].sort();
+const UP_SHAPE = ['ok', 'bytes', 'ms', 'ttfb', 'mbps', 'error'].sort();
+const assertDown = (r) => assert.deepEqual(Object.keys(r).sort(), DOWN_SHAPE, JSON.stringify(r));
+const assertUp = (r) => assert.deepEqual(Object.keys(r).sort(), UP_SHAPE, JSON.stringify(r));
+
+/* ----------------------------- warm-up arithmetic ----------------------------- */
+
+test('throughputMeter: mbps leaves out the warm-up after the first byte, mbpsRaw does not', () => {
+  const m = throughputMeter(300);
+  for (const [t, n] of [[0, 1e6], [100, 1e6], [400, 1e6], [700, 1e6]]) m.add(t, n);
+  assert.equal(m.bytes, 4e6);
+  assert.equal(m.first, 0, 'a first chunk at t=0 still counts as the first');
+  assert.equal(m.last, 700);
+  const s = m.stats();
+  assert.equal(s.mbpsRaw, 45.71, '32 Mb over the whole 0.7 s');
+  assert.equal(s.mbps, 40, 'the 16 Mb that arrived from t=300 on, over the 0.4 s after the warm-up');
+  assert.equal(s.warm, true);
+});
+
+test('throughputMeter: a transfer that ends inside the warm-up falls back to the raw figure and says so', () => {
+  const m = throughputMeter(1000);
+  m.add(0, 5e5); m.add(200, 5e5);
+  assert.deepEqual(m.stats(), { mbpsRaw: 40, mbps: 40, warm: false });
+});
+
+test('throughputMeter: warm-up 0 is the raw figure; one chunk uses the 50 ms floor; nothing received is 0', () => {
+  const zero = throughputMeter(0);
+  zero.add(0, 1e6); zero.add(250, 1e6);
+  assert.deepEqual(zero.stats(), { mbpsRaw: 64, mbps: 64, warm: true });
+  const one = throughputMeter(0);
+  one.add(5, 1e6);
+  assert.deepEqual(one.stats(), { mbpsRaw: 160, mbps: 160, warm: true });
+  assert.deepEqual(throughputMeter(300).stats(), { mbpsRaw: 0, mbps: 0, warm: false });
+  assert.equal(DOWN_DEFAULTS.warmupMs, 300);
+  assert.equal(DOWN_DEFAULTS.maxMs, 6000);
+});
 
 /* ----------------------------- download ----------------------------- */
 
 test('download (plain): exact byte count, sane timings, an HTTP/1.1 GET with the Host header', async () => {
   await withRig(async (rig) => {
     const r = await downloadThroughProxy(rig.socksPort, { host: 'plain.test', port: 80, path: '/down?bytes=300000', tls: false, bytes: 300000, maxMs: 5000, timeout: 3000 });
-    assertShape(r);
+    assertDown(r);
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.bytes, 300000);
     assert.ok(r.ttfb >= 0 && r.ttfb <= r.ms, `ttfb ${r.ttfb} ms ${r.ms}`);
     assert.ok(r.mbps > 0);
+    assert.ok(r.mbpsRaw > 0);
     assert.equal(r.error, null);
     assert.deepEqual(rig.log[0], { method: 'GET', url: '/down?bytes=300000', host: 'plain.test' });
+  });
+});
+
+test('download: a loopback transfer over in a few ms is shorter than the warm-up, so mbps is the raw figure with warm: false; warm-up 0 is always warm', async () => {
+  await withRig(async (rig) => {
+    const r = await downloadThroughProxy(rig.socksPort, { host: 'plain.test', port: 80, path: '/down?bytes=200000', tls: false, bytes: 200000, maxMs: 5000, timeout: 3000, warmupMs: 2000 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.warm, false);
+    assert.equal(r.mbps, r.mbpsRaw);
+    const z = await downloadThroughProxy(rig.socksPort, { host: 'plain.test', port: 80, path: '/down?bytes=200000', tls: false, bytes: 200000, maxMs: 5000, timeout: 3000, warmupMs: 0 });
+    assert.equal(z.warm, true);
+    assert.equal(z.mbps, z.mbpsRaw);
+  });
+});
+
+test('download: a stream that outlives the warm-up reports a warm mbps measured after it', async () => {
+  await withRig(async (rig) => {
+    const r = await downloadThroughProxy(rig.socksPort, { host: 'plain.test', port: 80, path: '/slow', tls: false, bytes: 1e9, maxMs: 700, timeout: 3000, warmupMs: 300 });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.warm, true);
+    assert.ok(r.mbps > 0 && r.mbpsRaw > 0, JSON.stringify(r));
+    assert.ok(r.ms >= 650, 'ran to maxMs: ' + r.ms);
   });
 });
 
@@ -174,10 +233,11 @@ test('download: a server that never answers is a timeout, not a hang and not a r
   await withRig(async (rig) => {
     const t0 = Date.now();
     const r = await downloadThroughProxy(rig.socksPort, { host: 'plain.test', port: 80, path: '/hang', tls: false, bytes: 1000, maxMs: 5000, timeout: 300 });
-    assertShape(r);
+    assertDown(r);
     assert.equal(r.ok, false);
     assert.equal(r.error, 'timeout');
     assert.equal(r.bytes, 0);
+    assert.equal(r.warm, false);
     assert.ok(Date.now() - t0 < 2000);
   });
 });
@@ -203,7 +263,7 @@ test('download: a refused CONNECT, a dead proxy port and a non-2xx status are fa
 test('upload (plain): the sink receives every byte and the probe times the status line', async () => {
   await withRig(async (rig) => {
     const r = await uploadThroughProxy(rig.socksPort, { host: 'plain.test', port: 80, path: '/up', tls: false, bytes: 200000, timeout: 3000 });
-    assertShape(r);
+    assertUp(r);
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.bytes, 200000);
     assert.ok(r.ttfb > 0 && r.ttfb <= r.ms);
@@ -225,13 +285,13 @@ test('upload: no answer is a timeout; a refused CONNECT is a failure', async () 
 
 /* ----------------------------- delay ----------------------------- */
 
-test('delaySeries: n requests in a row, summarised', async () => {
+test('delaySeries: n requests in a row, summarised with a median', async () => {
   await withRig(async (rig) => {
     const s = await delaySeries(rig.socksPort, { n: 3, host: 'plain.test', port: 80, path: '/', timeout: 2000 });
-    assert.deepEqual(Object.keys(s).sort(), ['avg', 'jitter', 'loss', 'min', 'samples']);
+    assert.deepEqual(Object.keys(s).sort(), ['avg', 'jitter', 'loss', 'median', 'min', 'samples']);
     assert.equal(s.samples.length, 3);
     assert.equal(s.loss, 0);
-    assert.ok(s.min >= 0 && s.avg >= s.min);
+    assert.ok(s.min >= 0 && s.median >= s.min && s.avg >= s.min);
     assert.equal(rig.log.filter(e => e.url === '/').length, 3);
   });
 });

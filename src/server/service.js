@@ -115,6 +115,7 @@ const DEFAULT_SETTINGS = {
   // weekly refresh of the downloaded files, never under a live tunnel:
   // 'off' | 'geo' (the data files only — the default) | 'all' (the cores too)
   autoUpdateAssets: 'geo',
+  coreChannel: 'stable',   // plus: 'latest' follows the official core's 26.9.x pre-releases
   // which surfaces the window shows: 'simple' hides chains, the pool, the log
   // page and the custom-rule editor. A view preference only — renderer-owned,
   // never baked into a config, so it needs no reconnect.
@@ -335,6 +336,7 @@ function createService(opts = {}) {
   });
 
   const downloader = new Downloader({
+    channel: () => getSettings().coreChannel || 'stable',   // plus: the release channel the cores follow
     destDir: userBinDir,
     onLog: (line, level) => send('log', { line, level }),
     onProgress: (component, pct) => send('asset-progress', { component, pct })
@@ -1803,6 +1805,7 @@ function createService(opts = {}) {
     addServer: (server) => { const existing = store.get('servers', []); existing.push(server); store.set('servers', existing); return server; },
     resolveTarget,
     log: (line, level = 'info') => send('log', { line, level }),
+    latestVersion: (id, channel) => downloader.latestVersion(id, channel),
     platform: process.platform, isElectron: false
   };
   const xserver = createXServer(plusCtx); xserver.register();
