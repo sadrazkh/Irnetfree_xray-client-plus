@@ -80,6 +80,22 @@ Strings for the new tabs live in `src/renderer/plus/<tab>.i18n.js` and are merge
 - **در فایل‌های پلاس** (`xserver/*`، `scan/*`، `renderer/plus/*`) تعارض معنایی ندارد؛ upstream این فایل‌ها را ندارد.
 - اگر یک تعارض در فایل مخزن اصلی *بزرگ* بود، یعنی جایی بیش از حد لازم دست‌کاری شده — منطق را به یک ماژول پلاس منتقل کنید تا دفعهٔ بعد دوباره تکرار نشود.
 
+### Hook sites as of v2.1 (what to re-apply after a conflict)
+
+| Upstream file | Marked lines |
+|---|---|
+| `src/main/main.js`, `src/server/service.js` | the two `require`s, `plusCtx` + `createXServer/createScan(...).register()`, `xserver.stop()`/`scanner.stop()` in the teardown, `xserver.autoStart()`, `coreChannel: 'stable'` in `DEFAULT_SETTINGS`, `channel:` in `new Downloader({ … })`, `latestVersion` in `plusCtx` |
+| `src/main/downloader.js` | `this.channel` in the constructor, `releaseApiUrl(engineId, channel)`, `pickRelease`, the two `getJSON` reads |
+| `src/main/configBuilder.js` | the `Object.assign(module.exports, …)` line |
+| `src/preload/preload.js`, `src/server/web-api.js` | the `xserver*` / `scan*` method blocks |
+| `src/renderer/index.html` | two nav buttons, two `<section>`s, the `<link>`/`<script>` tags, the `<!-- plus -->` modals before `</body>`, the title-bar `PLUS` |
+| `src/renderer/app.js` | `APP_REPO`, the Plus port fallbacks, the `plusInit` loop at the end of `init()` |
+| `src/renderer/i18n.js` | `extend()` |
+| `src/renderer/styles.css` | `.tb-plus` |
+| `src/main/backup.js`, `src/main/autostart.js`, `src/main/appUpdate.js` | the port guard on restore, the task name, the `IRNetFree-Plus-` asset names |
+| `tests/renderer.test.js`, `tests/appUpdate.test.js`, `tests/backup.test.js`, `tests/autostart.test.js` | the plus file lists and the plus cases |
+| `.github/workflows/release.yml` | the artifact names, `continue-on-error` on the upload |
+
 In upstream files, **upstream wins**: resolve with their side, then re-apply the marked hook lines. Plus's own files never conflict, because upstream does not have them. A large conflict in an upstream file is a signal that something belongs in a Plus module instead.
 
 پس از هر merge، این‌ها را دوباره بررسی کنید (چون در فایل‌های مخزن اصلی‌اند): جدول هویت بخش ۶، `APP_REPO` در `src/main/main.js` و `src/renderer/app.js`، `TASK` در `src/main/autostart.js`، `DEFAULT_SETTINGS` در `src/main/main.js` و `src/server/service.js`، نام‌های artifact در `package.json`، و عنوان نوار بالای پنجره در `src/renderer/index.html`.
