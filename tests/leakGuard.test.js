@@ -16,7 +16,7 @@ const path = require('node:path');
 
 const {
   LeakGuard, STATE_FILE, GUARD_EXCLUDES, rangeComplement, withoutPeers,
-  winSnapshotScript, parseWinSnapshot, winApplyScript, winRestoreScript,
+  winSnapshotScript, parseWinSnapshot, parseNetshDnsServers, winApplyScript, winRestoreScript,
   winOrphanKillScript, winRepairScript, winReleaseScript,
   winStrictApplyScript, winGroupRemoveScript, winUdpBlockApplyScript,
   macSnapshotScript, parseMacSnapshot, macApplyScript, macRestoreScript,
@@ -170,15 +170,9 @@ test('winRepairScript is the orphan kill followed by the restore, in one spawn',
   assert.equal(winRepairScript(adapters), winOrphanKillScript() + '\n' + winRestoreScript(adapters));
 });
 
-test('macOrphanKillScript kills a stray tunnel by its argv', () => {
-  assert.equal(macOrphanKillScript(), [
-    '#!/bin/bash',
-    'FAIL=0',
-    'for p in $(pgrep -f \'sing-box run -c .*irnf-sb-\' 2>/dev/null); do echo "killed sing-box (pid $p)"; kill -TERM "$p" 2>/dev/null || true; done',
-    'for p in $(pgrep -f \'[-]device utun\' 2>/dev/null); do echo "killed tun2socks (pid $p)"; kill -TERM "$p" 2>/dev/null || true; done',
-    'exit $FAIL',
-    ''
-  ].join('\n'));
+test('macOS guard never kills processes without an owned backend session', () => {
+  assert.doesNotMatch(macOrphanKillScript(), /pgrep|pkill|kill -/);
+  assert.equal(macRepairScript([]), macRestoreScript([]));
 });
 
 /* ----------------------------- macOS ----------------------------- */
@@ -296,6 +290,157 @@ const WIN_SNAP = JSON.stringify([
   { alias: 'Wi-Fi', v4: ['192.168.8.1'], v6: [], dhcp4: true, dhcp6: true },
   { alias: 'Ethernet', v4: ['178.22.122.100'], v6: [], dhcp4: false, dhcp6: true }
 ]);
+
+test('refresh repairs DHCP drift and journals a newly connected adapter before writing DNS', async () => {
+  let snapshot = WIN_SNAP;
+  const h = harness('win32', (cmd, args) => /ConvertTo-Json/.test(args.at(-1)) ? snapshot : '');
+  const { token } = await h.guard.engage({ level: 'standard', peer4: PEER4, peer6: PEER6 });
+  const original = h.state().win.adapters;
+  snapshot = JSON.stringify([
+    { alias: 'Wi-Fi', v4: ['192.168.8.254'], v6: ['fe80::2'], dhcp4: true, dhcp6: true },
+    { alias: 'Ethernet', v4: [PEER4], v6: [PEER6], dhcp4: false, dhcp6: false },
+    { alias: 'USB Ethernet', v4: ['192.168.20.1'], v6: [], dhcp4: true, dhcp6: true }
+  ]);
+  // the harness answers netsh with nothing, so the cheap check falls through
+  const ps = () => h.calls.filter(c => c.cmd === 'powershell').length;
+  const before = ps();
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: true, adapters: 2 });
+  assert.equal(ps(), before + 2);
+  assert.deepEqual(h.state().win.adapters.slice(0, 2), original);
+  assert.deepEqual(h.state().win.adapters[2].v4, ['192.168.20.1']);
+  assert.doesNotMatch(h.calls.at(-1).script, /Firewall|InterfaceAlias 'Ethernet'/);
+  await h.guard.release({ token });
+  assert.match(h.calls.at(-1).script, /InterfaceAlias 'USB Ethernet' -ResetServerAddresses/);
+  const after = h.calls.length;
+  assert.equal((await h.guard.refresh({ token })).skipped, true);
+  assert.equal(h.calls.length, after);
+});
+
+test('refresh without drift is read-only, and stale receipts do not even snapshot', async () => {
+  let snapshot = WIN_SNAP;
+  const h = harness('win32', (cmd, args) => /ConvertTo-Json/.test(args.at(-1)) ? snapshot : '');
+  const { token } = await h.guard.engage({ level: 'strict', peer4: PEER4, peer6: PEER6 });
+  snapshot = JSON.stringify([{ alias: 'Wi-Fi', v4: [PEER4], v6: [PEER6] }]);
+  const ps = () => h.calls.filter(c => c.cmd === 'powershell').length;
+  const before = ps();
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: false, adapters: 0 });
+  assert.equal(ps(), before + 1);
+  const all = h.calls.length;
+  assert.equal((await h.guard.refresh({ token: 'old' })).skipped, true);
+  assert.equal(h.calls.length, all, 'a stale receipt runs nothing, not even netsh');
+});
+
+/* ------------------------- refresh: the cheap half (netsh) ------------------------- */
+
+const netshBlock = (alias, label, addrs) => [
+  `Configuration for interface "${alias}"`,
+  ...addrs.map((a, i) => (i ? ' '.repeat(42) : `    ${label}:`.padEnd(42)) + a),
+  '    Register with which suffix:           Primary only',
+  ''
+].join('\r\n');
+const NETSH_V4 = ['',
+  netshBlock('IRNetFree', 'Statically Configured DNS Servers', [PEER4]),
+  netshBlock('Wi-Fi', 'Statically Configured DNS Servers', [PEER4]),
+  netshBlock('Ethernet', 'Statically Configured DNS Servers', [PEER4]),
+  netshBlock('Bluetooth Network Connection', 'DNS servers configured through DHCP', ['None'])
+].join('\r\n');
+const NETSH_V6 = ['',
+  netshBlock('Wi-Fi', 'Statically Configured DNS Servers', [PEER6]),
+  netshBlock('Ethernet', 'Statically Configured DNS Servers', [PEER6]),
+  netshBlock('Bluetooth Network Connection', 'DNS servers configured through DHCP', ['fec0:0:0:ffff::1%1', 'fec0:0:0:ffff::2%1'])
+].join('\r\n');
+
+test('parseNetshDnsServers: one block per quoted alias, addresses only, scope ids dropped, headings never matched', () => {
+  const v4 = parseNetshDnsServers(NETSH_V4);
+  assert.deepEqual([...v4.keys()], ['irnetfree', 'wi-fi', 'ethernet', 'bluetooth network connection']);
+  assert.deepEqual(v4.get('wi-fi'), [PEER4]);
+  assert.deepEqual(v4.get('bluetooth network connection'), [], '"None" is not an address');
+  const v6 = parseNetshDnsServers(NETSH_V6);
+  assert.deepEqual(v6.get('ethernet'), [PEER6]);
+  assert.deepEqual(v6.get('bluetooth network connection'), ['fec0:0:0:ffff::1', 'fec0:0:0:ffff::2'], 'continuation lines, %zone dropped');
+  // a localized heading is still a heading: only the quotes are matched
+  assert.deepEqual(parseNetshDnsServers('پیکربندی برای رابط "Wi-Fi"\r\n    سرورهای DNS:   10.255.0.1\r\n').get('wi-fi'), ['10.255.0.1']);
+  assert.equal(parseNetshDnsServers('').size, 0);
+  assert.equal(parseNetshDnsServers(null).size, 0);
+  assert.equal(parseNetshDnsServers('    10.255.0.1\r\n').size, 0, 'an address before any block belongs to nobody');
+});
+
+test('refresh: a netsh listing that still names the peers costs no PowerShell; a drift, `full` or an unreadable listing takes the snapshot', async () => {
+  let v4 = NETSH_V4, v6 = NETSH_V6, snapshot = WIN_SNAP;
+  const h = harness('win32', (cmd, args) => {
+    if (cmd === 'netsh') return args[1] === 'ipv6' ? v6 : v4;
+    return /ConvertTo-Json/.test(args.at(-1)) ? snapshot : '';
+  });
+  const { token } = await h.guard.engage({ level: 'standard', peer4: PEER4, peer6: PEER6 });
+  assert.deepEqual(h.state().win.adapters.map(a => a.alias), ['Wi-Fi', 'Ethernet']);
+  const ps = () => h.calls.filter(c => c.cmd === 'powershell').length;
+  const netsh = () => h.calls.filter(c => c.cmd === 'netsh').map(c => c.args.join(' '));
+
+  let p = ps();
+  const n = netsh().length;
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: false, adapters: 0, quick: true });
+  assert.equal(ps(), p, 'no PowerShell at all');
+  assert.deepEqual(netsh().slice(n), ['interface ipv4 show dnsservers', 'interface ipv6 show dnsservers']);
+
+  // the v6 family of an owned adapter drifted back to the router → the full
+  // path, which sees the same drift in the snapshot and repairs it
+  v6 = NETSH_V6.replace(`Statically Configured DNS Servers:    ${PEER6}`, 'DNS servers configured through DHCP:  fe80::1%22');
+  snapshot = JSON.stringify([
+    { alias: 'Wi-Fi', v4: [PEER4], v6: ['fe80::1'], dhcp4: true, dhcp6: true },
+    { alias: 'Ethernet', v4: [PEER4], v6: [PEER6], dhcp4: false, dhcp6: false }
+  ]);
+  p = ps();
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: true, adapters: 1 });
+  assert.equal(ps(), p + 2, 'snapshot + apply');
+  assert.match(h.calls.at(-1).script, /InterfaceAlias 'Wi-Fi' -ServerAddresses 'fdfe:dcba:9876::2'/);
+  assert.doesNotMatch(h.calls.at(-1).script, /InterfaceAlias 'Ethernet'/);
+
+  // `full` skips the cheap half even when nothing drifted
+  v6 = NETSH_V6;
+  snapshot = JSON.stringify([{ alias: 'Wi-Fi', v4: [PEER4], v6: [PEER6] }, { alias: 'Ethernet', v4: [PEER4], v6: [PEER6] }]);
+  p = ps();
+  const before = netsh().length;
+  assert.deepEqual(await h.guard.refresh({ token, full: true }), { refreshed: false, adapters: 0 });
+  assert.equal(ps(), p + 1);
+  assert.equal(netsh().length, before);
+
+  // an adapter netsh no longer lists is gone, not drifted
+  v4 = NETSH_V4.replace(netshBlock('Ethernet', 'Statically Configured DNS Servers', [PEER4]), '');
+  v6 = NETSH_V6.replace(netshBlock('Ethernet', 'Statically Configured DNS Servers', [PEER6]), '');
+  p = ps();
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: false, adapters: 0, quick: true });
+  assert.equal(ps(), p);
+
+  // an empty (unreadable) listing is not trusted: the snapshot decides
+  v4 = '';
+  p = ps();
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: false, adapters: 0 });
+  assert.equal(ps(), p + 1);
+
+  // a v4 drift alone is enough
+  v4 = NETSH_V4.replace(`Statically Configured DNS Servers:    ${PEER4}\r\n    Register with which suffix:           Primary only\r\n\r\nConfiguration for interface "Ethernet"`,
+    `DNS servers configured through DHCP:  192.168.8.1\r\n    Register with which suffix:           Primary only\r\n\r\nConfiguration for interface "Ethernet"`);
+  assert.deepEqual(parseNetshDnsServers(v4).get('wi-fi'), ['192.168.8.1']);
+  snapshot = JSON.stringify([{ alias: 'Wi-Fi', v4: ['192.168.8.1'], v6: [PEER6], dhcp4: true, dhcp6: true }]);
+  p = ps();
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: true, adapters: 1 });
+  assert.equal(ps(), p + 2);
+});
+
+test('mac refresh preserves original DNS and changes only drifted services', async () => {
+  let snapshot = 'Wi-Fi\t192.168.1.1\n';
+  const h = harness('darwin', cmd => cmd === '/bin/bash' ? snapshot : '');
+  const { token } = await h.guard.engage({ level: 'standard', peer4: PEER4, peer6: PEER6 });
+  snapshot = `Wi-Fi\t${PEER4} ${PEER6}\nUSB LAN\t192.168.2.1\n`;
+  assert.deepEqual(await h.guard.refresh({ token }), { refreshed: true, adapters: 1 });
+  assert.deepEqual(h.state().mac.services, [{ name: 'Wi-Fi', dns: ['192.168.1.1'] }, { name: 'USB LAN', dns: ['192.168.2.1'] }]);
+  assert.match(h.calls.at(-1).script, /-setdnsservers 'USB LAN'/);
+  assert.doesNotMatch(h.calls.at(-1).script, /-setdnsservers 'Wi-Fi'/);
+  snapshot = `Wi-Fi\t${PEER4} ${PEER6}\nUSB LAN\t${PEER4} ${PEER6}\n`;
+  const before = h.calls.length;
+  assert.equal((await h.guard.refresh({ token })).refreshed, false);
+  assert.equal(h.calls.length, before + 1, 'unchanged DNS never opens an administrator prompt');
+});
 
 /**
  * The state file a session that never shut down cleanly leaves behind.
@@ -1301,4 +1446,26 @@ test('recorded resolvers are quoted before they reach a root shell', () => {
   assert.equal(script.includes(evil), false, 'the payload is never interpolated raw');
   assert.equal(script.split(String.fromCharCode(92) + "'").length - 1, 2, 'both quotes escaped');
   assert.match(script, /networksetup -setdnsservers 'Wi-Fi' .* \|\| FAIL=1/);
+});
+
+for (const dns of [['9.9.9.9', '149.112.112.112'], []]) {
+  test('macOS restores pre-TUN DNS including DHCP: ' + JSON.stringify(dns), async () => {
+    const h = harness('darwin', cmd => cmd === 'privileged' ? '' : 'Wi-Fi\t' + PEER4 + '\n');
+    await h.guard.engage({level:'standard', peer4:PEER4, originalMacServices:[{name:'Wi-Fi',dns}]});
+    assert.deepEqual(h.state().mac.services, [{name:'Wi-Fi',dns}]);
+    await h.guard.release();
+    assert.equal(h.calls.at(-1).script, macRestoreScript([{name:'Wi-Fi',dns}]));
+  });
+}
+test('macOS retains previous-session originals ahead of a reconnect snapshot', async () => {
+  const h = harness('darwin', cmd => cmd === 'privileged' ? '' : 'Wi-Fi\t' + PEER4 + '\n');
+  const opts = {level:'standard', peer4:PEER4};
+  await h.guard.engage({...opts, originalMacServices:[{name:'Wi-Fi',dns:['9.9.9.9']}]});
+  await h.guard.engage({...opts, originalMacServices:[{name:'Wi-Fi',dns:[PEER4]}]});
+  assert.deepEqual(h.state().mac.services, [{name:'Wi-Fi',dns:['9.9.9.9']}]);
+});
+test('macOS trusts a fresh uncontaminated service instead of stale setup DNS', async () => {
+  const h = harness('darwin', cmd => cmd === 'privileged' ? '' : 'Wi-Fi\t8.8.4.4\nEthernet\t' + PEER4 + '\n');
+  await h.guard.engage({level:'standard', peer4:PEER4, originalMacServices:[{name:'Wi-Fi',dns:['9.9.9.9']}]});
+  assert.deepEqual(h.state().mac.services, [{name:'Wi-Fi',dns:['8.8.4.4']},{name:'Ethernet',dns:[]}]);
 });

@@ -21,9 +21,12 @@ const R = (f) => fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', f
 const HTML = R('index.html');
 // plus: the two tabs are classic scripts after app.js and share its contract
 const APP = ['app.js', 'plus/xserver.js', 'plus/scan.js'].map(R).join(String.fromCharCode(10));
+// The diagnostics dialog is built entirely in JS, so none of its strings and
+// none of its classes reach index.html — it has to be read on its own.
+const DIAG = R('diagnostics.js');
 // the stylesheet is split by surface (styles/home/lists/routing/settings/skins);
 // the contract is against all of it, so read them as one
-const CSS_FILES = ['styles.css', 'home.css', 'lists.css', 'routing.css', 'settings.css', 'skins.css', 'plus/shell.css', 'plus/xserver.css', 'plus/scan.css'];
+const CSS_FILES = ['styles.css', 'home.css', 'lists.css', 'routing.css', 'settings.css', 'skins.css', 'diagnostics.css', 'plus/shell.css', 'plus/xserver.css', 'plus/scan.css'];
 const CSS = CSS_FILES.map(R).join(String.fromCharCode(10));
 // plus: the tabs' strings live next to them and are merged through window.i18n.extend
 const I18N = ['i18n.js', 'plus/xserver.i18n.js', 'plus/scan.i18n.js'].map(R).join(String.fromCharCode(10));
@@ -70,6 +73,79 @@ test('every string on screen resolves in both languages', () => {
     for (const m of HTML.matchAll(new RegExp(a + '="([^"]+)"', 'g'))) keys.add(m[1]);
   }
   assert.ok(keys.size > 200, `expected the markup to be fully translated, found ${keys.size} keys`);
+  // The diagnostics dialog has no markup to scan: every one of its strings is a
+  // 'diag.…' key handed to t(), tel() or say(), so the keys ARE the contract.
+  const diag = new Set([...DIAG.matchAll(/'(diag\.[A-Za-z0-9.]+)'/g)].map((m) => m[1]));
+  assert.ok(diag.size >= 30, `expected the whole dialog to be translated, found ${diag.size} keys`);
+  for (const k of diag) keys.add(k);
+  const bad = [...keys].filter((k) => (I18N.split(`'${k}':`).length - 1) !== 2).sort();
+  assert.deepEqual(bad, [], 'these keys are not defined exactly once in each of fa and en');
+});
+
+/**
+ * The dialog's own controls. styles.css resets `button { background:none;
+ * border:0 }` and gives inputs `color: inherit`, so a class-less <button> in
+ * there rendered as bare padded text and its <input>s as near-white text on the
+ * UA's white box. They have to opt into the shared classes like every other
+ * control, and nothing may write a visible string past t().
+ */
+test('the diagnostics dialog uses the shared controls and no hard-coded strings', () => {
+  const buttons = [...DIAG.matchAll(/tel\('button', '[^']+', '([^']+)'\)/g)].map((m) => m[1]);
+  assert.equal(buttons.length, 6, 'the dialog has six buttons');
+  assert.equal(buttons.filter((c) => c === 'btn primary').length, 1, 'only Test is the primary action');
+  for (const cls of buttons) assert.match(cls, /^btn( |$)/, `a class-less button renders as bare text: "${cls}"`);
+  assert.equal([...DIAG.matchAll(/el\('input', null, '([^']+)'\)/g)].map((m) => m[1]).length, 2);
+  assert.doesNotMatch(DIAG, /el\('input', null, '(?!input')/, 'an unstyled input is white on white');
+
+  // el() writes its second argument verbatim; tel() sends it through t(). A
+  // quoted word there is therefore untranslated English on screen. The \b is
+  // load-bearing: without it the pattern matches the "el(" inside "tel(".
+  assert.doesNotMatch(DIAG, /\bel\('(?:p|h3|li|span|h2|button)', '[A-Za-z]/,
+    'a visible string written straight into el() never reaches t()');
+
+  // Neither the direction nor the language is the dialog's to decide: it is a
+  // panel of the page, and the page is RTL in Persian.
+  assert.doesNotMatch(DIAG, /\.dir\s*=|\.lang\s*=/, 'the dialog must follow the page direction');
+
+  // One idempotent teardown, run by the button AND the event — the `close`
+  // event alone did not arrive in every Chromium, and the panel could then
+  // never be reopened.
+  assert.match(DIAG, /close\.onclick = \(\) => teardown\(\)/);
+  assert.match(DIAG, /addEventListener\('close', \(\) => teardown\(\)\)/);
+  assert.match(DIAG, /function teardown\(\) \{\s*if \(!panel\) return;/);
+});
+
+/**
+ * Per-app routing under the sing-box TUN (D10) — the row in the TUN card.
+ *
+ * Three things can go wrong silently here and nowhere else catches them: an id
+ * app.js drives that the markup never grew, a mode the config builder does not
+ * understand (the tunnel would then be built from a value nothing routes on),
+ * and `tunapp.pickNone` — the one string of this row that never reaches the
+ * markup, because it only ever appears in a toast, so the whole-markup i18n
+ * test above cannot see it.
+ */
+test('the TUN card carries the per-app routing controls, in both languages', () => {
+  for (const id of ['tunAppRow', 'optTunAppMode', 'tunAppModeCards', 'tunAppsBlock',
+    'optTunApps', 'tunAppsPick', 'btnTunAppsPick', 'tunAppStrictNote', 'tunAppNeedsSingbox']) {
+    assert.ok(htmlIds.has(id), `#${id} is missing from the TUN card`);
+  }
+
+  // it belongs to the tunnel's own card, between the backend and the guard
+  const between = HTML.slice(HTML.indexOf('id="tunBackendRow"'), HTML.indexOf('id="leakGuardRow"'));
+  assert.ok(between.includes('id="tunAppRow"'),
+    'the per-app row is not in the TUN card, after the backend row');
+
+  // exactly the modes the sing-box config builder understands
+  const from = HTML.slice(HTML.indexOf('id="optTunAppMode"'));
+  const select = from.slice(0, from.indexOf('</select>'));
+  const modes = [...select.matchAll(/<option value="([^"]*)"/g)].map((m) => m[1]);
+  assert.deepEqual(modes, ['off', 'exclude', 'only']);
+
+  const keys = new Set();
+  for (const m of HTML.matchAll(/data-i18n(?:-ph|-title)?="(tunapp\.[^"]+)"/g)) keys.add(m[1]);
+  for (const m of APP.matchAll(/\bt\(\s*'(tunapp\.[^']+)'/g)) keys.add(m[1]);
+  assert.ok(keys.size >= 10, `expected the whole row to be translated, found ${keys.size} keys`);
   const bad = [...keys].filter((k) => (I18N.split(`'${k}':`).length - 1) !== 2).sort();
   assert.deepEqual(bad, [], 'these keys are not defined exactly once in each of fa and en');
 });

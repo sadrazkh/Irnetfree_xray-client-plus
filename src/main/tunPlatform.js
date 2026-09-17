@@ -42,9 +42,9 @@ function isOwnTunInterface(name) {
   return n === 'tun0';                        // Linux: tunManager's startLinux() fixed device
 }
 
-function run(cmd, args) {
+function run(cmd, args, options = {}) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { windowsHide: true }, (err, stdout, stderr) => {
+    execFile(cmd, args, { windowsHide: true, timeout: options.timeout || 0 }, (err, stdout, stderr) => {
       if (err) return reject(new Error((stderr || err.message).toString().trim()));
       resolve((stdout || '').toString());
     });
@@ -136,16 +136,16 @@ async function waitForAdapter(name, timeout) {
 
 /** Run a privileged shell script: directly if root, else via an osascript
  * GUI prompt (`do shell script ... with administrator privileges`). */
-async function runScriptPrivileged(scriptPath) {
+async function runScriptPrivileged(scriptPath, options = {}) {
   const isRoot = !!(process.getuid && process.getuid() === 0);
   if (isRoot) {
-    return run('/bin/bash', [scriptPath]);
+    return run('/bin/bash', [scriptPath], options);
   }
   // AppleScript string: escape backslashes and double quotes; the path may
   // contain spaces (e.g. ".../Application Support/IRNetFree/...").
   const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const cmd = `do shell script "/bin/bash \\"${esc(scriptPath)}\\"" with administrator privileges`;
-  return run('osascript', ['-e', cmd]);
+  return run('osascript', ['-e', cmd], options);
 }
 
 /** Parse `route -n get default` → { gateway, device } (macOS). */
@@ -176,10 +176,10 @@ async function serviceForDeviceMac(device) {
 }
 
 /** Current DNS servers for a service, or [] if set to automatic/DHCP. */
-async function getServiceDnsMac(service) {
+async function getServiceDnsMac(service, { strict = false } = {}) {
   if (!service) return [];
   let out = '';
-  try { out = await run('networksetup', ['-getdnsservers', service]); } catch { return []; }
+  try { out = await run('networksetup', ['-getdnsservers', service]); } catch (e) { if (strict) throw e; return []; }
   if (/aren't any|any DNS Servers/i.test(out)) return [];
   return out.split('\n').map(s => s.trim()).filter(s => /^\d+\.\d+\.\d+\.\d+$/.test(s) || s.includes(':'));
 }

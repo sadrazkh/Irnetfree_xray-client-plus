@@ -42,6 +42,15 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          # An explicit package list, because the action's default is
+          # `tools platform-tools` and Google removed the deprecated `tools`
+          # package from the SDK repository (android-actions/setup-android
+          # #537, #538, filed 2026-09-15/16). Every Android job started
+          # failing at SDK setup on 2026-09-16 with no change of ours; the
+          # Gradle build downloads the platform and build-tools it needs by
+          # itself, so platform-tools is all this step has to install.
+          packages: platform-tools
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
@@ -51,3 +60,22 @@ jobs:
         # assembleDebug, not assembleRelease: the point is "does the Kotlin
         # compile and link against libv2ray", not producing an artifact.
         run: gradle --no-daemon assembleDebug
+      - name: Unit tests (the pure core against the desktop's pins)
+        run: gradle --no-daemon testDebugUnitTest
+      - name: Unit test results (fail when nothing ran)
+        # Gradle exits 0 for an empty test source set, and the console shows
+        # no per-test lines on success — so a misplaced test directory would
+        # pass this job silently. Count the testcases in the JUnit XML instead.
+        run: |
+          set -e
+          files=$(ls app/build/test-results/testDebugUnitTest/*.xml 2>/dev/null || true)
+          test -n "$files" || { echo "no JUnit result files"; exit 1; }
+          total=0
+          for f in $files; do
+            n=$(grep -o '<testcase ' "$f" | wc -l)
+            bad=$(grep -o '<failure' "$f" | wc -l)
+            echo "$(basename "$f" .xml): $n tests, $bad failures"
+            total=$((total + n))
+          done
+          echo "total: $total"
+          test "$total" -gt 0

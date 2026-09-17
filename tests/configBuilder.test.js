@@ -13,7 +13,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { buildConfig, buildTestConfig, buildMultiTestConfig, buildRoutingRules, buildChainOutbounds, resolverBypassIps, resolverBypassIpsOf, wgResolvers, wgEndpointHosts } = require('../src/main/configBuilder');
+const { buildConfig, buildTestConfig, buildMultiTestConfig, buildRoutingRules, buildChainOutbounds, resolverBypassIps, resolverBypassIpsOf, wgResolvers, wgEndpointHosts, wgResolverAddresses } = require('../src/main/configBuilder');
 const {
   settings, ruleTags, outboundTagged, vlessWithMarkers,
   VLESS_WS_TLS, TROJAN_TCP_TLS, SS_TCP, WG_BAD_MASK, WG_CORP
@@ -478,10 +478,14 @@ test('wireguard: a wrong interface mask is coerced to /32 at build time', () => 
   assert.deepEqual(outboundTagged(c, 'proxy').settings.address, ['10.13.13.2/32']);
 });
 
-test('wireguard dialed through a chain disables the dialer buffer', () => {
-  // Xray-core #2850: without bufferSize 0 the tunnel silently passes no data.
+test('wireguard dialed through a chain keeps the default dialer buffer (v1.7.2)', () => {
+  // The `bufferSize: 0` of Xray-core #2850 is gone: level 0 is every connection
+  // of the config, so it throttled the WHOLE plan whenever a chained WireGuard
+  // was in it, and both cores pass scripts/probe-wg-chain.js without it.
+  // Pinned so nobody puts it back by habit.
   const chained = buildConfig({ mode: 'chain', chain: [VLESS_WS_TLS, WG_BAD_MASK] }, settings());
-  assert.equal(chained.policy.levels['0'].bufferSize, 0);
+  assert.equal('bufferSize' in chained.policy.levels['0'], false);
+  assert.deepEqual(chained.policy.levels['0'], { statsUserUplink: true, statsUserDownlink: true });
 
   const standalone = buildConfig(single(WG_BAD_MASK), settings());
   assert.equal('bufferSize' in standalone.policy.levels['0'], false);
@@ -657,7 +661,7 @@ test('the hijack precedes the private-IP bypass, or a query to the tunnel peer w
 
 test('managed bypass-ir: the in-country resolver rides direct and the domestic rules still follow', () => {
   const c = buildConfig(single(), settings(Object.assign({ routingMode: 'bypass-ir', blockAds: false }, MANAGED)));
-  assert.deepEqual(c.routing.rules[0], { type: 'field', inboundTag: ['dns-internal'], ip: ['178.22.122.100'], outboundTag: 'direct' });
+  assert.deepEqual(c.routing.rules[0], { type: 'field', inboundTag: ['dns-internal'], ip: ['178.22.122.100'], port: '53', outboundTag: 'direct' });
   assert.deepEqual(c.routing.rules[1], { type: 'field', inboundTag: ['dns-internal'], outboundTag: 'proxy' });
   assert.equal(c.routing.rules[2].outboundTag, 'dns-out');
   assert.equal(c.dns.servers[0].address, '178.22.122.100');
@@ -912,7 +916,9 @@ test('buildTestConfig is untouched by DNS management (no hijack, no tag)', () =>
 // company resolver the .conf names — which is reachable ONLY through that
 // tunnel. The resolver must be in the list, and its query must leave through
 // the chain, not the VLESS the exit rule points at.
-const CORP_SERVER = { address: '192.168.60.1', domains: ['domain:tes.systems'], expectedIPs: ['192.168.0.0/16', '10.0.0.0/8'] };
+// skipFallback (v1.7.3): pinned to its search domains, never the fallback for
+// the names the tunnel itself needs (dnsBuilder.test.js says why).
+const CORP_SERVER = { address: '192.168.60.1', domains: ['domain:tes.systems'], expectedIPs: ['192.168.0.0/16', '10.0.0.0/8'], skipFallback: true };
 const CORP_RULE = (tag) => ({ type: 'field', inboundTag: ['dns-internal'], ip: ['192.168.60.1'], outboundTag: tag });
 
 function corpPlan(over) {
@@ -995,6 +1001,17 @@ test('advanced: two rules to the same chain → one corporate server, one rule',
 test('resolverBypassIps: the corporate resolver is not routed past the tunnel — it rides the target', () => {
   assert.deepEqual(resolverBypassIps(corpPlan(), managed()), []);
   assert.deepEqual(resolverBypassIps(corpPlan({ rules: [{ type: 'domain', value: 'geosite:category-ir', target: 'direct' }] }), managed()), ['178.22.122.100']);
+});
+
+test('wgResolverAddresses: every resolver the plan\x27s WireGuard servers bring, in every plan shape, deduplicated', () => {
+  // What the connect path names when managed DNS is off and these are dropped.
+  assert.deepEqual(wgResolverAddresses({ mode: 'single', server: WG_CORP }), WG_CORP.dns);
+  assert.deepEqual(wgResolverAddresses({ mode: 'chain', chain: [VLESS_WS_TLS, WG_CORP] }), WG_CORP.dns);
+  assert.deepEqual(wgResolverAddresses({ mode: 'advanced', serversById: { a: VLESS_WS_TLS }, chainsById: { c: [VLESS_WS_TLS, WG_CORP] }, rules: [], def: 'a' }), WG_CORP.dns);
+  assert.deepEqual(wgResolverAddresses({ mode: 'single', server: WG_BAD_MASK }), [], 'a WireGuard without dns brings nothing');
+  assert.deepEqual(wgResolverAddresses({ mode: 'single', server: VLESS_WS_TLS }), []);
+  const twice = { mode: 'advanced', serversById: { w: WG_CORP }, chainsById: { c: [VLESS_WS_TLS, WG_CORP] }, rules: [], def: 'w' };
+  assert.deepEqual(wgResolverAddresses(twice), WG_CORP.dns, 'named twice, listed once');
 });
 
 test('wgResolvers: expectedIPs come from AllowedIPs minus the full-tunnel entries; no dns → nothing', () => {
@@ -1246,7 +1263,7 @@ test('WireGuard dialled directly is bound (its empty sockopt kept); behind a cha
   const chained = buildConfig({ mode: 'chain', chain: [VLESS_WS_TLS, WG_BAD_MASK] }, settings(BOUND));
   assert.deepEqual(sockoptOf(chained, 'proxy'), { dialerProxy: 'proxy-h0' });
   assert.deepEqual(sockoptOf(chained, 'proxy-h0'), { interface: 'Wi-Fi' });
-  assert.equal(chained.policy.levels['0'].bufferSize, 0, 'the chained-WireGuard rule still fires');
+  assert.equal('bufferSize' in chained.policy.levels['0'], false, 'no per-connection buffer cap for a chained WireGuard (v1.7.2)');
 });
 
 test('binding does not depend on managed DNS, and the interface name is taken as given', () => {
