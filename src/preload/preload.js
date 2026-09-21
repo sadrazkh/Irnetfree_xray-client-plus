@@ -113,6 +113,8 @@ contextBridge.exposeInMainWorld('api', {
   xserverPreview: () => ipcRenderer.invoke('xserver:preview'),
   xserverOtherSide: () => ipcRenderer.invoke('xserver:otherSide'),
   xserverFirewall: (req) => ipcRenderer.invoke('xserver:firewall', req),
+  xserverWizard: (req) => ipcRenderer.invoke('xserver:wizard', req),
+  xserverCoreInfo: (req) => ipcRenderer.invoke('xserver:coreInfo', req),
   onXServerStatus: (cb) => ipcRenderer.on('xserver-status', (e, d) => cb(d)),
   onXServerLog: (cb) => ipcRenderer.on('xserver-log', (e, d) => cb(d)),
   // plus: the IP-scan tab (src/main/scan)

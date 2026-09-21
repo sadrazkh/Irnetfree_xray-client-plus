@@ -143,6 +143,8 @@
     xserverPreview: () => invoke('xserver:preview'),
     xserverOtherSide: () => invoke('xserver:otherSide'),
     xserverFirewall: (req) => invoke('xserver:firewall', req),
+    xserverWizard: (req) => invoke('xserver:wizard', req),
+    xserverCoreInfo: (req) => invoke('xserver:coreInfo', req),
     onXServerStatus: (cb) => on('xserver-status', cb),
     onXServerLog: (cb) => on('xserver-log', cb),
     // plus: the IP-scan tab (src/main/scan)
