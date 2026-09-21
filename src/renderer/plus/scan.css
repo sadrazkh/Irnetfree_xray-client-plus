@@ -1,12 +1,16 @@
-/* plus: the IP-scan tab (#view-scan) — tokens only, logical properties, filled in by task R2 */
+/* plus: the IP-scan tab (#view-scan) — tokens only, logical properties */
 
 /* =========================================================================
-   The form is three cards that share a row when there is room and stack when
+   The form is four cards that share a row when there is room and stack when
    there is not; 900px is the window's own minimum, and at that width the
    content column is barely 500px, so nothing here may declare a fixed size.
-   The results table is the one thing that cannot fold — eleven columns of
+   The results table is the one thing that cannot fold — twelve columns of
    figures — so it scrolls inside its own wrapper and the page never grows
    sideways.
+
+   Two phases, two colours: the filter is the accent, the speed test is the ok
+   green, and the same pair is used on the pill, on the two bars and on the
+   dimmed cells of a row that has only been filtered.
    ========================================================================= */
 
 .scan-forms {
@@ -66,17 +70,28 @@
   text-transform: uppercase;
   letter-spacing: .06em;
 }
-/* the second and third headings inside the tests card need air above them */
+/* the second and third headings inside a form card need air above them */
 .scan-sub-label { margin-block-start: 14px; }
 
+/* ----------------------------- presets and limits ----------------------------- */
+
+.scan-preset { margin-block-end: 8px; }
 .scan-limits {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  /* the captions are plain sentences now ("چند تست سرعت هم‌زمان — ۱ دقیق‌ترین
+     است"), so the columns are wider than v2.0's and the label wraps instead of
+     being cut off — an ellipsis on the only explanation of a knob is no help */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
 }
-.scan-limits .field-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scan-limits .field-label {
+  white-space: normal;
+  line-height: 1.35;
+}
+/* the batch size is the one knob almost nobody should touch: label beside it, not above */
+.scan-adv { align-items: center; margin-block-start: 14px; }
 
-/* ----------------------------- run row ----------------------------- */
+/* ----------------------------- run row and stage strip ----------------------------- */
 
 .scan-run { margin-block-start: 16px; }
 .scan-run-row {
@@ -85,7 +100,61 @@
   flex-wrap: wrap;
   gap: 12px;
 }
-/* the track; #scanProgress is the fill inside it */
+
+/* which phase is in flight, in one word, coloured by which one it is */
+.scan-stage {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  padding: 5px 12px;
+  border-radius: var(--r2);
+  border: 1px solid var(--softline);
+  background: var(--soft);
+  color: var(--dim);
+  white-space: nowrap;
+}
+.scan-stage[data-stage="filter"] { color: var(--accentInk); border-color: var(--accentLine); background: var(--accentSoft); }
+.scan-stage[data-stage="speed"] { color: var(--ok); border-color: var(--ok); background: var(--okSoft); }
+.scan-stage[data-stage="done"] { color: var(--ink2); border-color: var(--dim); }
+
+.scan-stage-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink2);
+  direction: ltr;
+  white-space: nowrap;
+}
+.scan-eta,
+.scan-elapsed {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  direction: ltr;
+  white-space: nowrap;
+}
+/* the clock is the last thing on the row, whichever way the page runs */
+.scan-elapsed { margin-inline-start: auto; }
+
+/* one bar per phase, stacked so they can be compared at a glance */
+.scan-bars {
+  display: grid;
+  gap: 6px;
+  margin-block-start: 12px;
+}
+.scan-barline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.scan-bar-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink3);
+  min-inline-size: 52px;
+  white-space: nowrap;
+}
+/* the track; the span inside it is the fill */
 .scan-bar {
   flex: 1 1 180px;
   min-inline-size: 120px;
@@ -102,15 +171,8 @@
   border-radius: var(--r1);
   transition: inline-size 200ms ease-out;
 }
-.scan-prog-text {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--ink2);
-  direction: ltr;
-  white-space: nowrap;
-  min-inline-size: 110px;
-  text-align: end;
-}
+.scan-bar-sp .scan-bar-fill { background: var(--ok); }
+
 .scan-error { margin-block-start: 10px; }
 
 /* ----------------------------- results ----------------------------- */
@@ -127,11 +189,11 @@
 }
 .scan-table {
   inline-size: 100%;
-  /* Measured: eleven columns of figures need 660px, and the content column at
-     the app's own 900px minimum is 678px — so at the narrowest window the whole
-     table is still visible. Narrower than that (the headless panel on a phone)
-     the wrapper scrolls, never the page. */
-  min-inline-size: 660px;
+  /* Measured: twelve columns of figures need 710px, a little more than the
+     678px the content column has at the app's own 900px minimum — so the
+     wrapper above scrolls by a few dozen pixels there, and the page itself
+     never does. */
+  min-inline-size: 710px;
   border-collapse: collapse;
   font-size: 12px;
 }
@@ -165,6 +227,13 @@
 .scan-row:hover { background: var(--soft); }
 /* a row that measured nothing usable is still worth seeing, just not first */
 .scan-row-dead { opacity: .6; }
+
+/* The speed cells of a phase-1 row hold a dash, not a measurement. Dimming
+   exactly those two cells says "not measured yet" without dimming the delay
+   figures next to them, which ARE final. */
+.scan-c-sp { color: var(--ink2); }
+.scan-row-p1 .scan-c-sp { color: var(--dim); }
+.scan-p1-hint { margin-block-start: 10px; }
 
 .scan-row td { padding: 5px 8px; }
 .scan-c-ip {
@@ -233,4 +302,13 @@
 @media (max-width: 1100px) {
   .scan-results .sec { flex-wrap: wrap; }
   .scan-results .sec .head-actions { inline-size: 100%; }
+}
+
+/* At the window's own minimum the run row is two buttons, a pill and three
+   figures. Measured at 900px: they still share one line, but the clock must
+   stop being pushed to the far end — the moment the row does wrap, an auto
+   margin leaves it stranded on a line of its own. */
+@media (max-width: 900px) {
+  .scan-elapsed { margin-inline-start: 0; }
+  .scan-bar-label { min-inline-size: 44px; }
 }

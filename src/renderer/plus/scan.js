@@ -1,16 +1,22 @@
 'use strict';
 /**
- * plus: the IP-scan tab — filled in by task R2. Shares app.js globals ($, t, state, toast, …).
+ * plus: the IP-scan tab (spec section 1 of v2.1). Shares app.js globals ($, t, state, toast, …).
  *
- * One config, a list of addresses, and a table that fills while the cores
- * work. Everything measured comes from `scan-progress` events, one result at a
- * time, so a run of five thousand rows must not turn into five thousand
- * layouts: results are queued and applied once per animation frame, and the
- * table is kept sorted by inserting each row at its place instead of rebuilding
- * the body. Nothing here expands a CIDR — main owns the target list; the
- * *sample* button is the one convenience that has to pick addresses itself
- * (there is no channel to ask for a sample) and it only writes text into the
- * box that main will expand anyway.
+ * One config, a list of addresses, and a table that fills while the cores work.
+ * The run has two phases and the strip above the table says which one is in
+ * flight: *غربال* walks every address wide and cheap, *سرعت* re-visits only the
+ * best ones one transfer at a time. A row therefore arrives twice — phase 1
+ * without speeds, phase 2 with them — and the second one REPLACES the first,
+ * which is why the table is a Map keyed by `ip|engine` and never an array.
+ *
+ * Everything measured comes from `scan-progress` events, one result at a time,
+ * so a run of five thousand rows must not turn into five thousand layouts:
+ * results are queued and applied once per animation frame, and the table is
+ * kept sorted by inserting each row at its place instead of rebuilding the
+ * body. Nothing here expands a CIDR — main owns the target list; the *sample*
+ * button is the one convenience that has to pick addresses itself (there is no
+ * channel to ask for a sample) and it only writes text into the box that main
+ * will expand anyway.
  */
 (function () {
   const XRAY_PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks'];
@@ -18,7 +24,8 @@
   const TEST_DEFAULTS = { tcp: true, delay: true, down: true, up: false };
   /** The table has no room for "Xray-PattN (patterniha)". */
   const ENGINE_SHORT = { xray: 'Xray', 'xray-pattn': 'PattN' };
-  /** scan:start refuses with a bare code; anything else is shown as it came. */
+  const PRESET_IDS = ['fast', 'balanced', 'accurate'];
+  /** scan:start and scan:retest refuse with a bare code; anything else is shown as it came. */
   const START_ERRORS = {
     busy: 'scan.err.busy',
     'no server': 'scan.err.noServer',
@@ -26,18 +33,42 @@
     'unsupported protocol': 'scan.err.proto',
     'no targets': 'scan.err.noTargets',
     'no engine': 'scan.err.noEngine',
-    'no tests': 'scan.err.noTests'
+    'no tests': 'scan.err.noTests',
+    'no rows': 'scan.err.noRows'
   };
+  /**
+   * The limits card, field by field: every one is exactly one key of the opts
+   * object main sanitizes, so a preset can fill them and a run can read them
+   * back with no mapping table anywhere else. `lo` is what an empty or silly
+   * value falls back to — only speedTop may legitimately be 0 (skip phase 2).
+   */
+  const NUM_FIELDS = [
+    ['#scanConc', 'filterConcurrency', 16, 1],
+    ['#scanCores', 'coresInParallel', 2, 1],
+    ['#scanSamples', 'delaySamples', 2, 1],
+    ['#scanTcpTimeout', 'tcpTimeout', 2000, 500],
+    ['#scanDelayTimeout', 'delayTimeout', 4000, 500],
+    ['#scanSpeedTop', 'speedTop', 10, 0],
+    ['#scanSpeedConc', 'speedConcurrency', 1, 1],
+    ['#scanSpeedRounds', 'speedRounds', 1, 1],
+    ['#scanBatch', 'batch', 20, 1]
+  ];
+  /** The stage of the run → the word on the pill. */
+  const STAGE_KEYS = { idle: 'scan.stage.idle', filter: 'scan.stage.filter', speed: 'scan.stage.speed', done: 'scan.stage.done' };
+  /** A path main built from downBytes itself; filling it in would freeze the MB field. */
+  const AUTO_DOWN_PATH = /^\/__down\?bytes=\d+$/;
   const MAX_SAMPLE = 5000;
   /** A queue this deep means the frames stopped coming (hidden window): drain it. */
   const QUEUE_BURST = 500;
 
   let started = false;           // initScan can be reached from two directions (see below)
-  let presets = { cfRanges: [], defaults: {}, engines: [], last: null };
+  let presets = { cfRanges: [], defaults: {}, presets: {}, engines: [], last: null };
   let sourceSel = null;          // the makeSearchSelect element, when there is one
   let srcMode = 'server';        // 'server' | 'link'
-  let run = null;                // { runId, total, done, startedAt } while a scan is in flight
+  let run = null;                // { runId, startedAt } while a scan is in flight
+  let prog = null;               // the newest progress; it outlives the run so the strip keeps its numbers
   let lastReq = null;            // the request the rows came from — apply and re-test reuse its source
+  let count = { kind: 'typed' }; // what #scanCount says, so a language switch can say it again
   let ticker = null;             // the one-second elapsed clock
   const rows = new Map();        // 'ip|engine' -> { result, tr }
   const order = [];              // the same keys, in the order the tbody shows them
@@ -51,11 +82,12 @@
   /* ----------------------------- small helpers ----------------------------- */
 
   const tbody = () => $('#scanTbody');
-  const numOf = (sel, def) => { const n = Number($(sel).value); return Number.isFinite(n) && n > 0 ? n : def; };
-  const setNumField = (sel, v) => { if (Number.isFinite(Number(v)) && Number(v) > 0) $(sel).value = String(v); };
+  const numOf = (sel, def, lo = 1) => { const n = Number($(sel).value); return Number.isFinite(n) && n >= lo ? n : def; };
+  const setNumField = (sel, v, lo = 1) => { const n = Number(v); if (Number.isFinite(n) && n >= lo) $(sel).value = String(n); };
   const mbps = (v) => (Math.round((Number(v) || 0) * 10) / 10).toFixed(1);
+  const int0 = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
-  /** mm:ss — the elapsed clock next to the bar. */
+  /** mm:ss — the elapsed clock at the end of the run row. */
   function clock(ms) {
     const s = Math.max(0, Math.floor(ms / 1000));
     return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
@@ -118,6 +150,15 @@
     }
   }
 
+  /** The names come from main, so a language switch only rewrites them in place — the ticks are the user’s. */
+  function paintEngineLabels() {
+    const list = presets.engines || [];
+    $$('#scanEngines .scan-check').forEach((label, i) => {
+      const text = label.querySelector('.scan-check-label');
+      if (text && list[i]) text.textContent = list[i].label || list[i].id;
+    });
+  }
+
   function renderTests() {
     const host = $('#scanTests');
     host.innerHTML = '';
@@ -139,13 +180,51 @@
   }
 
   const testBox = (id) => document.querySelector(`#scanTests input[value="${id}"]`);
+  const testOn = (id) => { const b = testBox(id); return !!(b && b.checked); };
 
-  function fillLimits(d) {
-    setNumField('#scanConc', d.concurrency);
-    setNumField('#scanBatch', d.batch);
-    setNumField('#scanSamples', d.delaySamples);
-    setNumField('#scanDownMb', Math.round((Number(d.downBytes) || 10e6) / 1e6));
-    if (d.downHost) $('#scanDownHost').value = d.downHost;
+  /* ----------------------------- presets and limits ----------------------------- */
+
+  function fillLimits(o) {
+    if (!o || typeof o !== 'object') return;
+    for (const [sel, key, , lo] of NUM_FIELDS) setNumField(sel, o[key], lo);
+    if (Number(o.downBytes) > 0) setNumField('#scanDownMb', Math.round(Number(o.downBytes) / 1e6));
+    if (typeof o.downHost === 'string' && o.downHost) $('#scanDownHost').value = o.downHost;
+    // only a path the user wrote is worth restoring: the generated one carries
+    // its own byte count and would silently outrank the MB field
+    if (typeof o.downPath === 'string' && o.downPath && !AUTO_DOWN_PATH.test(o.downPath)) $('#scanDownPath').value = o.downPath;
+    paintPreset();
+  }
+
+  /** The preset the fields currently hold, or '' when they hold something else. */
+  function currentPreset() {
+    const all = presets.presets || {};
+    for (const id of PRESET_IDS) {
+      const p = all[id];
+      if (p && NUM_FIELDS.every(([sel, key, , lo]) => numOf(sel, NaN, lo) === Number(p[key]))) return id;
+    }
+    return '';
+  }
+
+  /** No preset is ever "on" by itself: the mark follows the numbers in the fields. */
+  function paintPreset() {
+    const now = currentPreset();
+    $$('#scanPreset .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.preset === now));
+  }
+
+  function applyPreset(name) {
+    const p = (presets.presets || {})[name];
+    if (!p) return;
+    fillLimits(p);
+  }
+
+  /** Every field of the limits card, as the opts object main expects. */
+  function buildOpts() {
+    const o = {};
+    for (const [sel, key, def, lo] of NUM_FIELDS) o[key] = Math.round(numOf(sel, def, lo));
+    o.downBytes = Math.round(numOf('#scanDownMb', 10) * 1e6);
+    o.downHost = $('#scanDownHost').value.trim();
+    o.downPath = $('#scanDownPath').value.trim();
+    return o;
   }
 
   /** The inputs of the last run, as main remembered them. */
@@ -156,13 +235,7 @@
       $$('#scanEngines input').forEach(b => { if (!b.disabled) b.checked = last.engines.includes(b.value); });
     }
     if (last.tests) for (const id of TEST_IDS) { const b = testBox(id); if (b) b.checked = !!last.tests[id]; }
-    const o = last.opts || {};
-    setNumField('#scanConc', o.concurrency);
-    setNumField('#scanBatch', o.batch);
-    setNumField('#scanSamples', o.delaySamples);
-    setNumField('#scanDownMb', Math.round((Number(o.downBytes) || 0) / 1e6));
-    if (o.downHost) $('#scanDownHost').value = o.downHost;
-    if (o.downPath) $('#scanDownPath').value = o.downPath;
+    fillLimits(last.opts);
     if (last.link) { setMode('link'); $('#scanLink').value = last.link; }
     else if (last.serverId) setMode('server');
   }
@@ -213,8 +286,29 @@
     return n;
   }
 
+  /**
+   * One line, three things it can say: what is typed, what the run really got,
+   * or how many rows went back for a speed test. It is rebuilt rather than
+   * remembered as text so a language switch can say the same thing again.
+   */
+  function paintCount() {
+    const el = $('#scanCount');
+    if (count.kind === 'run') {
+      const engines = Math.max(1, (count.engines || 1));
+      const targets = Math.max(0, Math.round((count.total || 0) / engines));
+      const parts = [t('scan.countTotal').replace('{n}', targets).replace('{e}', engines)];
+      if (count.truncated) parts.push(t('scan.truncated').replace('{n}', targets));
+      if (count.bad) parts.push(t('scan.badLines').replace('{n}', count.bad));
+      el.textContent = parts.join(' · ');
+      return;
+    }
+    if (count.kind === 'retest') { el.textContent = t('scan.retopCount').replace('{n}', count.n); return; }
+    el.textContent = t('scan.count').replace('{n}', countTokens($('#scanIps').value));
+  }
+
   function updateCount() {
-    $('#scanCount').textContent = t('scan.count').replace('{n}', countTokens($('#scanIps').value));
+    count = { kind: 'typed' };
+    paintCount();
   }
 
   /** One token → an inclusive integer interval, or null. */
@@ -269,6 +363,7 @@
     const d = r.delay && r.delay.loss < 1 ? r.delay : null;
     switch (key) {
       case 'tcp': return r.tcp && r.tcp.ok ? r.tcp.ms : null;
+      case 'median': return d ? d.median : null;
       case 'avg': return d ? d.avg : null;
       case 'min': return d ? d.min : null;
       case 'jitter': return d ? d.jitter : null;
@@ -303,7 +398,8 @@
       '<td class="scan-c-ip"></td>' +
       '<td class="scan-c-eng"></td>' +
       '<td class="scan-n"></td><td class="scan-n"></td><td class="scan-n"></td>' +
-      '<td class="scan-n"></td><td class="scan-n"></td><td class="scan-n"></td><td class="scan-n"></td>' +
+      '<td class="scan-n"></td><td class="scan-n"></td><td class="scan-n"></td>' +
+      '<td class="scan-n scan-c-sp"></td><td class="scan-n scan-c-sp"></td>' +
       '<td class="scan-c-score"><span class="scan-score-wrap">' +
         '<span class="scan-score-bar"><span class="scan-score-fill"></span></span>' +
         '<span class="scan-score-val"></span>' +
@@ -337,19 +433,26 @@
 
   function fillRow(tr, r) {
     const c = tr.cells;
+    const p1 = Number(r.phase) === 1;
     c[0].textContent = r.ip;
     c[1].textContent = ENGINE_SHORT[r.engine] || r.engine;
     const d = r.delay && r.delay.loss < 1 ? r.delay : null;
     setCell(c[2], r.tcp ? (r.tcp.ok ? fmtMs(r.tcp.ms) : '×') : '—', r.tcp ? pingClass(r.tcp.ok ? r.tcp.ms : -1) : '');
-    setCell(c[3], r.delay ? (d ? fmtMs(d.avg) : '×') : '—', r.delay ? pingClass(d ? d.avg : -1) : '');
-    setCell(c[4], d ? fmtMs(d.min) : (r.delay ? '×' : '—'), '');
-    setCell(c[5], d ? fmtMs(d.jitter) : (r.delay ? '×' : '—'), '');
-    setCell(c[6], r.delay ? Math.round(r.delay.loss * 100) + '%' : '—', r.delay ? pingClass(r.delay.loss >= 1 ? -1 : r.delay.loss * 1000) : '');
-    setCell(c[7], r.down ? (r.down.ok ? mbps(r.down.mbps) : '×') : '—', '');
-    setCell(c[8], r.up ? (r.up.ok ? mbps(r.up.mbps) : '×') : '—', '');
+    // the median is the headline figure of the delay group; the mean sits next to it
+    setCell(c[3], r.delay ? (d ? fmtMs(d.median) : '×') : '—', r.delay ? pingClass(d ? d.median : -1) : '');
+    setCell(c[4], r.delay ? (d ? fmtMs(d.avg) : '×') : '—', '');
+    setCell(c[5], d ? fmtMs(d.min) : (r.delay ? '×' : '—'), '');
+    setCell(c[6], d ? fmtMs(d.jitter) : (r.delay ? '×' : '—'), '');
+    setCell(c[7], r.delay ? Math.round(r.delay.loss * 100) + '%' : '—', r.delay ? pingClass(r.delay.loss >= 1 ? -1 : r.delay.loss * 1000) : '');
+    setCell(c[8], r.down ? (r.down.ok ? mbps(r.down.mbps) : '×') : '—', 'scan-c-sp');
+    setCell(c[9], r.up ? (r.up.ok ? mbps(r.up.mbps) : '×') : '—', 'scan-c-sp');
     paintScore(tr, r);
     tr.classList.toggle('scan-row-dead', !(Number(r.score) > 0));
-    if (r.error) tr.title = r.error; else tr.removeAttribute('title');
+    // phase 1 is a provisional row: its speed cells are empty on purpose
+    tr.classList.toggle('scan-row-p1', p1);
+    if (r.error) tr.title = r.error;
+    else if (p1) tr.title = t('scan.phase1');
+    else tr.removeAttribute('title');
   }
 
   function detach(key) {
@@ -400,6 +503,7 @@
     for (const r of batch) {
       const key = r.ip + '|' + r.engine;
       let entry = rows.get(key);
+      // a phase-2 row replaces the phase-1 row of the same ip|engine
       if (!entry) { entry = { result: r, tr: newRow(key) }; rows.set(key, entry); }
       else { entry.result = r; detach(key); }
       if ((Number(r.score) || 0) > best) { best = Number(r.score) || 0; rescale = true; }
@@ -409,7 +513,7 @@
     // a new best re-scales every bar; it happens a handful of times per run
     if (rescale) for (const e of rows.values()) paintScore(e.tr, e.result);
     $('#scanEmpty').hidden = rows.size > 0;
-    paintProgress();
+    paintStrip();
   }
 
   function paintSortMarks() {
@@ -439,14 +543,43 @@
     $('#scanEmpty').hidden = false;
   }
 
-  /* ----------------------------- running ----------------------------- */
+  /* ----------------------------- the stage strip ----------------------------- */
 
-  function paintProgress() {
-    if (!run) return;
-    const pct = run.total ? Math.min(100, (run.done / run.total) * 100) : 0;
-    $('#scanProgress').style.inlineSize = pct.toFixed(1) + '%';
-    $('#scanProgressText').textContent = `${run.done} / ${run.total} · ${clock(Date.now() - run.startedAt)}`;
+  /** The track is the element with the id; the fill inside it is what moves. */
+  function setBar(sel, done, total) {
+    const fill = $(sel).firstElementChild;
+    if (!fill) return;
+    const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
+    fill.style.inlineSize = pct.toFixed(1) + '%';
   }
+
+  /** Seconds while they are worth counting, minutes once they are not. */
+  function etaText(ms) {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n <= 0) return '';
+    const s = Math.round(n / 1000);
+    return s >= 90 ? t('scan.etaMin').replace('{n}', Math.round(s / 60)) : t('scan.etaSec').replace('{n}', Math.max(1, s));
+  }
+
+  function paintStrip() {
+    const p = prog || { stage: 'idle', done: 0, total: 0, alive: 0, speedDone: 0, speedTotal: 0, etaMs: null };
+    const stage = STAGE_KEYS[p.stage] ? p.stage : 'idle';
+    const pill = $('#scanStage');
+    pill.dataset.stage = stage;
+    // the pill is a JS-written label; the key rides along so applyI18n keeps it
+    pill.dataset.i18n = STAGE_KEYS[stage];
+    pill.textContent = t(STAGE_KEYS[stage]);
+    $('#scanStageText').textContent = !prog ? ''
+      : p.stage === 'speed'
+        ? t('scan.stageSpeed').replace('{done}', p.speedDone).replace('{total}', p.speedTotal)
+        : t('scan.stageFilter').replace('{done}', p.done).replace('{total}', p.total).replace('{alive}', p.alive);
+    setBar('#scanBarFilter', p.done, p.total);
+    setBar('#scanBarSpeed', p.speedDone, p.speedTotal);
+    $('#scanEta').textContent = run ? etaText(p.etaMs) : '';
+    $('#scanElapsed').textContent = prog ? clock((prog.endedAt || Date.now()) - prog.startedAt) : '';
+  }
+
+  /* ----------------------------- running ----------------------------- */
 
   /** The source of a request — one of the two keys, never both. */
   function srcOf(req) {
@@ -464,11 +597,17 @@
     return id ? { serverId: id } : {};
   }
 
+  /** The rows came from one config; a re-test has to go through that same one. */
+  function rowSource() {
+    const src = srcOf(lastReq);
+    return (src.serverId || src.link) ? src : formSource();
+  }
+
   const selectedEngines = () => $$('#scanEngines input').filter(b => b.checked).map(b => b.value);
 
   function selectedTests() {
     const tests = {};
-    for (const id of TEST_IDS) { const b = testBox(id); tests[id] = !!(b && b.checked); }
+    for (const id of TEST_IDS) tests[id] = testOn(id);
     return tests;
   }
 
@@ -477,25 +616,22 @@
       ipsText: $('#scanIps').value,
       engines: selectedEngines(),
       tests: selectedTests(),
-      opts: {
-        concurrency: Math.round(numOf('#scanConc', 8)),
-        batch: Math.round(numOf('#scanBatch', 20)),
-        delaySamples: Math.round(numOf('#scanSamples', 3)),
-        downBytes: Math.round(numOf('#scanDownMb', 10) * 1e6),
-        downHost: $('#scanDownHost').value.trim(),
-        downPath: $('#scanDownPath').value.trim()
-      }
+      opts: buildOpts()
     }, formSource(), over || {});
   }
 
-  /** The real numbers, once main has expanded the ranges. */
-  function showCount(req, res) {
-    const engines = Math.max(1, (req.engines || []).length);
-    const targets = Math.max(0, Math.round((res.total || 0) / engines));
-    const parts = [t('scan.countTotal').replace('{n}', targets).replace('{e}', engines)];
-    if (res.truncated) parts.push(t('scan.truncated').replace('{n}', targets));
-    if (res.errors && res.errors.length) parts.push(t('scan.badLines').replace('{n}', res.errors.length));
-    $('#scanCount').textContent = parts.join(' · ');
+  /** A run is in flight: the buttons, the clock and the strip all follow from this. */
+  function beginRun(runId, init) {
+    const startedAt = Date.now();
+    run = { runId, startedAt };
+    prog = Object.assign({
+      stage: 'filter', done: 0, total: 0, alive: 0, speedDone: 0, speedTotal: 0, etaMs: null
+    }, init, { startedAt, endedAt: 0 });
+    $('#btnScanStart').disabled = true;
+    $('#btnScanStop').disabled = false;
+    clearInterval(ticker);
+    ticker = setInterval(paintStrip, 1000);
+    paintStrip();
   }
 
   async function start(over) {
@@ -508,39 +644,75 @@
     if (!res || res.error) return setError((res && res.error) || 'no server');
     lastReq = req;
     clearTable();
-    run = { runId: res.runId, total: res.total || 0, done: 0, startedAt: Date.now() };
-    $('#btnScanStart').disabled = true;
-    $('#btnScanStop').disabled = false;
-    clearInterval(ticker);
-    ticker = setInterval(paintProgress, 1000);
-    showCount(req, res);
-    paintProgress();
+    beginRun(res.runId, { stage: 'filter', total: res.total || 0 });
+    count = {
+      kind: 'run', total: res.total || 0, engines: Math.max(1, (req.engines || []).length),
+      truncated: !!res.truncated, bad: (res.errors && res.errors.length) || 0
+    };
+    paintCount();
+  }
+
+  /**
+   * Phase 2 on rows the table already has. The row carries its TCP and its
+   * delay samples back to main so the re-measured row keeps the latency half
+   * of its score instead of being ranked on throughput alone.
+   */
+  async function retest(list) {
+    if (run) return;
+    const rowsOut = (list || [])
+      .filter(r => r && r.ip && r.engine)
+      .map(r => ({ ip: r.ip, engine: r.engine, tcp: r.tcp, delay: r.delay }));
+    if (!rowsOut.length) return setError('no rows');
+    const src = rowSource();
+    if (!src.serverId && !src.link) return setError('no server');
+    setError('');
+    let res;
+    try { res = await window.api.scanRetest(Object.assign({ rows: rowsOut, tests: { down: true, up: testOn('up') }, opts: buildOpts() }, src)); }
+    catch (e) { return setError((e && e.message) || String(e)); }
+    if (!res || res.error) return setError((res && res.error) || 'no rows');
+    const n = res.total || rowsOut.length;
+    // these rows passed the filter once already, so that bar starts full
+    beginRun(res.runId, { stage: 'speed', total: n, done: n, alive: n, speedTotal: n });
+    count = { kind: 'retest', n };
+    paintCount();
   }
 
   function finish(ev) {
     flush();
-    paintProgress();
+    if (prog) {
+      prog.endedAt = Date.now();
+      if (ev.stage && STAGE_KEYS[ev.stage]) prog.stage = ev.stage;
+    }
     clearInterval(ticker);
     ticker = null;
     run = null;
+    paintStrip();
     $('#btnScanStart').disabled = false;
     $('#btnScanStop').disabled = true;
-    if (ev.error) toast(t('scan.failed') + ': ' + ev.error, 'err');
+    if (ev.error) toast(t('scan.failed') + ': ' + errText(ev.error), 'err');
     else toast(ev.cancelled ? t('scan.stoppedToast') : t('scan.doneToast'), 'ok');
   }
 
-  /** Events of a run that is no longer the current one are somebody else's. */
+  /** Events of a run that is no longer the current one are somebody else’s. */
   function onProgress(ev) {
     if (!ev || !run || ev.runId !== run.runId) return;
-    if (typeof ev.done === 'number') run.done = ev.done;
+    if (prog) {
+      prog.stage = STAGE_KEYS[ev.stage] ? ev.stage : prog.stage;
+      prog.done = int0(ev.done);
+      prog.total = int0(ev.total);
+      prog.alive = int0(ev.alive);
+      prog.speedDone = int0(ev.speedDone);
+      prog.speedTotal = int0(ev.speedTotal);
+      prog.etaMs = ev.etaMs;
+    }
     if (ev.result) { queue.push(ev.result); schedule(); }
-    if (ev.finished) finish(ev); else paintProgress();
+    if (ev.finished) finish(ev); else paintStrip();
   }
 
   /* ----------------------------- row and toolbar actions ----------------------------- */
 
   async function useIp(r) {
-    const req = Object.assign(srcOf(lastReq), { ip: r.ip, engine: r.engine });
+    const req = Object.assign(rowSource(), { ip: r.ip, engine: r.engine });
     if (!req.serverId && !req.link) return toast(t('scan.err.noServer'), 'err');
     let res;
     try { res = await window.api.scanApply(req); }
@@ -558,16 +730,16 @@
     toast(t('scan.copied'), 'ok');
   }
 
-  /** The best N addresses, each once, re-run on every ticked core. */
+  /** The best N rows the filter left alive, each back through phase 2 alone. */
   function retestTop() {
-    const n = Math.round(numOf('#scanRetopN', 10));
-    const ips = [];
-    for (const e of [...rows.values()].sort((a, b) => (b.result.score - a.result.score))) {
-      if (!ips.includes(e.result.ip)) ips.push(e.result.ip);
-      if (ips.length >= n) break;
-    }
-    if (!ips.length) return toast(t('scan.noRows'), 'err');
-    start(Object.assign(srcOf(lastReq), { ipsText: ips.join('\n') }));
+    const n = Math.max(1, Math.round(numOf('#scanRetopN', 10)));
+    const list = [...rows.values()]
+      .map(e => e.result)
+      .filter(r => (Number(r.score) || 0) > 0)
+      .sort((a, b) => (b.score - a.score))
+      .slice(0, n);
+    if (!list.length) return toast(t('scan.err.noRows'), 'err');
+    retest(list);
   }
 
   async function exportAs(format) {
@@ -592,6 +764,14 @@
       const btn = e.target.closest('.seg-btn');
       if (btn) setMode(btn.dataset.src);
     };
+    $('#scanPreset').onclick = (e) => {
+      const btn = e.target.closest('.seg-btn');
+      if (btn) applyPreset(btn.dataset.preset);
+    };
+    // the mark says which preset the numbers ARE, so it has to follow the typing
+    $$('.scan-limits input').forEach(el => { el.oninput = paintPreset; });
+    $('#scanBatch').oninput = paintPreset;
+
     $('#scanIps').oninput = updateCount;
     $('#btnScanCf').onclick = () => { $('#scanIps').value = (presets.cfRanges || []).join('\n'); updateCount(); };
     $('#btnScanSample').onclick = () => {
@@ -637,15 +817,29 @@
       }
       if (btn.dataset.act === 'copy') copyIp(entry.result.ip);
       else if (btn.dataset.act === 'use') useIp(entry.result);
-      else if (btn.dataset.act === 'retest') {
-        start(Object.assign(srcOf(lastReq), { ipsText: entry.result.ip, engines: [entry.result.engine] }));
-      }
+      else if (btn.dataset.act === 'retest') retest([entry.result]);
     };
 
     $('#btnScanRetop').onclick = retestTop;
     $('#btnScanExportCsv').onclick = () => exportAs('csv');
     $('#btnScanExportJson').onclick = () => exportAs('json');
     $('#btnScanClear').onclick = () => { clearTable(); updateCount(); setError(''); };
+  }
+
+  /**
+   * applyI18n re-translates [data-i18n] nodes; the strip, the count line, the
+   * engine names and the row titles are written by this file and are out of its
+   * reach, so redraw them when the document’s language changes.
+   */
+  function redrawText() {
+    paintEngineLabels();
+    paintCount();
+    paintStrip();
+    paintSortMarks();
+    for (const e of rows.values()) {
+      e.tr.cells[0].title = t('scan.copy');
+      if (!e.result.error && Number(e.result.phase) === 1) e.tr.title = t('scan.phase1');
+    }
   }
 
   /**
@@ -661,13 +855,17 @@
     catch (e) { console.error(e); }
     renderEngines(presets.engines || []);
     renderTests();
+    // the balanced preset is what the tab opens on; the last run overrides it
     fillLimits(presets.defaults || {});
     restore(presets.last);
     refreshSourcePicker();
     wire();
     paintSortMarks();
+    paintStrip();
     updateCount();
     window.api.onScanProgress(onProgress);
+    new MutationObserver(redrawText)
+      .observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] });
   }
 
   // nothing calls this yet; it is here so a change to the server list can

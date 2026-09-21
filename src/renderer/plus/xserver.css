@@ -1,17 +1,52 @@
 /* plus: the Server tab (#view-xserver) — tokens only, logical properties */
 
 /* =========================================================================
-   Everything on this page is a row of small facts about one thing: an inbound
-   is a badge, a name, an address, a transport, a count and a meter; a user is
-   a name, a secret, an expiry and a bar. Rows like that cannot be a fixed
-   grid — at the window's own 900px minimum the content column is about 680px
-   and eight columns of figures do not fit — so every one of them is a flex row
-   that wraps, and the page never grows sideways.
+   The 3x-ui layout: a bar of sub-tabs, one panel each, and tables. A table
+   of nine or twelve columns cannot fold at the window's own 900px minimum
+   (the content column is about 680px there), so every table lives inside a
+   wrapper that scrolls sideways on its own, the way the scan tab's does —
+   the page itself never grows. Everything else wraps.
    ========================================================================= */
 
 .xs-card { margin-block-end: 16px; }
+.xs-panel-intro { margin-block-end: 14px; }
 
-/* ----------------------------- the head ----------------------------- */
+/* ----------------------------- sub-tabs ----------------------------- */
+
+.xs-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-block-end: 18px;
+  border-block-end: 1px solid var(--line);
+}
+.xs-tab {
+  border: 0;
+  border-block-end: 2px solid transparent;
+  background: none;
+  color: var(--ink3);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 8px 14px;
+  margin-block-end: -1px;
+  white-space: nowrap;
+  transition: color 140ms ease-out, border-color 140ms ease-out;
+}
+.xs-tab:hover { color: var(--ink); }
+.xs-tab.active { color: var(--accentInk); border-block-end-color: var(--accent); }
+/* a tab whose panel has a problem to fix */
+.xs-tab.has-err::after {
+  content: "";
+  display: inline-block;
+  inline-size: 6px;
+  block-size: 6px;
+  margin-inline-start: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+  vertical-align: middle;
+}
+
+/* ----------------------------- overview ----------------------------- */
 
 .xs-status-row {
   display: flex;
@@ -48,142 +83,175 @@
   min-inline-size: 0;
   overflow-wrap: anywhere;
 }
+.xs-run-meta:empty { display: none; }
 .xs-uptime { color: var(--ink2); }
 
-.xs-head-grid { margin-block-end: 12px; }
-/* a label that follows a block instead of opening a card needs air above it */
-.xs-sub-label { margin-block-start: 14px; }
-
-/* ----------------------------- inbound cards ----------------------------- */
-
-.xs-inbounds { display: flex; flex-direction: column; gap: 12px; }
-.xs-inbounds:empty { display: none; }
-
-.xs-in-card {
-  margin-block-end: 0;
-  padding: 12px 14px;
-  background: var(--soft);
-}
-.xs-in-card.disabled { opacity: .55; }
-
-.xs-in-head {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
+.xs-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 10px;
 }
-.xs-in-name {
-  font-size: 13px;
-  font-weight: 600;
+.xs-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--soft);
+  border: 1px solid var(--softline);
+  border-radius: var(--r5);
   min-inline-size: 0;
-  overflow-wrap: anywhere;
 }
-.xs-in-addr {
+.xs-stat-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.xs-stat-value {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+  direction: ltr;
+  text-align: start;
+  white-space: nowrap;
+}
+
+/* ----------------------------- tables ----------------------------- */
+
+.xs-table-wrap {
+  max-block-size: 60vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r5);
+}
+.xs-table-wrap:has(tbody:empty) { display: none; }
+.xs-table {
+  inline-size: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  /* Measured: the inbound table's nine columns need about 760px, the rule
+     table's eleven about 900px. Narrower than that the wrapper scrolls,
+     never the page. */
+  min-inline-size: 760px;
+}
+.xs-table-out { min-inline-size: 520px; }
+.xs-table-rules { min-inline-size: 900px; }
+.xs-table thead th {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  background: var(--panel);
+  /* a collapsed border scrolls away under a sticky header; an inset shadow travels with the cell */
+  box-shadow: inset 0 -1px 0 var(--line);
+}
+.xs-th {
+  padding: 9px 8px;
+  text-align: start;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink3);
+  white-space: nowrap;
+  user-select: none;
+}
+.xs-th-sw { inline-size: 44px; }
+.xs-th-acts { text-align: end; }
+
+.xs-row { border-block-end: 1px solid var(--line); }
+.xs-row:last-child { border-block-end: 0; }
+.xs-row:hover { background: var(--soft); }
+.xs-row.disabled > td { opacity: .5; }
+/* the switch and the buttons stay readable on a switched-off row */
+.xs-row.disabled > .xs-c-sw, .xs-row.disabled > .xs-c-acts { opacity: 1; }
+.xs-row td { padding: 6px 8px; vertical-align: middle; }
+.xs-row.expanded { background: var(--soft); }
+
+.xs-c-name {
+  font-weight: 600;
+  min-inline-size: 90px;
+  max-inline-size: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xs-c-addr {
   font-family: var(--mono);
   font-size: 12px;
   color: var(--accentInk);
   direction: ltr;
+  text-align: start;
   white-space: nowrap;
 }
-.xs-in-meta {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink3);
-  direction: ltr;
-  min-inline-size: 0;
-  overflow-wrap: anywhere;
-}
-.xs-in-traffic {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--ink2);
-  direction: ltr;
-  white-space: nowrap;
-}
-/* the switch and the buttons hold the end of the row; on a narrow window they
-   wrap together rather than splitting across two lines */
-.xs-in-sw { margin-inline-start: auto; }
-.xs-in-actions { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
-
-/* ----------------------------- client rows ----------------------------- */
-
-.xs-clients {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-block-start: 10px;
-}
-.xs-no-clients {
-  font-size: 11px;
-  color: var(--dim);
-  padding-block: 8px;
-}
-
-.xs-cl-row {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  padding: 7px 9px;
-  border-radius: var(--r3);
-  border: 1px solid transparent;
-  background: var(--panel);
-}
-.xs-cl-row:hover { border-color: var(--softline); }
-.xs-cl-row.disabled { opacity: .5; }
-
-/* a counter that moved in the last tick — the only "live" thing on the page */
-.xs-cl-dot {
-  inline-size: 7px;
-  block-size: 7px;
-  border-radius: 50%;
-  background: var(--dim);
-  flex: 0 0 auto;
-}
-.xs-cl-dot[data-online="1"] { background: var(--ok); box-shadow: 0 0 0 3px var(--okSoft); }
-
-.xs-cl-name {
-  font-size: 12px;
-  font-weight: 600;
-  min-inline-size: 70px;
-  overflow-wrap: anywhere;
-}
-.xs-cl-secret {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink3);
-  direction: ltr;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.xs-cl-secret:hover { color: var(--accentInk); }
-.xs-cl-exp {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--ink3);
-  direction: ltr;
-  white-space: nowrap;
-}
-
-/* the meter: a track only when there is a quota to measure against */
-.xs-cl-quota {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1 1 150px;
-  min-inline-size: 110px;
-}
-.xs-cl-quota .usage-bar { flex: 1 1 auto; min-inline-size: 40px; }
-.xs-cl-used {
+.xs-c-mono {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--ink2);
   direction: ltr;
+  text-align: start;
   white-space: nowrap;
 }
+.xs-c-dim {
+  font-size: 11px;
+  color: var(--ink3);
+  max-inline-size: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xs-c-num {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  direction: ltr;
+  text-align: start;
+  white-space: nowrap;
+}
+.xs-c-list {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  direction: ltr;
+  text-align: start;
+  max-inline-size: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xs-c-acts {
+  white-space: nowrap;
+  text-align: end;
+}
+.xs-c-acts .icon-btn { font-size: 12px; padding: 3px 5px; }
+.xs-c-sw { white-space: nowrap; }
+.xs-c-sw .switch { vertical-align: middle; }
+.xs-c-order { white-space: nowrap; }
+.xs-c-order .icon-btn { font-size: 10px; padding: 3px 4px; }
+.xs-c-order .icon-btn:disabled { opacity: .3; cursor: default; }
 
-/* why the enforcer switched this user off */
-.xs-cl-flag {
+/* a tag: the name rules refer to */
+.xs-tag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: var(--r2);
+  background: var(--soft);
+  border: 1px solid var(--softline);
+  color: var(--ink2);
+  direction: ltr;
+  white-space: nowrap;
+}
+.xs-tag.reverse { color: var(--accentInk); border-color: var(--accentLine); background: var(--accentSoft); }
+.xs-tag.exit { color: var(--ok); border-color: var(--okSoft); background: var(--okSoft); }
+.xs-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* why the enforcer switched something off, and the default-exit marker */
+.xs-flag {
+  display: inline-block;
   font-family: var(--mono);
   font-size: 10px;
   font-weight: 700;
@@ -194,56 +262,173 @@
   color: var(--warn);
   border: 1px solid var(--warn);
   white-space: nowrap;
+  margin-inline-start: 6px;
 }
-.xs-cl-sw { margin-inline-start: auto; }
-.xs-cl-actions { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
-.xs-cl-actions .icon-btn { font-size: 12px; padding: 3px 5px; }
+.xs-flag[hidden] { display: none; }
 
-/* ----------------------------- the reverse pair ----------------------------- */
+/* a counter that moved in the last tick — the only "live" thing on the page */
+.xs-dot {
+  display: inline-block;
+  inline-size: 7px;
+  block-size: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+  vertical-align: middle;
+}
+.xs-dot[data-online="1"] { background: var(--ok); box-shadow: 0 0 0 3px var(--okSoft); }
 
-.xs-diagram {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: 14px;
-  padding: 14px;
-  margin-block: 14px;
-  background: var(--soft);
-  border: 1px solid var(--softline);
-  border-radius: var(--r5);
-}
-.xs-node {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 3px;
-  min-inline-size: 110px;
-  padding: 10px 14px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--r5);
-}
-.xs-node-ico { font-size: 18px; line-height: 1.2; }
-.xs-node-name { font-size: 11px; color: var(--ink3); }
-.xs-node-role {
+/* the secret: enough to recognise, never enough to read over a shoulder */
+.xs-secret {
   font-family: var(--mono);
   font-size: 11px;
-  font-weight: 700;
-  color: var(--accentInk);
-  text-transform: uppercase;
-  letter-spacing: .06em;
+  color: var(--ink3);
+  direction: ltr;
+  cursor: pointer;
+  white-space: nowrap;
 }
-/* the flow reads start-to-end, so the glyph mirrors with the document */
-.xs-arrow { font-size: 20px; color: var(--accent); }
-[dir="rtl"] .xs-arrow { transform: scaleX(-1); }
+.xs-secret:hover { color: var(--accentInk); }
 
+/* the meter: a track only when there is a quota to measure against */
+.xs-c-quota { min-inline-size: 120px; }
+.xs-quota-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.xs-quota-wrap .usage-bar { flex: 1 1 auto; min-inline-size: 40px; }
+.xs-quota-wrap .usage-bar[hidden] { display: none; }
+.xs-used {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  direction: ltr;
+  white-space: nowrap;
+}
+
+/* ----------------------------- the client sub-table ----------------------------- */
+
+.xs-sub { background: var(--soft); }
+.xs-sub > td { padding: 8px 10px 12px; }
+.xs-sub[hidden] { display: none; }
+.xs-sub-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-block-end: 8px;
+}
+.xs-sub-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink3);
+}
+.xs-sub-head .btn { margin-inline-start: auto; }
+.xs-sub-empty { font-size: 11px; color: var(--dim); padding-block: 6px; }
+.xs-clients-wrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r4);
+  background: var(--panel);
+}
+.xs-clients {
+  inline-size: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  min-inline-size: 980px;
+}
+.xs-clients .xs-th { padding-block: 7px; }
+.xs-clients .xs-row td { padding: 5px 8px; }
+.xs-c-email { font-weight: 600; white-space: nowrap; }
+
+/* ----------------------------- routing ----------------------------- */
+
+.xs-strategy {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-block-end: 12px;
+}
+.xs-strategy .field-label { margin: 0; white-space: nowrap; }
+.xs-strategy-sel { inline-size: auto; min-inline-size: 150px; }
+.xs-row.highlight { outline: 2px solid var(--accent); outline-offset: -2px; }
+.xs-preset {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--accentInk);
+  margin-inline-end: 6px;
+}
+
+/* ----------------------------- reverse ----------------------------- */
+
+.xs-wiz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  align-items: start;
+  margin-block-end: 16px;
+}
+.xs-wiz { margin-block-end: 0; min-inline-size: 0; }
+.xs-wiz-actions { margin-block-start: 14px; align-items: center; }
+.xs-wiz-error { margin-block-start: 10px; }
+.xs-wiz-tags { margin-block-start: 10px; }
 .xs-seg { margin-block-end: 12px; }
 .xs-mount { display: block; }
 /* the searchable picker is a button-width element by default; here it owns the row */
 .xs-mount .ss { display: block; inline-size: 100%; }
-.xs-rev-actions { margin-block-start: 14px; }
+.xs-snippet {
+  margin-block-start: 12px;
+  max-block-size: 34vh;
+  min-block-size: 0;
+  block-size: auto;
+  overflow: auto;
+  white-space: pre;
+  font-size: 11px;
+}
 
+.xs-rev-list { display: flex; flex-direction: column; gap: 8px; }
+.xs-rev-list:empty { display: none; }
+.xs-rev-item {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 9px 12px;
+  background: var(--soft);
+  border: 1px solid var(--softline);
+  border-radius: var(--r4);
+}
+.xs-rev-where { font-size: 12px; color: var(--ink2); min-inline-size: 0; overflow-wrap: anywhere; }
+.xs-rev-rules {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink3);
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+.xs-rev-item .btn { margin-inline-start: auto; }
+
+/* ----------------------------- settings ----------------------------- */
+
+.xs-core-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-block-start: 14px;
+}
+.xs-core-check { color: var(--ink2); }
+.xs-sub-label { margin-block-start: 14px; }
+.xs-gen-row { margin-block-start: 10px; }
+
+/* ----------------------------- shared form bits ----------------------------- */
+
+.xs-grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
 .xs-checks {
   display: flex;
   flex-wrap: wrap;
@@ -262,21 +447,21 @@
 }
 .xs-check:hover { border-color: var(--dim); }
 .xs-check input { accent-color: var(--accent); margin: 0; }
-.xs-check-label { font-size: 12px; font-weight: 600; color: var(--ink2); }
+.xs-check-label { font-size: 12px; font-weight: 600; color: var(--ink2); direction: ltr; }
+.xs-checks-empty { font-size: 11px; color: var(--dim); }
 
 /* a field with a button glued to its end (generate, copy, QR) */
-.xs-row {
+.xs-row-field, .xs-row {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 .xs-row .input { flex: 1 1 auto; min-inline-size: 0; }
-.xs-gen-row { margin-block-start: 10px; }
 
-/* ----------------------------- log and errors ----------------------------- */
+/* ----------------------------- log, preview, errors ----------------------------- */
 
 .xs-log {
-  max-block-size: 34vh;
+  max-block-size: 60vh;
   overflow: auto;
 }
 .xs-preview {
@@ -293,6 +478,7 @@
   flex-direction: column;
   gap: 6px;
 }
+.xs-errors[hidden] { display: none; }
 .xs-error {
   display: flex;
   flex-wrap: wrap;
@@ -309,19 +495,20 @@
 }
 .xs-error-msg { color: var(--ink2); line-height: 1.6; }
 
-/* the card a refused path belongs to, and the message under it */
-.xs-invalid { border-color: var(--danger); }
+/* the row or card a refused path belongs to */
+.xs-invalid { outline: 1px solid var(--danger); outline-offset: -1px; }
+.xs-card.xs-invalid { border-color: var(--danger); }
 .xs-card-err { color: var(--danger); }
 
 .xs-qr-fallback { padding: 24px 8px; }
 
 /* ----------------------------- narrow window ----------------------------- */
 
-/* At the app's own minimum the head's three controls and the inbound toolbars
-   are the first things to run out of room: let them take the whole line rather
-   than squeeze the name they sit next to. */
+/* At the app's own minimum the run buttons and the wizard grid are the first
+   things to run out of room: let them take the whole line. */
 @media (max-width: 1100px) {
   .xs-run-actions { margin-inline-start: 0; inline-size: 100%; }
-  .xs-in-sw, .xs-cl-sw { margin-inline-start: 0; }
-  .xs-head-grid { grid-template-columns: minmax(0, 1fr); }
+  .xs-grid3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .xs-rev-item .btn { margin-inline-start: 0; }
+  .xs-sub-head .btn { margin-inline-start: 0; }
 }
