@@ -32,7 +32,7 @@ const I18N = {
     'confirm.clearUsageOne': 'مصرف کلِ این کانفیگ پاک شود؟',
     't.usageCleared': 'مصرف پاک شد',
     'mode.getFiles': 'دانلود فایل‌های موردنیاز',
-    'guard.held': '🔒 اتصال مجدد ناموفق بود. برای این‌که چیزی نشت نکند، دی‌ان‌اس روی تونل نگه داشته شده — تا وصل نشوی نام‌ها باز نمی‌شوند.',
+    'guard.held': '🔒 اتصال مجدد ناموفق بود. گارد نشتی دی‌ان‌اسِ کارت‌های شبکه را هنوز نگه داشته (روی ویندوز روی نشانی loopbackِ خودِ دستگاه، پس هیچ پرسشی از دستگاه بیرون نمی‌رود) — تا دوباره وصل نشوی نام‌ها باز نمی‌شوند.',
     'guard.retry': 'تلاش دوباره', 'guard.release': 'اینترنتم را برگردان',
     't.reconnecting': 'در حال اتصال مجدد…', 't.guardReleased': 'دی‌ان‌اس آداپتورها برگردانده شد',
     'set.skin': 'ظاهر برنامه',
@@ -468,6 +468,10 @@ const I18N = {
     'state.reconnecting': 'شبکه عوض شد — اتصال مجدد…',
     'net.reconnected': 'اتصال بعد از تغییر شبکه برقرار شد',
     'net.failed': 'شبکه عوض شد و اتصال مجدد ناموفق بود',
+    'net.dropFailed': 'اتصال مدام قطع می‌شود و اتصال مجدد ناموفق بود — دوباره وصل شوید',
+    'state.reconnectingDrop': 'اتصال قطع شد — اتصال مجدد…',
+    'net.shutdownCancelled': 'خاموش‌شدن سیستم لغو شد ولی اتصال برای آن قطع شده بود — دوباره وصل شوید',
+    'net.shutdownCancelledPartial': 'خاموش‌شدن سیستم لغو شد — ممکن است اتصال فقط تا حدی برقرار مانده باشد؛ برای اطمینان دوباره وصل شوید',
     'net.tunFailed': 'اتصال برقرار است ولی تونل سیستمی (TUN) بالا نیامد — فقط پروکسی کار می‌کند',
     'net.cleanupFailed': 'پاک‌سازی شبکه ناقص ماند؛ از «عیب‌یابی → بازیابی شبکه» استفاده کنید.',
 
@@ -478,7 +482,17 @@ const I18N = {
     'ss.search': 'جستجوی کانفیگ…', 'ss.none': 'موردی پیدا نشد',
 
     'ping.tcp': 'پینگ TCP (شبکه)', 'ping.real': 'تأخیر دانلود (از داخل کانفیگ — اثبات کارکرد)',
-    'ping.upload': 'تأخیر آپلود (از داخل کانفیگ) — کانفیگِ کندِ آپلود را پیدا کن'
+    'ping.upload': 'تأخیر آپلود (از داخل کانفیگ) — کانفیگِ کندِ آپلود را پیدا کن',
+
+    /* OpenWrt gateway (the router is the tunnel for the LAN) */
+    'gw.title': 'دستگاه‌های شبکه', 'gw.sub': 'هر دستگاهی که به این روتر وصل است از تونل می‌رود؛ آن‌هایی که علامت می‌زنی مستقیم می‌روند.',
+    'gw.refresh': 'تازه‌سازی', 'gw.direct': 'مستقیم (بدون تونل)',
+    'gw.none': 'دستگاهی پیدا نشد — دستگاه‌ها وقتی از روتر IP بگیرند این‌جا ظاهر می‌شوند.',
+    'gw.hint': 'دستگاه مستثنا هم نام‌ها را از DNS روتر می‌پرسد، یعنی از داخل تونل؛ فقط ترافیک خودش مستقیم می‌رود.',
+    'gw.online': 'آنلاین', 'gw.offline': 'آفلاین', 'gw.saved': 'فهرست دستگاه‌های مستقیم ذخیره شد',
+    'ins.gateway': 'گیت‌وی', 'gw.insWhole': 'کل شبکه از تونل', 'gw.insDirect': '{n} دستگاه مستقیم',
+    'gw.quic': 'QUIC (UDP 443) از شبکه رد نشود',
+    'gw.quicSub': 'مرورگرها بلافاصله سراغ TCP می‌روند که هر پروکسی‌ای حمل می‌کند؛ دستگاه‌های مستقیم دست نمی‌خورند.'
   },
 
   en: {
@@ -509,7 +523,7 @@ const I18N = {
     'confirm.clearUsageOne': 'Forget the lifetime usage of this config?',
     't.usageCleared': 'Usage cleared',
     'mode.getFiles': 'Download the required files',
-    'guard.held': '🔒 The reconnect was given up on. Nothing is leaking — your DNS is still pointed at the tunnel — but names will not resolve until you connect again.',
+    'guard.held': '🔒 The reconnect was given up on. The leak guard is still holding your network adapters’ DNS (on Windows on this machine’s own loopback address, so no lookup leaves it) — names will not resolve until you connect again.',
     'guard.retry': 'Try again', 'guard.release': 'Restore my internet',
     't.reconnecting': 'Reconnecting…', 't.guardReleased': 'The adapters have their own resolvers back',
     'set.skin': 'Look',
@@ -946,6 +960,10 @@ const I18N = {
     'state.reconnecting': 'Network changed — reconnecting…',
     'net.reconnected': 'Reconnected after the network change',
     'net.failed': 'The network changed and reconnecting failed',
+    'net.dropFailed': 'The connection keeps dropping and reconnecting failed — connect again',
+    'state.reconnectingDrop': 'Connection dropped — reconnecting…',
+    'net.shutdownCancelled': 'The shutdown was cancelled, but the connection had already been taken down for it — connect again',
+    'net.shutdownCancelledPartial': 'The shutdown was cancelled — the connection may be only partly up; connect again to be sure',
     'net.tunFailed': 'Connected, but the system-wide tunnel (TUN) did not come back — proxy only',
     'net.cleanupFailed': 'Network cleanup was incomplete; use Diagnostics → Recover network.',
 
@@ -956,7 +974,17 @@ const I18N = {
     'ss.search': 'Search configs…', 'ss.none': 'No matches',
 
     'ping.tcp': 'TCP ping (network)', 'ping.real': 'Download latency (through the config — proof it works)',
-    'ping.upload': 'Upload latency (through the config) — find slow-upload configs'
+    'ping.upload': 'Upload latency (through the config) — find slow-upload configs',
+
+    /* OpenWrt gateway (the router is the tunnel for the LAN) */
+    'gw.title': 'Devices on this network', 'gw.sub': 'Every device connected to this router goes through the tunnel; the ones you tick go direct.',
+    'gw.refresh': 'Refresh', 'gw.direct': 'Direct (not through the tunnel)',
+    'gw.none': 'No devices found — they appear here once they get an address from the router.',
+    'gw.hint': 'An excluded device still resolves names through the router, i.e. through the tunnel; only its own traffic goes direct.',
+    'gw.online': 'online', 'gw.offline': 'offline', 'gw.saved': 'Direct-device list saved',
+    'ins.gateway': 'Gateway', 'gw.insWhole': 'whole network', 'gw.insDirect': '{n} direct',
+    'gw.quic': 'Refuse QUIC (UDP 443) from the LAN',
+    'gw.quicSub': 'Browsers fall back to TCP at once, which every proxy carries; devices that go direct are not affected.'
   }
 };
 

@@ -18,7 +18,9 @@ data class ServerConfig(
     val outbound: JSONObject,
     val raw: String = "",
     val subId: String? = null,
-    // Per-config core: null/"xray" = default Xray core, "sing-box" = sing-box.
+    // Per-config core (EngineChoice.kt): null = follow the app-wide default,
+    // "xray" the in-process core, "xray-pattn" the bundled patterniha binary,
+    // "sing-box" the bundled sing-box binary (single configs only).
     val engine: String? = null,
     // A WireGuard's own resolvers and search domains (`DNS = 10.0.0.53, corp.local`
     // in its .conf, `dns=` in its link): asked THROUGH that tunnel for the names
@@ -29,7 +31,12 @@ data class ServerConfig(
     // certificate a TLS server presented, when its link asked for allowInsecure.
     val certPin: String = "",
     val certPinAt: String = "",
-    val certPinCheckedAt: Long = 0
+    val certPinCheckedAt: Long = 0,
+    // The edit-sheet fields the USER has changed on this server (ServerEditor
+    // field names, accumulated over every save). A subscription refresh keeps
+    // these and nothing else of the old record's connection (SubRefresh.carry):
+    // what the user did is recorded when they do it, never inferred afterwards.
+    val edited: List<String> = emptyList()
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id); put("name", name); put("protocol", protocol)
@@ -39,6 +46,7 @@ data class ServerConfig(
         if (dns.isNotEmpty()) put("dns", JSONArray(dns))
         if (dnsDomains.isNotEmpty()) put("dnsDomains", JSONArray(dnsDomains))
         if (certPin.isNotEmpty()) { put("certPin", certPin); put("certPinAt", certPinAt); put("certPinCheckedAt", certPinCheckedAt) }
+        if (edited.isNotEmpty()) put("edited", JSONArray(edited))
     }
 
     companion object {
@@ -66,7 +74,8 @@ data class ServerConfig(
                 dnsDomains = domains,
                 certPin = CertPin.normalizePin(o.optString("certPin")),
                 certPinAt = o.optString("certPinAt"),
-                certPinCheckedAt = o.optLong("certPinCheckedAt", 0)
+                certPinCheckedAt = o.optLong("certPinCheckedAt", 0),
+                edited = strList(o.optJSONArray("edited"))
             )
         }
 
@@ -106,7 +115,13 @@ data class PoolEntry(
     }
 }
 
-/** A subscription source + its last-known usage (from Subscription-Userinfo). */
+/**
+ * A subscription source + its last-known usage (from Subscription-Userinfo).
+ * `lastUpdated` is the last refresh that brought servers; `lastTried` the last
+ * attempt of any outcome, so a failing one waits out the auto-update interval
+ * like a good one instead of being fetched again on every visit (SubRefresh.due);
+ * `lastError` is what that attempt said when it failed ("" = it did not).
+ */
 data class Subscription(
     val id: String,
     val name: String,
@@ -114,18 +129,22 @@ data class Subscription(
     val serverCount: Int = 0,
     val lastUpdated: Long = 0,
     val autoUpdate: Boolean = true,
-    val upload: Long = 0, val download: Long = 0, val total: Long = 0, val expire: Long = 0
+    val upload: Long = 0, val download: Long = 0, val total: Long = 0, val expire: Long = 0,
+    val lastTried: Long = 0,
+    val lastError: String = ""
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id); put("name", name); put("url", url)
         put("serverCount", serverCount); put("lastUpdated", lastUpdated); put("autoUpdate", autoUpdate)
         put("upload", upload); put("download", download); put("total", total); put("expire", expire)
+        put("lastTried", lastTried); if (lastError.isNotEmpty()) put("lastError", lastError)
     }
     companion object {
         fun fromJson(o: JSONObject) = Subscription(
             o.optString("id"), o.optString("name", "Sub"), o.optString("url"),
             o.optInt("serverCount"), o.optLong("lastUpdated"), o.optBoolean("autoUpdate", true),
-            o.optLong("upload"), o.optLong("download"), o.optLong("total"), o.optLong("expire"))
+            o.optLong("upload"), o.optLong("download"), o.optLong("total"), o.optLong("expire"),
+            o.optLong("lastTried"), o.optString("lastError"))
     }
 }
 
@@ -156,6 +175,15 @@ data class AppSettings(
     val advancedRouting: Boolean = false,
     // apply routingMode (bypass Iran/China…) UNDER the advanced rules as well
     val advancedUseMode: Boolean = false,
+    // The core a config runs on when it does not name one of its own.
+    // "xray" = libv2ray in-process; "xray-pattn" = the bundled patterniha
+    // fork as a subprocess (EngineChoice.kt, the desktop's engineChoice.js).
+    val defaultEngine: String = EngineChoice.XRAY,
+    // Simple or advanced, the badge in the header. Advanced shows the chain,
+    // pool, routing and log screens behind More; simple hides them and leaves
+    // Connect one decision. Default true so an upgrade never hides work the
+    // owner already set up.
+    val advancedMode: Boolean = true,
     val routeRules: List<RouteRule> = emptyList(),
     val routeDefault: String = "proxy",
     val customRules: List<RouteRule> = emptyList(),
@@ -163,6 +191,10 @@ data class AppSettings(
     val perAppMode: String = "off",
     val perApps: List<String> = emptyList(),
     val ipv6: Boolean = false,
+    // Connect to the selected config when the app is opened. Off by default:
+    // like the desktop (main.js autoConnect), starting a tunnel by itself is a
+    // thing the user turns on deliberately.
+    val autoConnect: Boolean = false,
     val autoUpdateSubs: Boolean = true,
     val autoUpdateInterval: Int = 60,
     val lang: String = "fa"
@@ -173,11 +205,13 @@ data class AppSettings(
         put("routingMode", routingMode)
         put("blockAds", blockAds); put("enableSniffing", enableSniffing); put("logLevel", logLevel)
         put("advancedRouting", advancedRouting); put("advancedUseMode", advancedUseMode)
+        put("defaultEngine", defaultEngine)
+        put("advancedMode", advancedMode)
         put("routeRules", JSONArray(routeRules.map { it.toJson() }))
         put("routeDefault", routeDefault)
         put("customRules", JSONArray(customRules.map { it.toJson() }))
         put("perAppMode", perAppMode); put("perApps", JSONArray(perApps))
-        put("ipv6", ipv6); put("autoUpdateSubs", autoUpdateSubs); put("autoUpdateInterval", autoUpdateInterval)
+        put("ipv6", ipv6); put("autoConnect", autoConnect); put("autoUpdateSubs", autoUpdateSubs); put("autoUpdateInterval", autoUpdateInterval)
         put("lang", lang)
     }
     companion object {
@@ -226,12 +260,15 @@ data class AppSettings(
                 logLevel = o.optString("logLevel", "warning"),
                 advancedRouting = o.optBoolean("advancedRouting", false),
                 advancedUseMode = o.optBoolean("advancedUseMode", false),
+                defaultEngine = o.optString("defaultEngine", EngineChoice.XRAY).ifBlank { EngineChoice.XRAY },
+                advancedMode = o.optBoolean("advancedMode", true),
                 routeRules = ruleList(o.optJSONArray("routeRules")),
                 routeDefault = o.optString("routeDefault", "proxy"),
                 customRules = ruleList(o.optJSONArray("customRules")),
                 perAppMode = o.optString("perAppMode", "off"),
                 perApps = strList(o.optJSONArray("perApps")),
                 ipv6 = o.optBoolean("ipv6", false),
+                autoConnect = o.optBoolean("autoConnect", false),
                 autoUpdateSubs = o.optBoolean("autoUpdateSubs", true),
                 autoUpdateInterval = o.optInt("autoUpdateInterval", 60),
                 lang = o.optString("lang", "fa")
