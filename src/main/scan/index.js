@@ -7,22 +7,28 @@
  * unwrapped.
  *
  * Channels: scan:start, scan:retest, scan:stop, scan:presets, scan:apply,
- * scan:export. Event: scan-progress { runId, stage, done, total, alive,
+ * scan:export, scan:forget. Event: scan-progress { runId, stage, done, total, alive,
  * speedDone, speedTotal, etaMs, result } per result, the same without a
  * result when the stage changes, then { ..., finished: true, cancelled } (plus
  * `error` when the run itself failed). One run at a time; the last request is
- * remembered in the store under `scan`, never the results.
+ * remembered in the store under `scan`, never the results — only the addresses
+ * that were tested, under `scanTested`, so a random draw can skip them (v2.2).
  */
 const crypto = require('crypto');
 const { isIPv4 } = require('net');
 const { parseLink, buildShareLink } = require('../parser');
 const { xrayEngines, engineLabel } = require('../engines');
-const { expandTargets, CF_IPV4_RANGES } = require('./targets');
+const { expandTargets, drawTargets, CF_IPV4_RANGES, ip4ToInt } = require('./targets');
 const { withAddress } = require('./substitute');
 const { runScan: defaultRunScan, runSpeed: defaultRunSpeed } = require('./scanner');
 
 const STORE_KEY = 'scan';
 const MAX_TARGETS = 5000;
+/** Every address a run has tested (phase 1), as integers, newest last — spec v2.2 §2.2. */
+const TESTED_KEY = 'scanTested';
+const TESTED_CAP = 50000;
+/** How the box is read: every address, or a fresh draw of `perRange` per range that skips the tested. */
+const PICK_DEFAULTS = { mode: 'all', perRange: 20, fresh: true };
 /** What the tab shows before the user changes anything: the balanced preset. */
 const PRESET_DEFAULTS = {
   batch: 20, filterConcurrency: 16, coresInParallel: 2, delaySamples: 2,
@@ -47,6 +53,16 @@ const num = (v, def, lo, hi) => {
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
 };
 const str = (v, def) => (typeof v === 'string' && v.trim() ? v.trim() : def);
+
+/** The pick as sent, clamped; a v2.1 request without one reads as `all`. */
+function sanitizePick(raw) {
+  const p = raw && typeof raw === 'object' ? raw : {};
+  return {
+    mode: p.mode === 'random' ? 'random' : 'all',
+    perRange: num(p.perRange, PICK_DEFAULTS.perRange, 1, MAX_TARGETS),
+    fresh: p.fresh === undefined ? PICK_DEFAULTS.fresh : !!p.fresh
+  };
+}
 
 /** Clamp what the renderer sent; anything missing takes the default. */
 function sanitizeOpts(raw) {
@@ -136,6 +152,39 @@ function createScan(ctx, deps = {}) {
     return offered.filter((e) => e.installed && want.includes(e.id)).map((e) => e.id);
   }
 
+  /* ----------------------------- the tested history ----------------------------- */
+
+  let tested = null;        // Set<int>, read from the store on first use
+  let testedDirty = false;  // something was added since the last write
+  const testedSet = () => {
+    if (!tested) {
+      const raw = ctx.store.get(TESTED_KEY, null);
+      tested = new Set(Array.isArray(raw) ? raw.filter(n => Number.isInteger(n) && n >= 0 && n <= 0xffffffff) : []);
+    }
+    return tested;
+  };
+  /** A Set keeps insertion order, so the cap drops the oldest; an address seen again keeps its old place. */
+  function rememberTested(ip) {
+    const n = ip4ToInt(ip);
+    if (n === null) return;
+    const set = testedSet();
+    if (set.has(n)) return;
+    set.add(n);
+    testedDirty = true;
+    if (set.size > TESTED_CAP) for (const old of set) { set.delete(old); if (set.size <= TESTED_CAP) break; }
+  }
+  function persistTested() {
+    if (!testedDirty) return;
+    testedDirty = false;
+    try { ctx.store.setLazy(TESTED_KEY, Array.from(testedSet())); } catch { /* the history is a convenience */ }
+  }
+  function forget() {
+    tested = new Set();
+    testedDirty = false;
+    try { ctx.store.set(TESTED_KEY, []); } catch { /* same */ }
+    return { ok: true, tested: 0 };
+  }
+
   /**
    * Put a run in flight: its events go out as scan-progress with the newest
    * progress merged in — one per result, one on a stage change, one at the end.
@@ -153,7 +202,11 @@ function createScan(ctx, deps = {}) {
         progress = Object.assign({}, p);
         if (moved && p.stage !== 'done') send({});
       },
-      onResult: (result) => { done++; send({ result }); }
+      onResult: (result) => {
+        done++;
+        if (result && result.phase === 1 && result.ip) rememberTested(result.ip);   // whatever mode: it was tested
+        send({ result });
+      }
     };
     const promise = start(hooks).then(
       ({ cancelled }) => {
@@ -165,7 +218,7 @@ function createScan(ctx, deps = {}) {
         ctx.log(`Scan ${runId} failed: ${msg}`, 'error');
         send({ finished: true, cancelled: token.cancelled, error: msg });
       }
-    ).finally(() => { run = null; });
+    ).finally(() => { run = null; persistTested(); });
     run = { runId, token, promise };
     const label = server.name || server.address;
     return { runId, label };
@@ -178,7 +231,12 @@ function createScan(ctx, deps = {}) {
     try { server = resolveServer(req); } catch (e) { return { error: e.message }; }
     try { withAddress(server, '127.0.0.1'); } catch { return { error: 'unsupported protocol' }; }
 
-    const { ips, errors, truncated } = expandTargets(req.ipsText, { max: MAX_TARGETS });
+    // the box, read the way the pick says: every address, or a fresh draw per range
+    const pick = sanitizePick(req.pick);
+    const drawn = pick.mode === 'random'
+      ? drawTargets(req.ipsText, { perRange: pick.perRange, max: MAX_TARGETS, exclude: pick.fresh ? testedSet() : undefined })
+      : expandTargets(req.ipsText, { max: MAX_TARGETS });
+    const { ips, errors, truncated } = drawn;
     if (!ips.length) return { error: 'no targets', errors };
 
     const engines = chooseEngines(req.engines);
@@ -190,7 +248,7 @@ function createScan(ctx, deps = {}) {
 
     const remembered = {
       serverId: req.serverId || null, link: req.serverId ? null : (req.link || null),
-      ipsText: String(req.ipsText || ''), engines, tests, opts
+      ipsText: String(req.ipsText || ''), pick, engines, tests, opts
     };
     try { ctx.store.setLazy(STORE_KEY, remembered); } catch { /* the run matters more than the memory of it */ }
 
@@ -204,8 +262,12 @@ function createScan(ctx, deps = {}) {
         xray: ctx.xray, token
       }, hooks))
     });
-    ctx.log(`Scan ${runId}: ${ips.length} target(s) × ${engines.join(', ')} through "${label}"`, 'info');
-    return { runId, total, truncated, errors };
+    const how = pick.mode !== 'random' ? '' :
+      ` — a fresh draw of ${pick.perRange} per range from ${drawn.ranges} range(s)` +
+      (pick.fresh ? `, ${testedSet().size} tested before skipped` : '') +
+      (drawn.exhausted ? `, ${drawn.exhausted} range(s) had to repeat` : '');
+    ctx.log(`Scan ${runId}: ${ips.length} target(s) × ${engines.join(', ')} through "${label}"${how}`, 'info');
+    return { runId, total, truncated, errors, pick, ranges: drawn.ranges || 0, exhausted: drawn.exhausted || 0 };
   }
 
   /** Phase 2 alone on rows the table chose; every row names its engine. */
@@ -258,7 +320,8 @@ function createScan(ctx, deps = {}) {
       defaults: Object.assign({}, PRESET_DEFAULTS),
       presets: { fast: Object.assign({}, PRESETS.fast), balanced: Object.assign({}, PRESETS.balanced), accurate: Object.assign({}, PRESETS.accurate) },
       last: ctx.store.get(STORE_KEY, null) || null,
-      engines: engineOffer()
+      engines: engineOffer(),
+      tested: testedSet().size
     };
   }
 
@@ -295,7 +358,8 @@ function createScan(ctx, deps = {}) {
     'scan:stop': stop,
     'scan:presets': presets,
     'scan:apply': apply,
-    'scan:export': exportText
+    'scan:export': exportText,
+    'scan:forget': forget
   };
 
   return {
@@ -310,4 +374,4 @@ function createScan(ctx, deps = {}) {
   };
 }
 
-module.exports = { createScan, PRESET_DEFAULTS, PRESETS, CSV_HEADER, sanitizeOpts, sanitizeTests };
+module.exports = { createScan, PRESET_DEFAULTS, PRESETS, PICK_DEFAULTS, CSV_HEADER, sanitizeOpts, sanitizeTests, sanitizePick };

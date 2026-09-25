@@ -124,6 +124,7 @@ contextBridge.exposeInMainWorld('api', {
   scanPresets: () => ipcRenderer.invoke('scan:presets'),
   scanApply: (req) => ipcRenderer.invoke('scan:apply', req),
   scanExport: (req) => ipcRenderer.invoke('scan:export', req),
+  scanForget: () => ipcRenderer.invoke('scan:forget'),
   onScanProgress: (cb) => ipcRenderer.on('scan-progress', (e, d) => cb(d)),
 
   // events

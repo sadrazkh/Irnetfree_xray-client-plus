@@ -13,10 +13,10 @@
  * so a run of five thousand rows must not turn into five thousand layouts:
  * results are queued and applied once per animation frame, and the table is
  * kept sorted by inserting each row at its place instead of rebuilding the
- * body. Nothing here expands a CIDR — main owns the target list; the *sample*
- * button is the one convenience that has to pick addresses itself (there is no
- * channel to ask for a sample) and it only writes text into the box that main
- * will expand anyway.
+ * body. Nothing here expands a CIDR or draws a sample — main owns the target
+ * list, and in the *random* pick it draws a fresh set from the ranges on every
+ * start (v2.2); the tab only counts what is typed so the line under the box
+ * can say what a run will get.
  */
 (function () {
   const XRAY_PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks'];
@@ -57,7 +57,9 @@
   const STAGE_KEYS = { idle: 'scan.stage.idle', filter: 'scan.stage.filter', speed: 'scan.stage.speed', done: 'scan.stage.done' };
   /** A path main built from downBytes itself; filling it in would freeze the MB field. */
   const AUTO_DOWN_PATH = /^\/__down\?bytes=\d+$/;
-  const MAX_SAMPLE = 5000;
+  /** main's cap on one run's targets — the estimate under the box stops there too. */
+  const MAX_TARGETS = 5000;
+  const PICK_DEFAULTS = { mode: 'all', perRange: 20, fresh: true };
   /** A queue this deep means the frames stopped coming (hidden window): drain it. */
   const QUEUE_BURST = 500;
 
@@ -65,6 +67,8 @@
   let presets = { cfRanges: [], defaults: {}, presets: {}, engines: [], last: null };
   let sourceSel = null;          // the makeSearchSelect element, when there is one
   let srcMode = 'server';        // 'server' | 'link'
+  let pickMode = 'all';          // 'all' | 'random' — how main reads the box
+  let tested = 0;                // addresses in main's tested history, for the line under the pick row
   let run = null;                // { runId, startedAt } while a scan is in flight
   let prog = null;               // the newest progress; it outlives the run so the strip keeps its numbers
   let lastReq = null;            // the request the rows came from — apply and re-test reuse its source
@@ -231,6 +235,11 @@
   function restore(last) {
     if (!last) return;
     if (last.ipsText) $('#scanIps').value = last.ipsText;
+    if (last.pick && typeof last.pick === 'object') {
+      if (last.pick.perRange) $('#scanPerRange').value = last.pick.perRange;
+      $('#scanFresh').checked = last.pick.fresh !== false;
+      setPick(last.pick.mode);
+    }
     if (Array.isArray(last.engines) && last.engines.length) {
       $$('#scanEngines input').forEach(b => { if (!b.disabled) b.checked = last.engines.includes(b.value); });
     }
@@ -299,10 +308,16 @@
       const parts = [t('scan.countTotal').replace('{n}', targets).replace('{e}', engines)];
       if (count.truncated) parts.push(t('scan.truncated').replace('{n}', targets));
       if (count.bad) parts.push(t('scan.badLines').replace('{n}', count.bad));
+      if (count.exhausted) parts.push(t('scan.exhausted').replace('{n}', count.exhausted));
       el.textContent = parts.join(' · ');
       return;
     }
     if (count.kind === 'retest') { el.textContent = t('scan.retopCount').replace('{n}', count.n); return; }
+    if (pickMode === 'random') {
+      const est = drawEstimate($('#scanIps').value, perRange());
+      el.textContent = t('scan.countRandom').replace('{r}', est.ranges).replace('{k}', perRange()).replace('{n}', est.perRun);
+      return;
+    }
     el.textContent = t('scan.count').replace('{n}', countTokens($('#scanIps').value));
   }
 
@@ -333,27 +348,37 @@
   }
 
   /**
-   * A spread across every range in the box, not the first n of the first one —
-   * a scan of 104.16.0.0/13 alone would otherwise only ever see one corner of
-   * Cloudflare. Round-robin over the ranges, one random address each pass.
+   * What a random pick will draw: the ranges the box parses (the grammar main
+   * uses) and min(k, size) from each, capped the way main caps a run. An
+   * estimate for the line under the box — the draw itself happens in main.
    */
-  function sampleFrom(text, n) {
-    const ranges = [];
+  function drawEstimate(text, k) {
+    let ranges = 0, perRun = 0;
     for (const raw of String(text || '').split(/\r?\n/)) {
       for (const tok of uncomment(raw).split(/[\s,;]+/).filter(Boolean)) {
         const r = tokenRange(tok);
-        if (r) ranges.push(r);
+        if (!r) continue;
+        ranges++;
+        perRun += Math.min(k, r.end - r.start + 1);
       }
     }
-    const out = new Set();
-    if (!ranges.length) return [];
-    let guard = n * 20;
-    let i = 0;
-    while (out.size < n && guard-- > 0) {
-      const r = ranges[i++ % ranges.length];
-      out.add(intIp(r.start + Math.floor(Math.random() * (r.end - r.start + 1))));
-    }
-    return [...out];
+    return { ranges, perRun: Math.min(perRun, MAX_TARGETS) };
+  }
+  const perRange = () => Math.round(numOf('#scanPerRange', PICK_DEFAULTS.perRange, 1));
+
+  function setPick(mode) {
+    pickMode = mode === 'random' ? 'random' : 'all';
+    $$('#scanPickSeg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.pick === pickMode));
+    $('#scanPickOpts').hidden = pickMode !== 'random';
+    updateCount();
+  }
+
+  /** The history count next to the pick row; nothing while it is empty. */
+  function paintTested(n) {
+    const el = $('#scanTested');
+    tested = Math.max(0, Math.floor(Number(n) || 0));
+    el.textContent = tested ? t('scan.tested').replace('{n}', tested) : '';
+    el.hidden = !tested;
   }
 
   /* ----------------------------- the table ----------------------------- */
@@ -614,6 +639,7 @@
   function buildReq(over) {
     return Object.assign({
       ipsText: $('#scanIps').value,
+      pick: { mode: pickMode, perRange: perRange(), fresh: $('#scanFresh').checked },
       engines: selectedEngines(),
       tests: selectedTests(),
       opts: buildOpts()
@@ -647,7 +673,8 @@
     beginRun(res.runId, { stage: 'filter', total: res.total || 0 });
     count = {
       kind: 'run', total: res.total || 0, engines: Math.max(1, (req.engines || []).length),
-      truncated: !!res.truncated, bad: (res.errors && res.errors.length) || 0
+      truncated: !!res.truncated, bad: (res.errors && res.errors.length) || 0,
+      exhausted: res.exhausted || 0
     };
     paintCount();
   }
@@ -691,6 +718,8 @@
     $('#btnScanStop').disabled = true;
     if (ev.error) toast(t('scan.failed') + ': ' + errText(ev.error), 'err');
     else toast(ev.cancelled ? t('scan.stoppedToast') : t('scan.doneToast'), 'ok');
+    // the run added what it tested to main's history
+    window.api.scanPresets().then(p => paintTested(p && p.tested)).catch(() => {});
   }
 
   /** Events of a run that is no longer the current one are somebody else’s. */
@@ -774,13 +803,17 @@
 
     $('#scanIps').oninput = updateCount;
     $('#btnScanCf').onclick = () => { $('#scanIps').value = (presets.cfRanges || []).join('\n'); updateCount(); };
-    $('#btnScanSample').onclick = () => {
-      const n = Math.min(MAX_SAMPLE, Math.round(numOf('#scanSampleN', 100)));
-      const picked = sampleFrom($('#scanIps').value, n);
-      if (!picked.length) return setError('no targets');
-      $('#scanIps').value = picked.join('\n');
-      setError('');
-      updateCount();
+    $('#scanPickSeg').onclick = (e) => {
+      const btn = e.target.closest('.seg-btn');
+      if (btn) setPick(btn.dataset.pick);
+    };
+    $('#scanPerRange').oninput = updateCount;
+    $('#btnScanForget').onclick = async () => {
+      let r;
+      try { r = await window.api.scanForget(); }
+      catch (e) { return toast((e && e.message) || String(e), 'err'); }
+      paintTested(r && r.tested);
+      toast(t('scan.forgotToast'), 'ok');
     };
     $('#btnScanFile').onclick = () => $('#scanFile').click();
     $('#scanFile').onchange = async () => {
@@ -858,6 +891,7 @@
     // the balanced preset is what the tab opens on; the last run overrides it
     fillLimits(presets.defaults || {});
     restore(presets.last);
+    paintTested(presets.tested);
     refreshSourcePicker();
     wire();
     paintSortMarks();

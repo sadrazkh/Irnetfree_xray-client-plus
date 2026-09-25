@@ -151,4 +151,77 @@ function sampleTargets(text, n, rng = Math.random) {
   return out;
 }
 
-module.exports = { expandTargets, sampleTargets, parseTargetText, CF_IPV4_RANGES, ip4ToInt, intToIp4 };
+/**
+ * drawTargets(text, { perRange, max, exclude, rng })
+ *   → { ips, errors, ranges, exhausted, truncated }
+ *
+ * A fresh sample (spec v2.2 §2.1): `perRange` distinct addresses from every
+ * range in the text, in the order written, capped at `max` in total — so the
+ * cap cuts the last ranges, never a corner of the first. `exclude` is a Set of
+ * addresses (as integers) tested before: they are skipped while a range still
+ * has others and come back only when it has not; such a range is counted in
+ * `exhausted`. With no `rng` every call is a new draw.
+ *
+ * A small range is enumerated and shuffled (a /20 is 4096 numbers, nothing);
+ * a big one is sampled by rejection — twenty draws out of a /13's half
+ * million never collide in practice, and the bounded loop only matters for a
+ * block whose untested part is nearly gone.
+ */
+const ENUMERATE_UP_TO = 4096;
+
+function drawTargets(text, opts = {}) {
+  const perRange = Math.max(1, Math.floor(Number(opts.perRange) || 20));
+  const max = Math.max(1, Math.floor(Number(opts.max) || DEFAULT_MAX));
+  const exclude = opts.exclude instanceof Set ? opts.exclude : new Set();
+  const rng = typeof opts.rng === 'function' ? opts.rng : Math.random;
+  const { ranges, errors } = parseTargetText(text);
+  const seen = new Set();
+  const ips = [];
+  let exhausted = 0, truncated = false;
+
+  const shuffle = (arr) => {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+    return arr;
+  };
+  /** Takes n; true when it was one of the excluded (a repeat). */
+  const take = (n) => { seen.add(n); ips.push(intToIp4(n)); return exclude.has(n); };
+
+  outer: for (const r of ranges) {
+    const want = Math.min(perRange, r.size);
+    let got = 0, repeated = false;
+    if (r.size <= ENUMERATE_UP_TO) {
+      const fresh = [], tested = [];
+      for (let n = r.start; n <= r.end; n++) {
+        if (seen.has(n)) continue;
+        (exclude.has(n) ? tested : fresh).push(n);
+      }
+      const order = shuffle(fresh).concat(shuffle(tested));
+      for (let i = 0; i < order.length && got < want; i++) {
+        if (ips.length >= max) { truncated = true; break outer; }
+        if (take(order[i])) repeated = true;
+        got++;
+      }
+    } else {
+      let tries = 0, allowTested = false;
+      const budget = want * 30 + 100;
+      while (got < want) {
+        if (ips.length >= max) { truncated = true; break outer; }
+        if (tries++ >= budget) {
+          if (allowTested) break;      // even the tested part is used up (the same block written twice, say)
+          allowTested = true; tries = 0;
+        }
+        const n = r.start + Math.floor(rng() * r.size);
+        if (seen.has(n) || (!allowTested && exclude.has(n))) continue;
+        if (take(n)) repeated = true;
+        got++;
+      }
+    }
+    if (repeated) exhausted++;
+  }
+  return { ips, errors, ranges: ranges.length, exhausted, truncated };
+}
+
+module.exports = { expandTargets, sampleTargets, drawTargets, parseTargetText, CF_IPV4_RANGES, ip4ToInt, intToIp4 };
