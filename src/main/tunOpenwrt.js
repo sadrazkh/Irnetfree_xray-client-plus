@@ -1,0 +1,350 @@
+'use strict';
+/**
+ * TUN mode on an OpenWrt router: the router is the tunnel for every device
+ * behind it.
+ *
+ * This backend COMPOSES the sing-box one (tunSingbox.js) rather than changing
+ * it: sing-box's `auto_route` already routes forwarded LAN traffic into the TUN
+ * on Linux (sing-tun's rule set ends in `not iif lo → lookup 2022`), and every
+ * port-53 packet with it — so dnsmasq's upstream queries and every client's
+ * hard-coded resolver end up at Xray's dns-out without a line of DNS config.
+ * What a router adds is around that:
+ *
+ *   1. an nft table of ours (openwrtNet.buildNftRuleset) that marks packets
+ *      from EXCLUDED devices by source MAC, and
+ *   2. one `ip rule` (pref 8999, before sing-box's 9000+) that sends marked
+ *      packets to the main table — out the WAN, with fw4's normal NAT;
+ *   3. a check, after sing-box is up, that the TUN device exists and the
+ *      policy route is really there — a gateway that silently is not one
+ *      leaks the whole house.
+ *
+ * Order on start: table → rules → sing-box → verify; any failure rolls back
+ * in reverse and the error names the step. The exclusion list is replaced
+ * LIVE (atomic nft reload) without touching the tunnel.
+ *
+ * `managesDns = true`: the service then leaves the leak guard out. The guard
+ * rewrites adapter resolvers; on a router the resolver is dnsmasq, which must
+ * stay exactly as it is — the port-53 route above is the guard here.
+ *
+ * Fail-closed on a dead core, fail-open on a dead sing-box: routes into the
+ * TUN survive an Xray crash (traffic stops, nothing leaks); a sing-box crash
+ * removes its own routes and the LAN goes direct until the service's recovery
+ * rebuilds it. This class watches for that exit itself (`active` follows
+ * sing-box, `onUnexpectedExit` tells the service); the service watches Xray.
+ * A kill switch that closes the window is deliberately not in this version
+ * (spec §9).
+ *
+ * One ordering rule on the way down: rule 8998 goes only once the IRNetFree
+ * device is gone. Harmless without sing-box, it is what keeps the router's own
+ * LAN replies off a split table 2022 — deleting it under a live one is the
+ * v1.13.2 outage again.
+ */
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
+const platform = require('./tunPlatform');
+const { TunSingbox } = require('./tunSingbox');
+const net = require('./openwrtNet');
+
+/** sing-box's default `iproute2_table_index`; its rules must mention it. */
+const SINGBOX_TABLE = 2022;
+/**
+ * How long the device and the policy route get to appear after sing-box
+ * reports itself up. Its `auto_route` lays the rules a moment AFTER the tun
+ * device exists; on a slow CPU (an emulated one in CI) that moment was over
+ * four seconds once, and a verify that reads `ip rule` too early tears down a
+ * gateway that was about to be fine.
+ */
+const VERIFY_WAIT_MS = 15000;
+/** How long the IRNetFree device gets to disappear after sing-box is told to stop. */
+const LINK_GONE_WAIT_MS = 5000;
+
+function defaultWhich(name) {
+  return String(process.env.PATH || '').split(path.delimiter).some(d => d && fs.existsSync(path.join(d, name)));
+}
+
+/** Block the thread for `ms` — only for the exit hook, where nothing can be awaited. */
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait: poll faster */ }
+}
+
+class TunOpenwrt {
+  constructor(opts = {}) {
+    // The inner backend is built WITHOUT the caller's onUnexpectedExit: this
+    // class reports sing-box's exit itself (watchInner), and a pass-through
+    // would fire twice once TunSingbox reports its own exits.
+    const innerOpts = Object.assign({}, opts);
+    delete innerOpts.onUnexpectedExit;
+    this.inner = opts.inner || new TunSingbox(innerOpts);
+    this.onUnexpectedExit = opts.onUnexpectedExit || (() => {});
+    this.run = opts.run || platform.run;
+    this.runSync = opts.runSync || ((cmd, args) => execFileSync(cmd, args, { stdio: 'ignore', timeout: 5000 }));
+    this.writeFile = opts.writeFile || ((p, text) => fs.writeFileSync(p, text, { mode: 0o600 }));
+    this.lanStatus = opts.lanStatus || (() => net.lanStatus(this.run));
+    this.which = opts.which || defaultWhich;
+    this.onLog = opts.onLog || (() => {});
+    this.lang = opts.lang || 'fa';
+    this.tmpDir = opts.tmpDir || os.tmpdir();
+    this.verifyWaitMs = opts.verifyWaitMs || VERIFY_WAIT_MS;
+    this.linkWaitMs = opts.linkWaitMs || LINK_GONE_WAIT_MS;
+
+    this.backendId = 'openwrt';
+    this.managesDns = true;
+    this.interfaceName = this.inner.interfaceName;
+    this.dnsPeer = this.inner.dnsPeer;
+    this.dnsPeer6 = this.inner.dnsPeer6;
+    this.active = false;
+    this.excludeIps = [];
+    this.macs = [];
+    this.blockQuic = false;    // refuse UDP 443 from the LAN (settings.lanBlockQuic)
+    this.lanIf = 'br-lan';
+    this.probe = null;         // a LAN client address for the route check in verify()
+    this.mark = net.BYPASS_MARK;
+    this.laid = false;         // our table / rules may be in the kernel
+    this.watchGen = 0;         // bumped by every exit we cause: only a newer watch may report
+  }
+
+  msg(fa, en) { return this.lang === 'en' ? en : fa; }
+
+  isAvailable() { return this.inner.isAvailable() && this.which('nft'); }
+  isElevated() { return this.inner.isElevated(); }
+  prepare(o) { return typeof this.inner.prepare === 'function' ? this.inner.prepare(o) : undefined; }
+  physicalInterface() { return this.inner.physicalInterface(); }
+
+  /* ----------------------------- the router's two tables ----------------------------- */
+
+  /** Atomic replace of our nft table with the given exclusions (and the QUIC refusal, when on). */
+  async applyTable(macs) {
+    // a router path is a POSIX path, whatever the tests run on
+    const file = path.posix.join(this.tmpDir, 'irnetfree-nft.conf');
+    this.writeFile(file, net.buildNftRuleset({ lanIf: this.lanIf, macs, mark: this.mark, blockQuic: this.blockQuic }));
+    await this.run('nft', ['-f', file]);
+  }
+
+  /** Every `ip rule` of ours, in the order they are added: main-first, then the bypass. */
+  ruleSets(verb) { return [...net.mainFirstRuleArgs(verb), ...net.bypassRuleArgs(verb, this.mark)]; }
+
+  /** Our rules, added after clearing any leftover so a restart never doubles them. */
+  async addRules() {
+    await this.delRules();
+    for (const args of this.ruleSets('add')) await this.run('ip', args);
+  }
+
+  /**
+   * Delete by preference, repeatedly, until the kernel says there is none left:
+   * a leftover from an older version (other selectors, same preference) goes
+   * too, and a doubled rule from an unclean exit cannot survive.
+   */
+  async delRules() {
+    for (const args of this.ruleSets('del')) {
+      for (let i = 0; i < 4; i++) {
+        try { await this.run('ip', args); } catch { break; }   // "not there" — the common case
+      }
+    }
+  }
+
+  async deleteTable() {
+    try { await this.run('nft', ['delete', 'table', 'inet', 'irnetfree']); } catch { /* not there */ }
+  }
+
+  /**
+   * The device exists AND sing-box's policy route is in place — else the LAN
+   * is not tunnelled. Both are polled under one deadline: the rules arrive a
+   * moment after the device.
+   */
+  async verify() {
+    const deadline = Date.now() + this.verifyWaitMs;
+    let lastErr = null;
+    for (;;) {
+      try {
+        await this.run('ip', ['link', 'show', this.interfaceName]);
+        const rules = await this.run('ip', ['rule', 'show']);
+        if (new RegExp(`lookup ${SINGBOX_TABLE}\\b`).test(rules)) break;
+        lastErr = new Error(`sing-box laid no policy route (ip rule):\n${String(rules).trim()}`);
+      } catch (e) { lastErr = e; }
+      if (Date.now() >= deadline) throw lastErr;
+      await platform.delay(250);
+    }
+    // The check that would have caught v1.13.2: the router's own packets to a
+    // LAN client must NOT be routed into the tunnel. Refusing here costs a log
+    // line; going active would cost the whole house its network.
+    if (this.probe) {
+      const out = String(await this.run('ip', ['route', 'get', this.probe]));
+      if (new RegExp(`\\bdev ${this.interfaceName}\\b`).test(out)) {
+        throw new Error(`the router's own traffic to its LAN (${this.probe}) would enter the tunnel:\n${out.trim()}`);
+      }
+    }
+  }
+
+  async rollback() {
+    this.watchGen++;
+    const proc = this.inner.proc || null;
+    try { await this.inner.stop(); } catch { /* best effort */ }
+    await this.unlay(proc);
+  }
+
+  /** Resolves true once `ip link show IRNetFree` fails (no device), false at the deadline. */
+  async linkGone(ms) {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      try { await this.run('ip', ['link', 'show', this.interfaceName]); } catch { return true; }
+      if (Date.now() >= deadline) return false;
+      await platform.delay(200);
+    }
+  }
+
+  linkGoneSync(ms) {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      try { this.runSync('ip', ['link', 'show', this.interfaceName]); } catch { return true; }
+      if (Date.now() >= deadline) return false;
+      sleepSync(100);
+    }
+  }
+
+  /**
+   * Our rules and table, removed — the rules only once sing-box's device is
+   * gone (see the header). A sing-box that outlives its SIGTERM gets a SIGKILL
+   * first; a device that still will not go keeps our rules, which the next
+   * start (or the next service start) clears.
+   */
+  async unlay(proc) {
+    let gone = await this.linkGone(this.linkWaitMs);
+    if (!gone && proc) {
+      try { proc.kill('SIGKILL'); } catch { /* gone meanwhile */ }
+      gone = await this.linkGone(this.linkWaitMs);
+    }
+    if (gone) await this.delRules();
+    else this.onLog(`The ${this.interfaceName} device is still there after sing-box was stopped — the router's rules stay until it is gone (harmless without sing-box; the next start clears them)`, 'error');
+    await this.deleteTable();
+    this.laid = !gone;
+    return gone;
+  }
+
+  /**
+   * At service start: what a killed service left behind (our rules, our
+   * table — the QUIC refusal among them) goes, once no IRNetFree device is
+   * left. The caller has already ended its orphaned cores.
+   */
+  clearLeftovers() {
+    this.laid = true;
+    return this.unlay(null);
+  }
+
+  /**
+   * sing-box dying on its own (OOM, a panic) takes its routes with it: the LAN
+   * goes direct while everything above still says "gateway up". `active`
+   * follows the inner's liveness and the service is told, so it can rebuild.
+   * An exit this class caused (stop, rollback, exit hook) bumped the
+   * generation first and is not reported.
+   */
+  watchInner() {
+    const gen = ++this.watchGen;
+    const exited = this.inner.exited;
+    if (!exited || typeof exited.then !== 'function') return;
+    exited.then((info) => {
+      if (gen !== this.watchGen || !this.active || this.inner.active) return;
+      this.active = false;
+      this.excludeIps = [];
+      const why = (info && info.error) || `code=${info && info.code != null ? info.code : '-'} signal=${(info && info.signal) || '-'}`;
+      this.onLog(`Gateway down: sing-box exited on its own (${why}) — the LAN goes direct until the tunnel is rebuilt`, 'error');
+      try {
+        this.onUnexpectedExit(new Error(this.msg(`sing-box گیت‌وی بسته شد (${why})`, `the gateway's sing-box exited (${why})`)));
+      } catch (e) { this.onLog('Gateway recovery: ' + e.message, 'error'); }
+    }, () => { /* never rejects; nothing to report if it does */ });
+  }
+
+  /* ----------------------------- public API ----------------------------- */
+
+  /**
+   * @param socksPort   Xray's local SOCKS inbound
+   * @param bypassAddrs server addresses kept off the tunnel (route_exclude_address)
+   * @param dnsServers  ignored here, as on Linux: dnsmasq is left alone
+   * @param opts        { ipv6, strict, apps, bypassMacs } — bypassMacs is the router's own
+   */
+  async start(socksPort, bypassAddrs, dnsServers, opts = {}) {
+    if (this.active) return;
+    const o = opts || {};
+    this.inner.lang = this.lang;
+    const lan = await this.lanStatus();
+    this.lanIf = lan.device;
+    this.probe = net.lanProbeAddress(lan.address, lan.mask);
+    this.macs = net.validMacs(o.bypassMacs);
+    this.blockQuic = !!o.blockQuic;
+    let step = 'nft';
+    this.laid = true;
+    try {
+      await this.applyTable(this.macs);
+      step = 'ip rule';
+      await this.addRules();
+      step = 'sing-box';
+      // (GSO on the tun — batches of segments per read/write — is something
+      // sing-box ≥ 1.11 turns on by itself on Linux; the option that once asked
+      // for it is refused by 1.12, which CI found out for us.)
+      await this.inner.start(socksPort, bypassAddrs, dnsServers, o);
+      step = 'verify';
+      await this.verify();
+    } catch (e) {
+      await this.rollback();
+      throw new Error(this.msg(
+        `گیت‌وی بالا نیامد (${step}): ${e.message}`,
+        `Gateway did not come up (${step}): ${e.message}`));
+    }
+    this.active = true;
+    this.excludeIps = this.inner.excludeIps;
+    this.watchInner();
+    this.onLog(`Gateway up on ${this.lanIf}: every device behind the router goes through the tunnel; ${this.macs.length} excluded by MAC`, 'info');
+  }
+
+  /** Replace the exclusions under a live tunnel; the tunnel is not touched. */
+  async setBypassMacs(macs) {
+    this.macs = net.validMacs(macs);
+    if (!this.active) return;
+    await this.applyTable(this.macs);
+    this.onLog(`Gateway: ${this.macs.length} device(s) excluded by MAC`, 'info');
+  }
+
+  /** Turn the QUIC refusal on or off under a live tunnel; the tunnel is not touched. */
+  async setBlockQuic(on) {
+    this.blockQuic = !!on;
+    if (!this.active) return;
+    await this.applyTable(this.macs);
+    this.onLog(`Gateway: QUIC (UDP 443) from the LAN is ${this.blockQuic ? 'refused — browsers use TCP' : 'allowed'}`, 'info');
+  }
+
+  /** Also after sing-box died on its own: our rules and table are still there then. */
+  async stop() {
+    if (!this.active && !this.inner.active && !this.laid) return;
+    this.watchGen++;            // the exit from here on is one we asked for
+    this.active = false;
+    this.excludeIps = [];
+    const proc = this.inner.proc || null;
+    try { await this.inner.stop(); }
+    finally { await this.unlay(proc); }
+    this.onLog('Gateway stopped: the LAN goes direct.', 'info');
+  }
+
+  /** Synchronous best effort for process exit — the same order: sing-box, its device gone, then our rules. */
+  cleanupSync() {
+    if (!this.active && !this.inner.active && !this.laid && !this.inner.proc) return;
+    this.watchGen++;
+    const proc = this.inner.proc || null;
+    try { this.inner.cleanupSync(); } catch { /* best effort */ }
+    let gone = this.linkGoneSync(this.linkWaitMs);
+    if (!gone && proc) {
+      try { proc.kill('SIGKILL'); } catch { /* gone meanwhile */ }
+      gone = this.linkGoneSync(1000);
+    }
+    if (gone) {
+      for (const args of this.ruleSets('del')) {
+        for (let i = 0; i < 4; i++) { try { this.runSync('ip', args); } catch { break; } }
+      }
+    }
+    try { this.runSync('nft', ['delete', 'table', 'inet', 'irnetfree']); } catch { /* not there */ }
+    this.active = false;
+    this.laid = !gone;
+  }
+}
+
+module.exports = { TunOpenwrt, SINGBOX_TABLE };

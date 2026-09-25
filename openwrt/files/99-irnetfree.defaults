@@ -1,0 +1,39 @@
+#!/bin/sh
+# Runs at install and at every upgrade (default_postinst runs the uci-defaults
+# scripts the package ships, then deletes them). A firewall zone for the tunnel
+# device so fw4 forwards the LAN into it — explicit, rather than relying on the
+# lan zone's forward policy.
+#
+# input MUST be ACCEPT. sing-box's `system` stack hands every TCP flow from the
+# LAN to the kernel as INPUT on the tun device (a local listener on the tun's
+# own address does the L4 work); UDP never leaves userspace. v1.13.3 and earlier
+# created the zone with input REJECT, and on the owner's AC-1304 that was
+# "UDP passes, no TCP at all" — no web for any device behind the router.
+if uci -q get firewall.irnetfree >/dev/null; then
+	# an existing zone (an upgrade): repair the one option that was wrong
+	if [ "$(uci -q get firewall.irnetfree.input)" != "ACCEPT" ]; then
+		uci set firewall.irnetfree.input='ACCEPT'
+		uci commit firewall
+		[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+	fi
+else
+	uci -q batch <<-EOF
+		set firewall.irnetfree=zone
+		set firewall.irnetfree.name='irnetfree'
+		set firewall.irnetfree.input='ACCEPT'
+		set firewall.irnetfree.output='ACCEPT'
+		set firewall.irnetfree.forward='REJECT'
+		set firewall.irnetfree.masq='0'
+		add_list firewall.irnetfree.device='IRNetFree'
+		set firewall.irnetfree_lan=forwarding
+		set firewall.irnetfree_lan.src='lan'
+		set firewall.irnetfree_lan.dest='irnetfree'
+		commit firewall
+	EOF
+	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
+fi
+# Not only lan: every zone that forwards to wan (a guest Wi-Fi, a VLAN) also
+# forwards to irnetfree, or it has no internet while the gateway is up. The
+# init script runs the same at every start, for a zone added later.
+sh /usr/lib/irnetfree/fw-forwardings.sh
+exit 0

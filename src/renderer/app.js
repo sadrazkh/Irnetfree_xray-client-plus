@@ -297,6 +297,8 @@ async function init() {
   state.assets = data.assets || {};
   state.version = data.version || '';
   state.platform = data.platform || (data.assets && data.assets.platform) || 'win32';
+  // the router flavour of Linux: the device list shows, the desktop-only rows go
+  state.flavor = data.flavor || null;
   // main only reports pending keys while something is actually connected, so a
   // fresh launch always starts empty
   state.pendingReconnect = data.pendingReconnect || [];
@@ -338,6 +340,7 @@ async function init() {
   setModeWidget();
   updateLanInfo();
   updateKillStatus();
+  applyFlavor();
   renderPendingBanner();
 
   // app version + xray-core version
@@ -899,14 +902,83 @@ async function updateLanInfo() {
   if (!info) { try { info = await window.api.lanInfo(); } catch { info = null; } }
   if (info && info.ip) {
     el.innerHTML = `${escapeHtml(t('lan.address'))}: ` +
-      `<b dir="ltr">${escapeHtml(info.ip)}:${info.httpPort}</b> (HTTP) • ` +
-      `<b dir="ltr">${escapeHtml(info.ip)}:${info.socksPort}</b> (SOCKS)`;
+      `<b dir="ltr">${escapeHtml(info.ip)}:${escapeHtml(info.httpPort)}</b> (HTTP) • ` +
+      `<b dir="ltr">${escapeHtml(info.ip)}:${escapeHtml(info.socksPort)}</b> (SOCKS)`;
     el.className = 'tun-status ok';
   } else {
     el.textContent = t('lan.noIp');
     el.className = 'tun-status warn';
   }
 }
+
+/**
+ * OpenWrt: the router IS the tunnel for the LAN, so the switches that only
+ * mean something on a desktop go (system proxy, login item, Windows kill
+ * switch, the TUN backend choice — fixed there, per-app routing — no process
+ * behind a forwarded packet) and the device list comes.
+ */
+function applyFlavor() {
+  const rt = state.flavor === 'openwrt';
+  $('#gwRow').hidden = !rt;
+  $('#insGatewayRow').hidden = !rt;
+  // ...and "DNS managed by the app": on a router the service forces it on (the
+  // core must answer every port-53 packet from the LAN), so the switch would lie
+  for (const id of ['optSysProxy', 'optLaunchAtLogin', 'optKillSwitch', 'optDnsManaged']) {
+    const row = $('#' + id).closest('.switch-row');
+    if (row) row.hidden = rt;
+  }
+  $('#killStatus').hidden = rt;
+  $('#tunBackendRow').hidden = rt;
+  $('#tunAppRow').hidden = rt;
+  $('#gwQuicRow').hidden = !rt;
+  $('#optLanBlockQuic').checked = !!state.settings.lanBlockQuic;
+  if (rt) renderLanDevices();
+}
+$('#optLanBlockQuic').onchange = async () => {
+  // not a reconnect key: the service replaces the nft table under the live tunnel
+  await saveSettings({ lanBlockQuic: $('#optLanBlockQuic').checked }, { silent: true });
+  toast(t('gw.saved'), 'ok');
+};
+
+/** The devices behind the router, each with its "direct" tick. */
+async function renderLanDevices() {
+  const host = $('#gwList');
+  if (!host || state.flavor !== 'openwrt' || !window.api.lanDevices) return;
+  let devices = [];
+  try { devices = (await window.api.lanDevices()) || []; } catch { devices = []; }
+  const bypass = new Set((state.settings.lanBypassMacs || []).map(m => String(m).toLowerCase()));
+  // an excluded device that is not on the network right now still shows, so it can be un-excluded
+  for (const mac of bypass) if (!devices.some(d => d.mac === mac)) devices.push({ mac, ip: '', name: '', online: false });
+  host.innerHTML = '';
+  if (!devices.length) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = t('gw.none');
+    host.appendChild(p);
+    return;
+  }
+  for (const d of devices) {
+    const row = document.createElement('label');
+    row.className = 'gw-item';
+    row.innerHTML =
+      `<span class="gw-dot${d.online ? ' on' : ''}" title="${escapeHtml(t(d.online ? 'gw.online' : 'gw.offline'))}"></span>` +
+      `<span class="gw-name">${escapeHtml(d.name || d.mac)}</span>` +
+      `<span class="gw-meta">${escapeHtml(d.ip || '')}${d.ip ? ' · ' : ''}${escapeHtml(d.mac)}</span>` +
+      `<span class="gw-direct">${escapeHtml(t('gw.direct'))}</span>` +
+      `<input type="checkbox" class="gw-check"${bypass.has(d.mac) ? ' checked' : ''} />`;
+    row.querySelector('.gw-check').onchange = async (e) => {
+      const next = new Set(bypass);
+      if (e.target.checked) next.add(d.mac); else next.delete(d.mac);
+      // not a reconnect key: the service replaces the nft set under the live tunnel
+      await saveSettings({ lanBypassMacs: [...next] }, { silent: true });
+      toast(t('gw.saved'), 'ok');
+      renderLanDevices();
+    };
+    host.appendChild(row);
+  }
+}
+$('#btnGwRefresh').onclick = () => renderLanDevices();
+
 $('#btnSaveRules').onclick = async () => {
   const rules = textToCustomRules($('#customRules').value);
   await saveSettings({ customRules: rules });
@@ -1027,18 +1099,18 @@ function renderServers() {
     const selBadge = `<span class="sel-badge"${isSel ? '' : ' hidden'}>✓ ${escapeHtml(t('srv.selected'))}</span>`;
 
     card.innerHTML = `
-      <span class="q-dot ${tl.cls}" data-ping-dot="${s.id}"></span>
-      <span class="proto-badge proto-${s.protocol}">${s.protocol}</span>
+      <span class="q-dot ${tl.cls}" data-ping-dot="${escapeHtml(s.id)}"></span>
+      <span class="proto-badge proto-${escapeHtml(s.protocol)}">${escapeHtml(s.protocol)}</span>
       <div class="srv-info">
         <div class="srv-name">${escapeHtml(s.name)} ${selBadge}</div>
-        <div class="srv-addr">${escapeHtml(s.address)}:${s.port}</div>
+        <div class="srv-addr">${escapeHtml(s.address)}:${escapeHtml(s.port)}</div>
       </div>
       <div class="stat-group">
-        <span class="stat" title="${escapeHtml(t('ping.tcp'))}"><i>⚡</i><b class="stat-v ${tl.cls}" data-pbase="stat-v" data-ping="${s.id}">${tl.txt}</b></span>
-        <span class="stat" title="${escapeHtml(t('ping.real'))}"><i>↓</i><b class="stat-v ${rl.cls}" data-pbase="stat-v" data-ping-real="${s.id}">${rl.txt}</b></span>
-        <span class="stat" title="${escapeHtml(t('ping.upload'))}"><i>↑</i><b class="stat-v ${ul.cls}" data-pbase="stat-v" data-ping-up="${s.id}">${ul.txt}</b></span>
+        <span class="stat" title="${escapeHtml(t('ping.tcp'))}"><i>⚡</i><b class="stat-v ${tl.cls}" data-pbase="stat-v" data-ping="${escapeHtml(s.id)}">${tl.txt}</b></span>
+        <span class="stat" title="${escapeHtml(t('ping.real'))}"><i>↓</i><b class="stat-v ${rl.cls}" data-pbase="stat-v" data-ping-real="${escapeHtml(s.id)}">${rl.txt}</b></span>
+        <span class="stat" title="${escapeHtml(t('ping.upload'))}"><i>↑</i><b class="stat-v ${ul.cls}" data-pbase="stat-v" data-ping-up="${escapeHtml(s.id)}">${ul.txt}</b></span>
       </div>
-      <span class="srv-usage" data-usage="${s.id}" title="${escapeHtml(t('srv.usage'))} — ${escapeHtml(t('srv.usageClick'))}">${usageLabel(s.id)}</span>
+      <span class="srv-usage" data-usage="${escapeHtml(s.id)}" title="${escapeHtml(t('srv.usage'))} — ${escapeHtml(t('srv.usageClick'))}">${usageLabel(s.id)}</span>
       <div class="srv-actions">
         <button class="icon-btn ping-srv" data-i18n-title="btn.quickPing" title="ping">⚡</button>
         <button class="icon-btn copy-srv" data-i18n-title="btn.copy" title="copy">⧉</button>
@@ -1241,13 +1313,13 @@ function renderPicker() {
     row.className = 'picker-item' + (isSpecial ? ' picker-special' : '') + (id === selId ? ' active' : '');
     const pingPart = pingId
       ? `<span class="stat-group">` +
-          `<span class="stat" title="${escapeHtml(t('ping.tcp'))}"><i>⚡</i><b class="stat-v ${tl.cls}" data-pbase="stat-v" data-ping="${id}">${tl.txt}</b></span>` +
-          `<span class="stat" title="${escapeHtml(t('ping.real'))}"><i>↓</i><b class="stat-v ${rl.cls}" data-pbase="stat-v" data-ping-real="${id}">${rl.txt}</b></span>` +
-          `<span class="stat" title="${escapeHtml(t('ping.upload'))}"><i>↑</i><b class="stat-v ${ul.cls}" data-pbase="stat-v" data-ping-up="${id}">${ul.txt}</b></span>` +
+          `<span class="stat" title="${escapeHtml(t('ping.tcp'))}"><i>⚡</i><b class="stat-v ${tl.cls}" data-pbase="stat-v" data-ping="${escapeHtml(id)}">${tl.txt}</b></span>` +
+          `<span class="stat" title="${escapeHtml(t('ping.real'))}"><i>↓</i><b class="stat-v ${rl.cls}" data-pbase="stat-v" data-ping-real="${escapeHtml(id)}">${rl.txt}</b></span>` +
+          `<span class="stat" title="${escapeHtml(t('ping.upload'))}"><i>↑</i><b class="stat-v ${ul.cls}" data-pbase="stat-v" data-ping-up="${escapeHtml(id)}">${ul.txt}</b></span>` +
         `</span>` +
         `<button class="pi-ping-btn" title="ping">⚡</button>`
       : '';
-    const dot = pingId ? `<span class="q-dot ${tl.cls}" data-ping-dot="${id}"></span>` : '<span class="q-dot"></span>';
+    const dot = pingId ? `<span class="q-dot ${tl.cls}" data-ping-dot="${escapeHtml(id)}"></span>` : '<span class="q-dot"></span>';
     row.innerHTML = `${dot}${badgeHtml}<span class="pi-name">${escapeHtml(name)}</span>${pingPart}`;
     row.onclick = () => { selectServer(id); closePicker(); };
     const pb = row.querySelector('.pi-ping-btn');
@@ -1271,7 +1343,7 @@ function renderPicker() {
     if (chainReady(c)) addRow(c.id, '<span class="proto-badge proto-chain">⛓</span>', c.name, c.id, true);
   }
   for (const s of state.servers) {
-    addRow(s.id, `<span class="proto-badge proto-${s.protocol}">${escapeHtml(s.protocol)}</span>`, s.name, s.id, false);
+    addRow(s.id, `<span class="proto-badge proto-${escapeHtml(s.protocol)}">${escapeHtml(s.protocol)}</span>`, s.name, s.id, false);
   }
 }
 
@@ -1899,9 +1971,29 @@ function renderInspector() {
       ? t('path.rules').replace('{n}', (s.routeRules || []).length)
       : (s.routingMode || 'global');
   }
+  if (state.flavor === 'openwrt') {
+    const n = (s.lanBypassMacs || []).length;
+    // the LIVE gateway, not the switch: connected (on a router a gateway that
+    // did not come up is a failed connect) with the TUN the connection was
+    // built with — a switch flipped since is only pending
+    const gatewayUp = !!state.connected && (!!s.tunMode !== (state.pendingReconnect || []).includes('tunMode'));
+    set('#insGateway', gatewayUp ? t('gw.insWhole') + (n ? ' · ' + t('gw.insDirect').replace('{n}', n) : '') : off, gatewayUp ? 'on' : 'off');
+  }
 }
 
 /* status events from main */
+// The recovery reasons main.js calls a drop (DROP_REASONS there) rather than
+// the network moving: the window says which of the two it was.
+const DROP_REASONS = ['core-exited', 'tunnel-exited', 'reload-failed'];
+function reconnectingKey() {
+  return DROP_REASONS.includes(state.reconnectReason) ? 'state.reconnectingDrop' : 'state.reconnecting';
+}
+/** What a give-up says: a cancelled shutdown, a drop, or the network moving. */
+function failedKey(reason) {
+  if (reason === 'shutdown-cancelled') return 'net.shutdownCancelled';
+  if (reason === 'shutdown-cancelled-partial') return 'net.shutdownCancelledPartial';
+  return DROP_REASONS.includes(reason) ? 'net.dropFailed' : 'net.failed';
+}
 window.api.onStatus((d) => {
   if (d.state === 'connected') {
     state.connected = true;
@@ -1934,7 +2026,7 @@ window.api.onStatus((d) => {
     setConnUI('connecting', d.serverId);
     // the rebuild reapplyConnection() runs is still part of the recovery — keep
     // saying so instead of flashing a bare "Connecting…"
-    if (state.wasReconnecting) $('#connState').textContent = t('state.reconnecting');
+    if (state.wasReconnecting) $('#connState').textContent = t(reconnectingKey());
   } else if (d.state === 'disconnected') {
     state.connected = false;
     state.connecting = false;
@@ -1958,8 +2050,9 @@ window.api.onStatus((d) => {
     state.connected = false;
     state.connecting = true;
     state.wasReconnecting = true;
+    state.reconnectReason = d.reason || '';
     setConnUI('connecting', d.serverId || state.activeServerId);
-    $('#connState').textContent = t('state.reconnecting');
+    $('#connState').textContent = t(reconnectingKey());
   } else if (d.state === 'reconnect-failed') {
     // every retry is spent — the user has to act
     state.connecting = false;
@@ -1982,7 +2075,7 @@ window.api.onStatus((d) => {
     } else {
       state.connected = false;
       setConnUI('error');
-      toast(t('net.failed'), 'err', 8000);
+      toast(t(failedKey(d.reason)), 'err', 8000);
     }
   } else if (d.state === 'cleanup-failed') {
     // The state IS the code; `d.error` carries it too, for a headless consumer.
@@ -2034,10 +2127,12 @@ window.api.onStoreError(reportStoreError);
 
 /* ----------------------------- kill switch ----------------------------- */
 window.api.onKillSwitch((d) => {
+  const wasEngaged = state.killEngaged;
   state.killEngaged = !!(d && d.engaged);
   const banner = $('#killBanner');
   if (banner) banner.hidden = !state.killEngaged;
-  if (state.killEngaged) toast(t('kill.blocked'), 'err');
+  // on the way in only: a second drop under a switch already closed is not news
+  if (state.killEngaged && !wasEngaged) toast(t('kill.blocked'), 'err');
 });
 $('#killDisarm').onclick = async () => {
   // full teardown so the machine returns to normal direct internet
@@ -2390,7 +2485,8 @@ function missingEssentials() {
   const list = [];
   if (!anyXrayCore()) list.push('xray');
   if (!(a.geoip && a.geosite)) list.push('geo');
-  if (want && !a.tun2socks) list.push('tun2socks');
+  // on a router sing-box is the backend and tun2socks never runs
+  if (want && !a.tun2socks && state.flavor !== 'openwrt') list.push('tun2socks');
   if (want && isWin && !a.wintun) list.push('wintun');
   return list;
 }
@@ -2528,7 +2624,7 @@ function renderSubs() {
       <div class="sub-info">
         <div class="sub-name">${escapeHtml(sub.name)}</div>
         <div class="sub-url">${escapeHtml(sub.url)}</div>
-        <div class="sub-meta">${sub.serverCount || 0} ${t('sub.servers')} • ${t('sub.lastUpdate')}: ${timeAgo(sub.lastUpdated)}</div>
+        <div class="sub-meta">${escapeHtml(sub.serverCount || 0)} ${escapeHtml(t('sub.servers'))} • ${escapeHtml(t('sub.lastUpdate'))}: ${escapeHtml(timeAgo(sub.lastUpdated))}</div>
         ${subUsageHtml(sub)}
       </div>
       <div class="sub-actions">
@@ -2623,7 +2719,8 @@ function readServerFields(s) {
   const st = ob.streamSettings || {};
   const f = {
     name: s.name, address: s.address, port: s.port,
-    network: st.network || 'tcp', security: st.security || 'none',
+    // `raw` is tcp under its newer name, and the select has no option for it
+    network: (st.network === 'raw' ? 'tcp' : st.network) || 'tcp', security: st.security || 'none',
     sni: '', host: '', path: '', fp: '', pbk: '', sid: '', alpn: '',
     allowInsecure: false, cred: '', method: '',
     fragment: ob._fragment || '',
@@ -2666,6 +2763,7 @@ function readServerFields(s) {
   else if (st.grpcSettings) { f.path = st.grpcSettings.serviceName || ''; }
   else if (st.httpSettings) { f.path = st.httpSettings.path || ''; f.host = (st.httpSettings.host || []).join(','); }
   else if (st.xhttpSettings) { f.path = st.xhttpSettings.path || ''; f.host = st.xhttpSettings.host || ''; }
+  else if (st.httpupgradeSettings) { f.path = st.httpupgradeSettings.path || ''; f.host = st.httpupgradeSettings.host || ''; }
   else if (st.tcpSettings && st.tcpSettings.header && st.tcpSettings.header.request) {
     const r = st.tcpSettings.header.request;
     f.path = (r.path && r.path[0]) || '';
@@ -2695,9 +2793,11 @@ function setNoiseFields(noise) {
   if (!sel) return;
   const nz = String(noise || '').trim();
   const key = nz.toLowerCase();
-  if (!nz) { sel.value = 'off'; if (custom) custom.value = ''; }
-  else if (NOISE_PRESET_KEYS.includes(key)) { sel.value = key === 'fakehello' ? 'faketls' : key; if (custom) custom.value = ''; }
-  else { sel.value = 'custom'; if (custom) custom.value = nz; }
+  // A preset keeps its own spelling (`fakehello`, `FakeTLS`): mapped onto the
+  // nearest option, a save that changed nothing would rewrite it.
+  if (!nz) { selectValue(sel, 'off'); if (custom) custom.value = ''; }
+  else if (NOISE_PRESET_KEYS.includes(key)) { selectValue(sel, nz); if (custom) custom.value = ''; }
+  else { selectValue(sel, 'custom'); if (custom) custom.value = nz; }
   syncNoiseCustom();
 }
 
@@ -2735,7 +2835,12 @@ async function showServerQr(id) {
   const box = $('#qrImage'); box.innerHTML = '';
   try {
     const qr = qrcode(0, 'L'); qr.addData(link); qr.make();
-    box.innerHTML = qr.createImgTag(4, 6);
+    // A scalable SVG, not createImgTag's fixed-size GIF: a long link (an xhttp
+    // `extra` object, a WireGuard peer) makes a 350px+ bitmap that overflowed the
+    // modal and could not shrink. The SVG takes whatever width the box gives it
+    // and stays crisp. margin 16 = the 4 modules of quiet zone the QR spec asks
+    // for; 6px was 1.5 modules, which scanners refuse.
+    box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 16, scalable: true });
   } catch (e) {
     box.innerHTML = '<p class="hint" style="padding:24px 8px">' + (t('qr.tooBig') || 'Link too long for a QR — use Copy.') + '</p>';
   }
@@ -2753,25 +2858,7 @@ function openEdit(id) {
   editOriginal = s;
   const f = readServerFields(s);
   const proto = s.protocol;
-
-  $('#edName').value = f.name || '';
-  $('#edAddress').value = f.address || '';
-  $('#edPort').value = f.port || '';
-  $('#edCred').value = f.cred || '';
-  $('#edNetwork').value = f.network || 'tcp';
-  $('#edSecurity').value = f.security || 'none';
-  $('#edSni').value = f.sni || '';
-  $('#edHost').value = f.host || '';
-  $('#edPath').value = f.path || '';
-  $('#edFp').value = f.fp || '';
-  $('#edPbk').value = f.pbk || '';
-  $('#edSid').value = f.sid || '';
-  $('#edFragment').value = f.fragment || '';
-  setNoiseFields(f.noise || '');
-  if ($('#edCipherSuites')) $('#edCipherSuites').value = f.cipherSuites || '';
-  if ($('#edFinalMask')) $('#edFinalMask').value = f.finalMask || '';
-  if ($('#edEngine')) $('#edEngine').value = f.engine || 'xray';
-  $('#edInsecure').checked = !!f.allowInsecure;
+  fillEditForm(f, proto);
   // The certificate pinned on first use stands in for "allow insecure" now
   // (certPin.js). Shown abbreviated, the full hash in the tooltip; clearing it
   // makes the next connect read the certificate again.
@@ -2808,12 +2895,41 @@ function openEdit(id) {
   $('#edRealityRow').hidden = !(isStd && $('#edSecurity').value === 'reality');
   updateSpoofLabels();
 
-  if (isProxy) {
+  $('#editModal').hidden = false;
+}
+
+/**
+ * Put a record's form view (readServerFields) into the edit form. What this
+ * shows is what a save sends back, so a save that changes nothing changes
+ * nothing — the main process records a field as the user's edit only when
+ * the submitted value differs from the shown one (parser.applyServerEdits).
+ */
+function fillEditForm(f, proto) {
+  $('#edName').value = f.name || '';
+  $('#edAddress').value = f.address || '';
+  $('#edPort').value = f.port || '';
+  $('#edCred').value = f.cred || '';
+  $('#edNetwork').value = f.network || 'tcp';
+  $('#edSecurity').value = f.security || 'none';
+  $('#edSni').value = f.sni || '';
+  $('#edHost').value = f.host || '';
+  $('#edPath').value = f.path || '';
+  selectValue($('#edFp'), f.fp || '');
+  $('#edPbk').value = f.pbk || '';
+  $('#edSid').value = f.sid || '';
+  $('#edFragment').value = f.fragment || '';
+  setNoiseFields(f.noise || '');
+  if ($('#edCipherSuites')) $('#edCipherSuites').value = f.cipherSuites || '';
+  if ($('#edFinalMask')) $('#edFinalMask').value = f.finalMask || '';
+  if ($('#edEngine')) selectValue($('#edEngine'), f.engine || 'xray');
+  $('#edInsecure').checked = !!f.allowInsecure;
+
+  if (proto === 'socks' || proto === 'http') {
     $('#edProxyUser').value = f.pxUser || '';
     $('#edProxyPass').value = f.pxPass || '';
   }
 
-  if (isWg) {
+  if (proto === 'wireguard') {
     $('#edWgPub').value = f.wgPub || '';
     $('#edWgAddr').value = f.wgAddr || '';
     $('#edWgPsk').value = f.wgPsk || '';
@@ -2822,8 +2938,25 @@ function openEdit(id) {
     $('#edWgAllowed').value = f.wgAllowed || '';
     $('#edWgDns').value = f.wgDns || '';
   }
+}
 
-  $('#editModal').hidden = false;
+/**
+ * Set a <select>, adding the value as an option of its own when the record
+ * holds one the markup does not list (a fingerprint like `qq`, an engine from
+ * a link): otherwise the select reads back as another value, and a save that
+ * changed nothing would rewrite it. Options added for an earlier record go.
+ */
+function selectValue(sel, v) {
+  if (!sel) return;
+  for (const o of [...sel.querySelectorAll('option[data-own]')]) o.remove();
+  if (v && ![...sel.options].some(o => o.value === v)) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = v;
+    o.dataset.own = '1';
+    sel.appendChild(o);
+  }
+  sel.value = v;
 }
 
 function show(sel, on) { const el = $(sel); if (el) el.hidden = !on; }
@@ -2846,7 +2979,7 @@ function updateSpoofLabels() {
   const hintEl = $('#edSpoofHint'); if (hintEl) hintEl.hidden = !on;
   if (!on) return;
 
-  const frontable = ['ws', 'grpc', 'xhttp', 'splithttp', 'h2', 'http'].includes(net);
+  const frontable = ['ws', 'grpc', 'xhttp', 'splithttp', 'h2', 'http', 'httpupgrade'].includes(net);
   let head, sni, hint, showHost;
   if (sec === 'reality') { head = 'spoof.realityTitle'; sni = 'spoof.realitySni'; hint = 'spoof.realityHint'; showHost = false; }
   else if (frontable) { head = 'spoof.frontTitle'; sni = 'spoof.frontSni'; hint = 'spoof.frontHint'; showHost = true; }
@@ -2890,10 +3023,12 @@ $('#editCancel').onclick = closeEdit;
 $('#editModal').onclick = (e) => { if (e.target === $('#editModal')) closeEdit(); };
 if ($('#edNoise')) $('#edNoise').onchange = syncNoiseCustom;
 
-$('#editSave').onclick = async () => {
-  const id = state.editingId;
-  if (!id || !editOriginal) return;
-  const proto = editOriginal.protocol;
+/**
+ * What a save sends: every field of the form, read back from the inputs that
+ * fillEditForm() filled. `orig` is the record being edited.
+ */
+function collectEditFields(orig, clearPin) {
+  const proto = orig.protocol;
   const fields = {
     name: $('#edName').value,
     address: $('#edAddress').value,
@@ -2918,13 +3053,13 @@ $('#editSave').onclick = async () => {
     fields.pbk = $('#edPbk').value.trim();
     fields.sid = $('#edSid').value.trim();
     fields.allowInsecure = $('#edInsecure').checked;
-    if (editClearPin) fields.clearCertPin = true;
+    if (clearPin) fields.clearCertPin = true;
     // patterniha custom-TLS: cipherSuites + finalMask ('' clears them)
     fields.cipherSuites = $('#edCipherSuites') ? $('#edCipherSuites').value.trim() : '';
     fields.finalMask = $('#edFinalMask') ? $('#edFinalMask').value.trim() : '';
     // preserve alpn from original (no field for it)
-    const orig = readServerFields(editOriginal);
-    if (orig.alpn) fields.alpn = orig.alpn;
+    const shown = readServerFields(orig);
+    if (shown.alpn) fields.alpn = shown.alpn;
   } else if (proto === 'wireguard') {
     fields.publicKey = $('#edWgPub').value.trim();
     // `address` above is the ENDPOINT host (#edAddress); the interface address
@@ -2932,9 +3067,6 @@ $('#editSave').onclick = async () => {
     // endpoint with "10.10.10.42/32" and stopped the core from starting.
     fields.localAddress = $('#edWgAddr').value.trim();
     fields.dns = $('#edWgDns').value.trim();
-    // the endpoint field must hold the PUBLIC host — the interface address
-    // pasted here is exactly how the record used to get corrupted
-    if (!String(fields.address).trim() || String(fields.address).includes('/')) return toast(t('t.wgBadEndpoint'), 'err');
     fields.presharedKey = $('#edWgPsk').value.trim();
     fields.mtu = $('#edWgMtu').value;
     fields.reserved = $('#edWgReserved').value.trim();
@@ -2943,6 +3075,19 @@ $('#editSave').onclick = async () => {
     fields.username = $('#edProxyUser').value.trim();
     fields.password = $('#edProxyPass').value.trim();
   }
+
+  return fields;
+}
+
+$('#editSave').onclick = async () => {
+  const id = state.editingId;
+  if (!id || !editOriginal) return;
+  const proto = editOriginal.protocol;
+  const fields = collectEditFields(editOriginal, editClearPin);
+
+  // the endpoint field must hold the PUBLIC host — the interface address
+  // pasted here is exactly how the record used to get corrupted
+  if (proto === 'wireguard' && (!String(fields.address).trim() || String(fields.address).includes('/'))) return toast(t('t.wgBadEndpoint'), 'err');
 
   // finalmask goes to the core untouched, so catch bad JSON here rather than
   // letting xray refuse the whole config at connect time
@@ -3151,10 +3296,10 @@ function renderChains() {
         <span class="proto-badge proto-chain">⛓</span>
         <input class="input chain-name" value="${escapeHtml(chain.name)}" />
         <span class="chain-pings">
-          <span class="pi-ping-ico" title="${escapeHtml(t('ping.tcp'))}">⚡</span><span class="chain-ping ${tl.cls}" data-pbase="chain-ping" data-ping="${chain.id}">${tl.txt}</span>
-          <span class="pi-ping-ico" title="${escapeHtml(t('ping.real'))}">⏱</span><span class="chain-ping ${rl.cls}" data-pbase="chain-ping" data-ping-real="${chain.id}">${rl.txt}</span>
+          <span class="pi-ping-ico" title="${escapeHtml(t('ping.tcp'))}">⚡</span><span class="chain-ping ${tl.cls}" data-pbase="chain-ping" data-ping="${escapeHtml(chain.id)}">${tl.txt}</span>
+          <span class="pi-ping-ico" title="${escapeHtml(t('ping.real'))}">⏱</span><span class="chain-ping ${rl.cls}" data-pbase="chain-ping" data-ping-real="${escapeHtml(chain.id)}">${rl.txt}</span>
         </span>
-        <span class="srv-usage" data-usage="chain:${chain.id}" title="${escapeHtml(t('srv.usage'))}">${usageLabel('chain:' + chain.id)}</span>
+        <span class="srv-usage" data-usage="chain:${escapeHtml(chain.id)}" title="${escapeHtml(t('srv.usage'))}">${usageLabel('chain:' + chain.id)}</span>
         <div class="chain-card-actions">
           <button class="icon-btn ch-ping" title="ping">⚡</button>
           <button class="icon-btn ch-connect" title="connect"${ready ? '' : ' disabled'}>▶</button>
@@ -3195,7 +3340,7 @@ function renderChains() {
       node.draggable = true;
       node.dataset.idx = idx;
       node.innerHTML = `
-        <span class="proto-badge proto-${s.protocol}">${s.protocol}</span>
+        <span class="proto-badge proto-${escapeHtml(s.protocol)}">${escapeHtml(s.protocol)}</span>
         <span class="cn-name">${escapeHtml(s.name)}</span>
         <button class="cn-remove" title="remove">✕</button>`;
       node.querySelector('.cn-remove').onclick = (e) => { e.stopPropagation(); chain.members.splice(idx, 1); persistChains(); };
@@ -3238,7 +3383,7 @@ function renderChains() {
       row.className = 'pool-item';
       row.dataset.name = s.name;
       row.innerHTML = `
-        <span class="proto-badge proto-${s.protocol}">${s.protocol}</span>
+        <span class="proto-badge proto-${escapeHtml(s.protocol)}">${escapeHtml(s.protocol)}</span>
         <span class="pi-name">${escapeHtml(s.name)}</span>
         <span class="pool-add">+ ${escapeHtml(t('chain.add'))}</span>`;
       row.onclick = () => { chain.members.push(s.id); persistChains(); };
@@ -3345,11 +3490,11 @@ function renderPool() {
         </div>
         <div class="pool-field">
           <label class="field-label">${escapeHtml(t('pool.socksPort'))}</label>
-          <input type="number" class="input pool-socks" dir="ltr" value="${entry.socksPort || ''}" />
+          <input type="number" class="input pool-socks" dir="ltr" value="${escapeHtml(entry.socksPort || '')}" />
         </div>
         <div class="pool-field">
           <label class="field-label">${escapeHtml(t('pool.httpPort'))}</label>
-          <input type="number" class="input pool-http" dir="ltr" value="${entry.httpPort || ''}" placeholder="—" />
+          <input type="number" class="input pool-http" dir="ltr" value="${escapeHtml(entry.httpPort || '')}" placeholder="—" />
         </div>
       </div>
       <div class="pool-warn ${valid ? '' : 'warn'}">${escapeHtml(valid ? '' : t('pool.invalidTarget'))}</div>`;

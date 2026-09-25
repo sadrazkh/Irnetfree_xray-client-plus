@@ -80,7 +80,7 @@ Strings for the new tabs live in `src/renderer/plus/<tab>.i18n.js` and are merge
 - **در فایل‌های پلاس** (`xserver/*`، `scan/*`، `renderer/plus/*`) تعارض معنایی ندارد؛ upstream این فایل‌ها را ندارد.
 - اگر یک تعارض در فایل مخزن اصلی *بزرگ* بود، یعنی جایی بیش از حد لازم دست‌کاری شده — منطق را به یک ماژول پلاس منتقل کنید تا دفعهٔ بعد دوباره تکرار نشود.
 
-### Hook sites as of v2.1 (what to re-apply after a conflict)
+### Hook sites as of v2.2 (synced to upstream v1.14.0) (what to re-apply after a conflict)
 
 | Upstream file | Marked lines |
 |---|---|
@@ -93,8 +93,9 @@ Strings for the new tabs live in `src/renderer/plus/<tab>.i18n.js` and are merge
 | `src/renderer/i18n.js` | `extend()` |
 | `src/renderer/styles.css` | `.tb-plus` |
 | `src/main/backup.js`, `src/main/autostart.js`, `src/main/appUpdate.js` | the port guard on restore, the task name, the `IRNetFree-Plus-` asset names |
-| `tests/renderer.test.js`, `tests/appUpdate.test.js`, `tests/backup.test.js`, `tests/autostart.test.js` | the plus file lists and the plus cases |
-| `.github/workflows/release.yml` | the artifact names, `continue-on-error` on the upload |
+| `tests/renderer.test.js`, `tests/appUpdate.test.js`, `tests/backup.test.js`, `tests/autostart.test.js`, `tests/desktopLifecycle.test.js` | the plus file lists and the plus cases; the `const xserver = null` line in the ready-to-show sandbox |
+| `.github/workflows/release.yml` | the artifact names (the OpenWrt job’s `IRNetFree-Plus-OpenWrt` too), `continue-on-error` on the upload |
+| `package.json` | the identity block, the `IRNetFree-Plus-` artifact names, the `probe:reverse` / `probe:dns` scripts |
 
 In upstream files, **upstream wins**: resolve with their side, then re-apply the marked hook lines. Plus's own files never conflict, because upstream does not have them. A large conflict in an upstream file is a signal that something belongs in a Plus module instead.
 

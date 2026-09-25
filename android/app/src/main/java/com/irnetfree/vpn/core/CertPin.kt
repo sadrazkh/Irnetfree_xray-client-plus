@@ -46,7 +46,40 @@ object CertPin {
      * not complete a handshake (a uTLS-only server may refuse a plain one) — the
      * caller then leaves verification to the core.
      */
-    fun fetchLeafPin(host: String, port: Int, servername: String?, timeoutMs: Int = 5000): String {
+    fun fetchLeafPin(host: String, port: Int, servername: String?, timeoutMs: Int = 5000): String =
+        withLeaf(host, port, servername, timeoutMs) { leaf, _ -> pinOf(leaf.encoded) }
+
+    /**
+     * Who is actually answering for this name, in one line.
+     *
+     * When a TLS handshake fails there is no way to tell a censored panel from
+     * a broken one without looking at the certificate the other end sent, and
+     * the JSSE exception never carries it. This dials again with verification
+     * off and reports what came back: the address it reached, the name on the
+     * certificate and who issued it. On the owner's network a middlebox answers
+     * every name with its own certificate, and this is what makes that visible
+     * rather than a guess.
+     *
+     * Diagnostics only — nothing trusts the result.
+     */
+    fun describeLeaf(host: String, port: Int, servername: String? = host, timeoutMs: Int = 5000): String = try {
+        withLeaf(host, port, servername, timeoutMs) { leaf, peer ->
+            val subject = shortName(leaf.subjectX500Principal?.name)
+            val issuer = shortName(leaf.issuerX500Principal?.name)
+            "$peer presented \"$subject\" issued by \"$issuer\""
+        }
+    } catch (t: Throwable) {
+        "could not read the certificate (${t.message ?: t.javaClass.simpleName})"
+    }
+
+    /** CN if there is one, else the whole DN — an X.500 name is unreadable in a toast. */
+    private fun shortName(dn: String?): String {
+        val s = dn ?: return "?"
+        return Regex("CN=([^,]+)").find(s)?.groupValues?.get(1)?.trim() ?: s
+    }
+
+    /** One trust-all handshake; [use] gets the leaf certificate and the address reached. */
+    private fun <T> withLeaf(host: String, port: Int, servername: String?, timeoutMs: Int, use: (X509Certificate, String) -> T): T {
         val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
             override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
@@ -68,7 +101,9 @@ object CertPin {
             sock.startHandshake()
             val certs = sock.session.peerCertificates
             if (certs.isEmpty()) throw IllegalStateException("the server presented no certificate")
-            return pinOf(certs[0].encoded)
+            val leaf = certs[0] as? X509Certificate ?: throw IllegalStateException("not an X.509 certificate")
+            val peer = sock.inetAddress?.hostAddress ?: host
+            return use(leaf, peer)
         } finally { runCatching { sock.close() } }
     }
 
@@ -142,5 +177,84 @@ object CertPin {
     fun recheckDue(server: ServerConfig, now: Long = System.currentTimeMillis(), maxAgeMs: Long = RECHECK_AFTER_MS): Boolean {
         if (normalizePin(server.certPin).isEmpty()) return false
         return now - server.certPinCheckedAt >= maxAgeMs
+    }
+
+    /* ----------------------------- one connect's pins, applied by id ----------------------------- */
+
+    /**
+     * What one connect learnt about the certificate of the record [id]: when
+     * it was checked, and — unless [pin] is null — the pin itself ("" = the old
+     * one is gone). [address], [port] and [sni] are where it was learnt; a
+     * record that dials somewhere else by the time it is applied does not take it.
+     */
+    data class PinUpdate(val id: String, val address: String, val port: Int, val sni: String, val checkedAt: Long, val pin: String? = null, val pinAt: String = "")
+
+    /** The name the probe presents: the record's serverName, else its address. */
+    fun sniOf(s: ServerConfig): String =
+        s.outbound.optJSONObject("streamSettings")?.optJSONObject("tlsSettings")?.optString("serverName")?.takeIf { it.isNotBlank() } ?: s.address
+
+    /**
+     * The pins this plan needs, learnt from the live servers — and written
+     * nowhere: the caller applies them by id (applyPins) where the store's
+     * lists are written, the main thread. [fetch] is fetchLeafPin on the
+     * device and throws when a server completes no handshake. Blocks.
+     *
+     *  - a pin due for its re-check (RECHECK_AFTER_MS: a rotated certificate
+     *    makes the core refuse every dial, and it says so only at log level
+     *    info) is compared with what the server presents now — the same, only
+     *    the time of the check moves; different, the old pin goes and the one
+     *    presented now is pinned; unreachable is not a verdict;
+     *  - a server the phone dials itself that asked for allowInsecure and has
+     *    no pin yet is pinned on first use.
+     */
+    fun learn(plan: ConnectionPlan, now: Long, fetch: (ServerConfig) -> String, log: (String) -> Unit = {}): List<PinUpdate> {
+        val targets = pinTargets(plan)
+        for (b in targets.behind) log("${b.name} sits behind a proxy; its certificate cannot be pinned automatically — connect to it directly once to pin it")
+        val out = LinkedHashMap<String, PinUpdate>()
+        fun update(s: ServerConfig, pin: String?, pinAt: String = "") = PinUpdate(s.id, s.address, s.port, sniOf(s), now, pin, pinAt)
+        val probe = ArrayList(targets.probe)
+        for (srv in directServers(plan).filter { recheckDue(it, now) }) {
+            val live = normalizePin(runCatching { fetch(srv) }.getOrNull())
+            if (live.isNotEmpty() && live != normalizePin(srv.certPin)) {
+                out[srv.id] = update(srv, "")
+                log("Certificate changed for ${srv.name} — the old pin is gone; the one it presents now will be pinned instead")
+                if (probe.none { it.id == srv.id }) probe.add(srv)
+            } else {
+                out[srv.id] = update(srv, null)
+            }
+        }
+        for (srv in probe) {
+            try {
+                val pin = fetch(srv)
+                out[srv.id] = update(srv, pin, java.util.Date(now).toString())
+                log("Certificate pinned on first use for ${srv.name}: $pin")
+            } catch (e: Exception) {
+                log("Could not read the certificate of ${srv.name} to pin it (${e.message}) — the core will verify it itself")
+            }
+        }
+        return ArrayList(out.values)
+    }
+
+    /**
+     * Write [updates] into [servers] by id, onto the record that holds the id
+     * NOW: a subscription refresh may have rebuilt the list since they were
+     * learnt (another order, records replaced by the panel's fresh copies,
+     * some gone). Only the pin fields move. A record gone, or one that dials
+     * another address, port or name by now, is left alone. True when anything
+     * changed. Call it where the list is written — the main thread.
+     */
+    fun applyPins(servers: MutableList<ServerConfig>, updates: List<PinUpdate>): Boolean {
+        var changed = false
+        for (u in updates) {
+            val i = servers.indexOfFirst { it.id == u.id }
+            if (i < 0) continue
+            val s = servers[i]
+            if (s.address != u.address || s.port != u.port || sniOf(s) != u.sni) continue
+            val pin = u.pin
+            servers[i] = if (pin == null) s.copy(certPinCheckedAt = u.checkedAt)
+                else s.copy(certPin = pin, certPinAt = u.pinAt, certPinCheckedAt = u.checkedAt)
+            changed = true
+        }
+        return changed
     }
 }
