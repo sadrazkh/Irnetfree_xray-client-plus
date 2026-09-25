@@ -31,6 +31,10 @@
 .scan-ips { min-block-size: 130px; }
 .scan-ip-actions { align-items: center; margin-block-start: 10px; }
 .scan-num { inline-size: 82px; flex: 0 0 auto; }
+/* the pick segment sits in the actions row; the seg’s own bottom margin would push the row apart */
+.scan-pick { margin-block-end: 0; }
+.scan-pick-opts { align-items: center; flex-wrap: wrap; margin-block-start: 8px; }
+.scan-inline-label { margin: 0; }
 .scan-count {
   font-family: var(--mono);
   font-size: 11px;

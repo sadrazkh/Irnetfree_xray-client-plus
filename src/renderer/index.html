@@ -801,11 +801,21 @@
             <textarea id="scanIps" class="textarea scan-ips" rows="7" dir="ltr" spellcheck="false" data-i18n-ph="scan.ipsPh"></textarea>
             <div class="row-gap scan-ip-actions">
               <button class="btn ghost small" id="btnScanCf" data-i18n="scan.cf">رنج‌های کلودفلر</button>
-              <button class="btn ghost small" id="btnScanSample" data-i18n="scan.sample">نمونهٔ تصادفی</button>
-              <input type="number" id="scanSampleN" class="input scan-num" dir="ltr" min="1" max="5000" value="100" data-i18n-title="scan.sampleN" />
               <button class="btn ghost small" id="btnScanFile" data-i18n="scan.file">از فایل</button>
+              <!-- how main reads the box: every address, or a fresh draw per range on every start -->
+              <div class="seg scan-pick" id="scanPickSeg">
+                <button type="button" class="seg-btn active" data-pick="all" data-i18n="scan.pick.all">همهٔ آدرس‌ها</button>
+                <button type="button" class="seg-btn" data-pick="random" data-i18n="scan.pick.random">تصادفی از هر رنج</button>
+              </div>
               <input type="file" id="scanFile" accept=".txt,.csv,.log,text/plain" class="vis-hidden" tabindex="-1" aria-hidden="true" />
               <span class="scan-count" id="scanCount"></span>
+            </div>
+            <div class="row-gap scan-pick-opts" id="scanPickOpts" hidden>
+              <label class="field-label scan-inline-label" for="scanPerRange" data-i18n="scan.perRange">از هر رنج</label>
+              <input type="number" id="scanPerRange" class="input scan-num" dir="ltr" min="1" max="5000" value="20" data-i18n-title="scan.perRangeHint" />
+              <label class="scan-check"><input type="checkbox" id="scanFresh" checked /><span class="scan-check-label" data-i18n="scan.fresh">فقط آدرس‌های تست‌نشده</span></label>
+              <button class="btn ghost small" id="btnScanForget" data-i18n="scan.forget">فراموش کردن تاریخچه</button>
+              <span class="scan-count" id="scanTested" hidden></span>
             </div>
           </div>
 

@@ -155,6 +155,7 @@
     scanPresets: () => invoke('scan:presets'),
     scanApply: (req) => invoke('scan:apply', req),
     scanExport: (req) => invoke('scan:export', req),
+    scanForget: () => invoke('scan:forget'),
     onScanProgress: (cb) => on('scan-progress', cb),
 
     // events

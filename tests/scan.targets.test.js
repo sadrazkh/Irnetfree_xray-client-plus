@@ -134,3 +134,78 @@ test('CF_IPV4_RANGES are 15 valid IPv4 CIDRs', () => {
   assert.ok(CF_IPV4_RANGES.includes('104.16.0.0/13'));
   assert.ok(CF_IPV4_RANGES.includes('172.64.0.0/13'));
 });
+
+/* ----------------------------- drawTargets (v2.2) ----------------------------- */
+
+const { drawTargets, ip4ToInt } = require('../src/main/scan/targets');
+const countIn = (ips, lo, hi) => ips.filter(ip => inRange(ip, lo, hi)).length;
+
+test('drawTargets: perRange from every range, in the order written, distinct, and the same seed gives the same draw', () => {
+  const r = drawTargets('1.1.1.0/24\n2.2.2.0/24', { perRange: 3, rng: seeded(7) });
+  assert.equal(r.ips.length, 6);
+  assert.equal(countIn(r.ips.slice(0, 3), '1.1.1.0', '1.1.1.255'), 3, 'the first range comes first');
+  assert.equal(countIn(r.ips.slice(3), '2.2.2.0', '2.2.2.255'), 3);
+  assert.equal(new Set(r.ips).size, 6);
+  assert.deepEqual([r.ranges, r.exhausted, r.truncated, r.errors], [2, 0, false, []]);
+  assert.deepEqual(drawTargets('1.1.1.0/24\n2.2.2.0/24', { perRange: 3, rng: seeded(7) }), r);
+  assert.notDeepEqual(drawTargets('1.1.1.0/24\n2.2.2.0/24', { perRange: 3, rng: seeded(8) }).ips, r.ips);
+});
+
+test('drawTargets: a range smaller than perRange gives all of it; bad lines are reported and skipped', () => {
+  const r = drawTargets('1.1.1.1-1.1.1.2\nnot-an-ip\n3.3.3.3', { perRange: 5, rng: seeded(1) });
+  assert.deepEqual(r.ips.slice().sort(), ['1.1.1.1', '1.1.1.2', '3.3.3.3']);
+  assert.deepEqual(r.errors.map(e => e.line), [2]);
+  assert.equal(r.ranges, 2);
+  assert.deepEqual(drawTargets('', { perRange: 5 }), { ips: [], errors: [], ranges: 0, exhausted: 0, truncated: false });
+});
+
+test('drawTargets: the cap cuts the last ranges; reaching it exactly is not a truncation', () => {
+  const text = '1.1.1.0/24\n2.2.2.0/24\n3.3.3.0/24';
+  const cut = drawTargets(text, { perRange: 10, max: 25, rng: seeded(2) });
+  assert.equal(cut.ips.length, 25);
+  assert.equal(cut.truncated, true);
+  assert.equal(countIn(cut.ips, '3.3.3.0', '3.3.3.255'), 5, 'the third range is what got cut');
+  const exact = drawTargets(text, { perRange: 10, max: 30, rng: seeded(2) });
+  assert.equal(exact.ips.length, 30);
+  assert.equal(exact.truncated, false);
+});
+
+test('drawTargets: addresses tested before are skipped while others remain, and come back — counted as exhausted — only when a range has run out', () => {
+  const exclude = new Set([ip4ToInt('1.1.1.0'), ip4ToInt('1.1.1.1')]);
+  const fresh = drawTargets('1.1.1.0/30', { perRange: 2, exclude, rng: seeded(3) });
+  assert.deepEqual(fresh.ips.slice().sort(), ['1.1.1.2', '1.1.1.3']);
+  assert.equal(fresh.exhausted, 0);
+  const more = drawTargets('1.1.1.0/30', { perRange: 3, exclude, rng: seeded(3) });
+  assert.equal(more.ips.length, 3);
+  assert.ok(more.ips.includes('1.1.1.2') && more.ips.includes('1.1.1.3'), 'the two fresh ones are always in');
+  assert.equal(more.exhausted, 1);
+  // the tested ones are not what a fresh draw across two ranges reaches for
+  const two = drawTargets('1.1.1.0/30\n2.2.2.0/30', { perRange: 2, exclude, rng: seeded(4) });
+  assert.equal(two.exhausted, 0);
+  assert.equal(two.ips.some(ip => exclude.has(ip4ToInt(ip))), false);
+});
+
+test('drawTargets over a big block: inside it, none of the excluded, fast, and a new draw every call', () => {
+  const exclude = new Set();
+  const rnd = seeded(5);
+  for (let i = 0; i < 1000; i++) exclude.add(ip4ToInt('104.16.0.0') + Math.floor(rnd() * 2 ** 19));
+  const t0 = Date.now();
+  const r = drawTargets('104.16.0.0/13', { perRange: 200, exclude, rng: seeded(6) });
+  assert.ok(Date.now() - t0 < 300);
+  assert.equal(r.ips.length, 200);
+  assert.equal(new Set(r.ips).size, 200);
+  for (const ip of r.ips) { assert.ok(inRange(ip, '104.16.0.0', '104.23.255.255'), ip); assert.equal(exclude.has(ip4ToInt(ip)), false, ip); }
+  assert.equal(r.exhausted, 0);
+  const a = drawTargets('104.16.0.0/13', { perRange: 20 }).ips, b = drawTargets('104.16.0.0/13', { perRange: 20 }).ips;
+  assert.notDeepEqual(a, b, 'Math.random: two runs are two samples');
+});
+
+test('drawTargets: the same block written twice does not repeat an address; a big block fully drawn stops at what it has', () => {
+  const twice = drawTargets('1.1.1.0/30\n1.1.1.0/30', { perRange: 4, rng: seeded(9) });
+  assert.equal(twice.ips.length, 4);
+  assert.equal(new Set(twice.ips).size, 4);
+  assert.equal(twice.ranges, 2);
+  const big = drawTargets('10.0.0.0/19\n10.0.0.0/19', { perRange: 8192, max: 100000, rng: seeded(10) });
+  assert.equal(big.ips.length, 8192, 'the second copy finds every address already taken and gives up');
+  assert.equal(new Set(big.ips).size, 8192);
+});
