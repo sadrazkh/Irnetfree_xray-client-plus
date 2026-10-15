@@ -994,14 +994,17 @@ test('xserver:wizard — portal and bridge go through applyModel and come back w
   assert.deepEqual(b.model.routing.rules.at(-1).inboundTags, ['bridge']);
 }));
 
-test('xserver:coreInfo — the installed core, the channel from the settings, and GitHub only when asked', withChannels({ data: { xserver: model() } }, async (h) => {
+test('xserver:coreInfo — the installed core, and what a download would install only when asked', withChannels({ data: { xserver: model() } }, async (h) => {
   const off = await h.call('xserver:coreInfo');
   assert.equal(off.engine, 'xray');
   assert.equal(off.installed, true);
-  assert.equal(off.channel, 'stable');
-  assert.equal(off.latestAny, null);
-  h.ctx.latestVersion = async (id, channel) => (channel === 'latest' ? '26.9.9' : '26.3.27');
+  assert.equal(off.latest, null);
+  assert.deepEqual(Object.keys(off).sort(), ['engine', 'installed', 'latest', 'version']);
+  const asked = [];
+  h.ctx.latestVersion = async (id) => { asked.push(id); return '26.10.10'; };
   const on = await h.call('xserver:coreInfo', { online: true });
-  assert.equal(on.latestStable, '26.3.27');
-  assert.equal(on.latestAny, '26.9.9');
+  assert.equal(on.latest, '26.10.10');
+  assert.deepEqual(asked, ['xray']);
+  h.ctx.latestVersion = async () => { throw new Error('offline'); };
+  assert.equal((await h.call('xserver:coreInfo', { online: true })).latest, null);
 }));

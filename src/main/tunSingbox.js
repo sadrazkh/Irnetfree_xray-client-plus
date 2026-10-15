@@ -113,8 +113,18 @@ function normalizeAppNames(names) {
  *   2. `{ process_name: names, outbound: mode === 'exclude' ? 'direct' : 'socks-out' }`.
  * `route.final` becomes `mode === 'exclude' ? 'socks-out' : 'direct'` — the
  * unlisted apps get the opposite of what the listed ones get.
+ *
+ * `udpTimeout`: the router's alone (TunOpenwrt passes it, writeConfig takes
+ * it only when composed by it). A positive whole number of seconds becomes the
+ * inbound's `udp_timeout` — a JSON number, which every sing-box from 1.7.8 to
+ * 1.14 reads as seconds — after every other key; anything else leaves the
+ * output exactly as v1.16.1 built it (tests/desktopPin.test.js).
+ *
+ * `dnsMode`: the inbound's `dns_mode` (sing-box 1.14+, tunDnsModeFor) after
+ * every other key; null (the default, and every sing-box before 1.14) leaves
+ * the key out — the output of before.
  */
-function buildTunConfig({ socksPort, excludeIps = [], ipv6 = false, strict = false, stack = 'system', mtu = 1500, interfaceName = TUN_IF, apps = null } = {}) {
+function buildTunConfig({ socksPort, excludeIps = [], ipv6 = false, strict = false, stack = 'system', mtu = 1500, interfaceName = TUN_IF, apps = null, udpTimeout = null, dnsMode = null } = {}) {
   void ipv6;
   const inbound = { type: 'tun', tag: 'tun-in' };
   if (interfaceName) inbound.interface_name = interfaceName;
@@ -124,6 +134,9 @@ function buildTunConfig({ socksPort, excludeIps = [], ipv6 = false, strict = fal
   inbound.strict_route = !!strict;
   inbound.stack = stack;
   inbound.route_exclude_address = excludeIps.filter(Boolean).map(cidrOf);
+  if (Number.isInteger(udpTimeout) && udpTimeout > 0) inbound.udp_timeout = udpTimeout;
+  // sing-box 1.14+ only (tunDnsModeFor): a key the older cores refuse
+  if (dnsMode === 'disabled' || dnsMode === 'native' || dnsMode === 'hijack') inbound.dns_mode = dnsMode;
 
   const outbounds = [{ type: 'socks', tag: 'socks-out', server: '127.0.0.1', server_port: socksPort, version: '5' }];
   const route = { final: 'socks-out', auto_detect_interface: true };
@@ -153,6 +166,39 @@ function buildTunConfig({ socksPort, excludeIps = [], ipv6 = false, strict = fal
   };
 }
 
+/**
+ * The TUN inbound's `dns_mode` for a sing-box `version` ('1.14.3', 'sing-box
+ * version 1.13.14', …) under the app's DNS policy.
+ *
+ * sing-box 1.14.0 added `dns_mode`, and under auto_route its default is
+ * `hijack`: it sets the interface DNS itself and answers every query to
+ * `dns_address` — by default the address after the TUN's own, 172.19.0.2,
+ * the very peer the app makes the adapter's resolver — with its OWN resolver.
+ * This config carries no DNS of its own, so those queries never reached Xray:
+ * a WireGuard target's private names stopped resolving ("name not resolved")
+ * and the rest left through the system resolver — a DNS leak. Here sing-box is
+ * only the TUN → SOCKS forwarder and the app owns DNS (the adapter's resolver
+ * is set by netsh / networksetup, the managed DNS and the port-53 hijack are
+ * Xray's), so from 1.14 on: 'disabled' — no interface DNS, no hijack, every
+ * query goes on to Xray as it did on 1.13.
+ *
+ * null — the key left out — before 1.14 (it does not exist there and the
+ * config would be refused), for a version that cannot be read, and for
+ * `policy` 'core': the user's own choice (Settings) to leave DNS to sing-box.
+ */
+const DNS_MODE_SINCE = [1, 14];
+function tunDnsModeFor(version, policy) {
+  if (policy === 'core') return null;
+  const m = /(\d+)\.(\d+)\.\d+/.exec(String(version == null ? '' : version));
+  if (!m) return null;
+  const major = Number(m[1]), minor = Number(m[2]);
+  const has = major > DNS_MODE_SINCE[0] || (major === DNS_MODE_SINCE[0] && minor >= DNS_MODE_SINCE[1]);
+  return has ? 'disabled' : null;
+}
+
+/** `<bin> version` once per binary (path, size, mtime): a download or the version picker replaces it. */
+const versionCache = new Map();
+
 const { buildMacSetupScript, buildMacTeardownScript, assertIps } = require('./macTunScripts');
 // Keep overlapping Connect/Disconnect calls from recovering another live
 // instance's session in this process. Crash recovery starts with an empty map.
@@ -174,6 +220,10 @@ class TunSingbox {
     this.onLog = opts.onLog || (() => {});
     this.lang = opts.lang || 'fa';   // user-facing error language
     this.platform = opts.platform || os.platform();
+    // Who wraps this backend: 'openwrt' when the router's gateway
+    // (tunOpenwrt.js) composes it — the advice meant for a desktop Linux
+    // ("set your resolver to the peer") is then wrong, so it is not given.
+    this.composedBy = opts.composedBy || null;
     this.backendId = 'sing-box';
     this.interfaceName = TUN_IF;
     this.dnsPeer = TUN_PEER4;
@@ -312,12 +362,50 @@ class TunSingbox {
     return ips;
   }
 
+  /**
+   * The sing-box binary's version ('1.14.3'), '' when it cannot be read: `<bin>
+   * version`, run once per binary (path, size, mtime — a new download or a
+   * version picked in Required files is another binary).
+   */
+  singboxVersion(bin) {
+    if (!bin) return '';
+    try {
+      const st = fs.statSync(bin);
+      const key = `${bin}|${st.size}|${st.mtimeMs}`;
+      if (versionCache.has(key)) return versionCache.get(key);
+      const out = execFileSync(bin, ['version'], { cwd: path.dirname(bin), timeout: 5000, windowsHide: true, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const m = /(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)/.exec(String(out || ''));
+      const version = m ? m[1] : '';
+      versionCache.set(key, version);
+      return version;
+    } catch { return ''; }
+  }
+
+  /**
+   * The inbound's dns_mode for the binary that will run it (tunDnsModeFor),
+   * said once in the log. The router's resolver is dnsmasq, never sing-box:
+   * there the app's policy always holds. On a desktop `opts.dnsPolicy` 'core'
+   * is the user's "leave DNS to sing-box" (never under the strict guard: main.js).
+   */
+  dnsModeFor(opts) {
+    const version = this.singboxVersion(this.singboxPath());
+    const policy = this.composedBy === 'openwrt' ? 'app' : (opts && opts.dnsPolicy === 'core' ? 'core' : 'app');
+    const mode = tunDnsModeFor(version, policy);
+    if (!version) this.onLog('sing-box: its version could not be read — the TUN config leaves DNS to its default (1.14+ answers DNS itself)', 'warn');
+    else if (mode) this.onLog(`sing-box ${version}: dns_mode disabled — every DNS query goes on to Xray`, 'info');
+    else if (policy === 'core' && tunDnsModeFor(version, 'app')) this.onLog(`sing-box ${version}: DNS left to sing-box (Settings) — Xray's DNS rules and private WireGuard names are bypassed`, 'warn');
+    return mode;
+  }
+
   writeConfig(socksPort, excludeIps, opts, interfaceName) {
     const base = this.platform === 'darwin' && this.userData ? path.join(this.userData, 'mac-tun-sessions') : os.tmpdir();
     fs.mkdirSync(base, { recursive: true, mode: 0o700 });
     const work = fs.mkdtempSync(path.join(base, 'irnf-sb-'));
     const cfgFile = path.join(work, 'sing-box.json');
-    const cfg = buildTunConfig({ socksPort, excludeIps, ipv6: !!opts.ipv6, strict: !!opts.strict, interfaceName, apps: opts.apps || null });
+    // udpTimeout is the router's (TunOpenwrt); a desktop caller cannot set it
+    const udpTimeout = this.composedBy === 'openwrt' ? opts.udpTimeout : null;
+    const dnsMode = this.dnsModeFor(opts);
+    const cfg = buildTunConfig({ socksPort, excludeIps, ipv6: !!opts.ipv6, strict: !!opts.strict, interfaceName, apps: opts.apps || null, udpTimeout, dnsMode });
     fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2));
     this.work = work;
     return { work, cfgFile };
@@ -714,7 +802,10 @@ class TunSingbox {
     }
     // auto_route lays the routes; the resolver is left alone (resolv.conf /
     // systemd-resolved differ per distro) — point it at the peer if needed.
-    this.onLog(`TUN started on ${TUN_IF} (routes by sing-box; set your resolver to ${TUN_PEER4} if needed).`, 'warn');
+    // Not on a router: dnsmasq stays the LAN's resolver there and every
+    // port-53 packet already enters the tunnel; the gateway says its own line
+    // once it has verified the routes (TunOpenwrt.start).
+    if (this.composedBy !== 'openwrt') this.onLog(`TUN started on ${TUN_IF} (routes by sing-box; set your resolver to ${TUN_PEER4} if needed).`, 'warn');
     this.active = true;
   }
 
@@ -811,6 +902,6 @@ class TunSingbox {
 }
 
 module.exports = {
-  TunSingbox, buildTunConfig, buildMacSetupScript, buildMacTeardownScript, cidrOf,
+  TunSingbox, buildTunConfig, tunDnsModeFor, buildMacSetupScript, buildMacTeardownScript, cidrOf,
   TUN_IF, TUN_ADDR4, TUN_PEER4, TUN_ADDR6, TUN_PEER6
 };

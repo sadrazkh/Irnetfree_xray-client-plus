@@ -14,21 +14,23 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
-const { parseMany, parseLink, makeWireguardServer, makeProxyServer, applyServerEdits, buildShareLink, migrateStoredServer, parseWireguardConf } = require('../main/parser');
-const { buildConfig, buildTestConfig, buildMultiTestConfig, resolverBypassIpsOf, wgEndpointHosts, wgResolverAddresses, entryHosts } = require('../main/configBuilder');
-const { adapterDnsServers, guardPeers } = require('../main/dnsBuilder');
+const { parseMany, parseLink, makeWireguardServer, makeProxyServer, createServer, applyServerEdits, buildShareLink, migrateStoredServer, parseWireguardConf } = require('../main/parser');
+const { buildConfig, buildTestConfig, buildMultiTestConfig, resolverBypassIpsOf, echResolverIpsOf, wgEndpointHosts, wgResolverAddresses, entryHosts, buildRawConfig, rawServerOf, rawModeNotes, entryAddressesOf, rawApplies, dialerTagsOf } = require('../main/configBuilder');
+const { latencyTest, testsAlone, udpOnly } = require('../main/latencyTest');
+const { adapterDnsServers, guardPeers, resolverIp, routerDnsTuning } = require('../main/dnsBuilder');
 const { buildSingboxConfig } = require('../main/singboxBuilder');
 const { engineFormat } = require('../main/engines');
 const { chooseEngine, testEngineFor } = require('../main/engineChoice');
+const { muxMode, muxCandidates, decideMux, probeMux, rememberVerdicts, markRecheck, muxFingerprint, PROBE_PARALLEL } = require('../main/mux');
 const { resolveHost } = require('../main/trustedDns');
 const { fetchLeafPin, pinTargets, directServers, staleCertPins, recheckDue, PinWatch } = require('../main/certPin');
 const { assetStatus: scanAssets, downloadedFileNames } = require('../main/assets');
 const { geoTokensOf, checkGeoTokens, geoCodeHint } = require('../main/geoCheck');
-const { XrayManager, getFreePort, getFreePorts } = require('../main/xrayManager');
+const { XrayManager, getFreePort, getFreePorts, versionBelow } = require('../main/xrayManager');
 const { setSystemProxy, useProxyJournal, repairSystemProxy, restoreSystemProxySync } = require('../main/sysproxy');
 const { tcpPing, httpThroughProxy, uploadThroughProxy, ipInfo, pLimit } = require('../main/netutils');
 const { Store } = require('../main/store');
-const { SubscriptionManager } = require('../main/subscription');
+const { SubscriptionManager, serverIdentity } = require('../main/subscription');
 const { TunManager, isOwnTunInterface, TUN_GW } = require('../main/tunManager');
 const { TunSingbox } = require('../main/tunSingbox');
 const { NativeMacTun } = require('../main/nativeMacTun');
@@ -45,19 +47,31 @@ const { Downloader } = require('../main/downloader');
 const { listProcesses, collectProcessIps, pruneProcCache, ProcWatcher } = require('../main/procRouter');
 const { pendingReconnectKeys, snapshotApplied } = require('../main/settingsMeta');
 const { migrateSettings } = require('../main/settingsMigrate');
+const { migrateProfiles, mirrorToSettings, mirrorFromSettings, isAdvancedSelection, profileIdOf, selectionIdOf, resolveBaseTargets, advancedTargets, resolveProcessRules, liveRoutingOf, routingPendingKeys } = require('../main/routingProfiles');
 const { NetWatcher, fingerprint } = require('../main/netWatcher');
+const { createWanWatcher, decide: decideWanChange } = require('../main/wanWatch');
 const { exportBundle, importBundle } = require('../main/backup');
+const { createRouteShareApi } = require('../main/routeShare');
 const { AssetUpdater } = require('../main/assetUpdater');
+const { CORE_IDS, createCoreVersionsApi } = require('../main/coreVersions');
+const { warpHandler } = require('../main/warp');
 // OpenWrt: the router as the LAN's tunnel — the gateway backend and the device
 // list (docs/superpowers/specs/2026-09-23-openwrt-port-design.md). main.js is
 // deliberately NOT given this: Electron never runs on a router.
-const { isOpenwrt, lanInterface, lanDevices, validMacs, ownOrphanCores } = require('../main/openwrtNet');
+const { isOpenwrt, lanInterface, lanDevices, validMacs, ownOrphanCores, normalizeCidrs } = require('../main/openwrtNet');
 const { TunOpenwrt } = require('../main/tunOpenwrt');
+const { createKillSwitch } = require('../main/killSwitchOpenwrt');
+const { createLogRing } = require('./logRing');
 const tcpNet = require('net');
 
-/** Resolves true once 127.0.0.1:port accepts a TCP connection, false at the deadline. */
-function waitForLocalPort(port, ms) {
+/**
+ * Resolves true once 127.0.0.1:port accepts a TCP connection, false at the
+ * deadline — or as soon as `opts.stop()` says there is no point (the core
+ * that would open it is gone).
+ */
+function waitForLocalPort(port, ms, opts = {}) {
   const deadline = Date.now() + ms;
+  const stop = typeof opts.stop === 'function' ? opts.stop : () => false;
   const tryOnce = () => new Promise((resolve) => {
     const s = tcpNet.connect({ host: '127.0.0.1', port, timeout: 1000 });
     s.once('connect', () => { s.destroy(); resolve(true); });
@@ -67,7 +81,7 @@ function waitForLocalPort(port, ms) {
   return (async () => {
     for (;;) {
       if (await tryOnce()) return true;
-      if (Date.now() >= deadline) return false;
+      if (Date.now() >= deadline || stop()) return false;
       await new Promise(r => setTimeout(r, 300));
     }
   })();
@@ -110,6 +124,11 @@ const DEFAULT_SETTINGS = {
   // leak guard under TUN: 'off' | 'standard' (adapter DNS override) | 'strict'
   // (+ strict_route and a firewall for everything off the tunnel)
   leakGuard: 'standard',
+  // who answers DNS inside the sing-box TUN (tunSingbox.tunDnsModeFor): 'app' —
+  // sing-box 1.14+ gets dns_mode "disabled" and every query reaches Xray — or
+  // 'core', sing-box's own default (1.14+: it answers them itself). Never 'core'
+  // under the strict guard; the router's is always the app's.
+  singboxDns: 'app',
   // proxy mode only: block outbound UDP except :53 on physical adapters (WebRTC)
   blockUdpInProxyMode: false,
   // per-app split under the sing-box TUN (see tunApps.js): 'off' | 'exclude'
@@ -146,7 +165,6 @@ const DEFAULT_SETTINGS = {
   // weekly refresh of the downloaded files, never under a live tunnel:
   // 'off' | 'geo' (the data files only — the default) | 'all' (the cores too)
   autoUpdateAssets: 'geo',
-  coreChannel: 'stable',   // plus: 'latest' follows the official core's 26.9.x pre-releases
   // which surfaces the window shows: 'simple' hides chains, the pool, the log
   // page and the custom-rule editor. A view preference only — renderer-owned,
   // never baked into a config, so it needs no reconnect.
@@ -155,8 +173,18 @@ const DEFAULT_SETTINGS = {
   skin: 'console',
   theme: 'dark',
   defaultEngine: 'xray',
+  // mux on the servers' own outbounds (mux.js): 'auto' tests each ws /
+  // httpupgrade server once and muxes it where it works, 'on' every such
+  // server untested, 'off' never — the default: nothing changes unless the
+  // user turns it on. Written into the config: a reconnect key.
+  mux: 'off',
   lang: 'fa'
 };
+
+/** The official core the LAN's DNS plan was verified on (dnsBuilder.js: the hijack's `rules` form). */
+const CORE_DNS_VERIFIED = '26.3.27';
+/** Public anycast resolvers — no in-country resolver for a bypass mode (Google, Cloudflare, Quad9). */
+const PUBLIC_ANYCAST_DNS = new Set(['8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1', '9.9.9.9', '149.112.112.112', '2001:4860:4860::8888', '2001:4860:4860::8844', '2606:4700:4700::1111', '2606:4700:4700::1001', '2620:fe::fe', '2620:fe::9']);
 
 function defaultDataDir() {
   // plus: its own folder, so a headless Plus does not read and rewrite the
@@ -193,9 +221,19 @@ function createService(opts = {}) {
   const T = Object.assign({
     bootDelayMs: 1000, bootEveryMs: 15000, bootSlowAfter: 20, bootSlowMs: 60000,
     routerBackoffMs: [2000, 5000, 15000, 30000, 60000],
+    refusedRetryMs: 600000,      // a connect the core refused (holdRefused): tried again this rarely — no WAN to wait for
     crashWindowMs: 120000,       // a drop this soon after a rebuild continues that rebuild's backoff
-    syslogTunQuietMs: 10000      // one sing-box line of a kind per this, into syslog
+    syslogTunQuietMs: 10000,     // one sing-box line of a kind per this, into syslog
+    outOfFilesQuietMs: 60000,    // a core's "too many open files": one line with the numbers per this (watchOpenFiles)
+    // the router's WAN watcher (wanWatch.js): the poll, how long a change must hold still, the gap between the two probes
+    wanIntervalMs: 5000, wanSettleMs: 10000, wanProbeGapMs: 5000,
+    ksVerifyMs: 30000            // while the kill switch should be armed: how often the kernel is asked for its table
   }, deps.timing || {});
+  // "does the tunnel answer" — an HTTP 204 through the local SOCKS inbound, 5 s (a test hands in an answer)
+  const probeTunnel = deps.probeTunnel || (async () => {
+    const r = await httpThroughProxy(getSettings().socksPort, { host: 'cp.cloudflare.com', port: 80, path: '/generate_204', timeout: 5000 });
+    return !!(r && r.ok);
+  });
 
   const dataDir = opts.dataDir || defaultDataDir();
   fs.mkdirSync(dataDir, { recursive: true });
@@ -211,6 +249,9 @@ function createService(opts = {}) {
   // OpenWrt: `opkg install xray-core sing-box` puts the official cores in
   // /usr/bin. Searched LAST — a core downloaded into userBinDir still wins.
   const OPENWRT = isOpenwrt();
+  // Raw JSON mode (configBuilder.rawApplies): never on a router, whose LAN
+  // lives on the app's port-53 answer — there a raw server runs its full form.
+  const RAW_OPTS = { openwrt: OPENWRT };
   const systemBinDirs = OPENWRT ? ['/usr/bin'] : [];
   // A router is headless: after a power cut the tunnel has to come back by
   // itself, so "connect at start" is the default THERE (the user can still turn
@@ -223,11 +264,178 @@ function createService(opts = {}) {
   // rides the proxy as UDP — which most servers do not carry — and the whole
   // LAN has no names (the AC-1304 log: `udp:1.1.1.1:53 [socks-in -> proxy]`,
   // never answered). On a router that switch has no meaning; the UI hides it.
-  const ROUTER_FORCED = OPENWRT ? { dnsManaged: true } : {};
+  // TUN likewise: "connected, proxy only" on a router is every device behind
+  // it going direct while the panel says connected — and with the kill switch
+  // armed, a LAN with no internet at all (killSwitchState: the gateway is
+  // never up). A desktop backup restored there carried exactly that.
+  const ROUTER_FORCED = OPENWRT ? { dnsManaged: true, tunMode: true } : {};
+  // What a backup restored on a router does not overlay (backup:import): the
+  // desktop's own switches, and the router's choices a desktop file would
+  // undo — a desktop's lanBlockQuic:false / autoConnect:false / killSwitch
+  // turned the router's defaults off with nothing said (field report D5, fix 9).
+  const ROUTER_KEEPS_ON_IMPORT = ['tunMode', 'tunBackend', 'tunAppMode', 'tunApps', 'systemProxy', 'launchAtLogin', 'leakGuard', 'blockUdpInProxyMode', 'autoConnect', 'lanBlockQuic', 'killSwitch'];
 
   const listeners = new Set();
+  const oneLine = (s) => String(s == null ? '' : s).replace(/\s*[\r\n]+\s*/g, ' | ').slice(0, 1000);
+
+  /* ----------------------------- the connection as one fact ----------------------------- */
+  // Everything a page needs on load and after every events reconnect
+  // (connSnapshot): the LAST state told to the clients, kept where the status
+  // events pass (tell, below — the one funnel), plus what only the service
+  // knows — who caused it, when the tunnel came up, when the next attempt is.
+  // A page that loaded while the tunnel was up used to start on
+  // "disconnected" with no event ever coming to correct it, and its Connect
+  // was a 20-40 s rebuild of a gateway that was fine (v1.16 S1/S2).
+  const ring = createLogRing(500);   // the last 500 log lines and state changes, for LuCI (S7)
+  const conn = { state: 'disconnected', reason: null, cause: null, attempt: 0, retryAt: null, since: null, serverId: null, label: null, engine: null, tun: false };
+  const stamp = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+  // the service's own files under /proc (Linux); a test hands in fakes
+  const readProc = deps.readProc || ((p) => fs.readFileSync(p, 'utf8'));
+  /** node, the core and the gateway's sing-box, by pid (a process not running is absent). */
+  function procPids() {
+    return { node: process.pid, xray: xray && xray.proc && xray.proc.pid, 'sing-box': tun && tun.inner && tun.inner.proc && tun.inner.proc.pid };
+  }
+  /**
+   * MemAvailable and the RSS of node, xray and sing-box, from /proc — on Linux;
+   * a file that is not there is a field that is not reported. Logged at every
+   * connect and drop (S6: a 512 MB router), and in the diagnostics bundle.
+   *
+   * No GOMEMLIMIT for the cores. Measured in the QEMU smoke while connected
+   * (v1.16, armsr-armv7, one idle connection): node 36-40 MB, sing-box 22-32 MB,
+   * xray 25 MB RSS — ~100 MB for the three, against ~570 MB available of the
+   * guest's 768 MB and the AC-1304's 512 MB. A limit only matters once a Go
+   * heap balloons under load, and one set near these figures would make the
+   * collector burn a Cortex-A7 core for nothing; the figures the router logs
+   * here are what would justify one later.
+   */
+  function memInfo() {
+    const out = { memAvailableKb: null, rss: {} };
+    try { const m = /^MemAvailable:\s+(\d+)/m.exec(readProc('/proc/meminfo')); if (m) out.memAvailableKb = Number(m[1]); } catch { /* not Linux */ }
+    const pids = procPids();
+    for (const [name, pid] of Object.entries(pids)) {
+      if (!pid) continue;
+      try { const m = /^VmRSS:\s+(\d+)/m.exec(readProc(`/proc/${pid}/status`)); if (m) out.rss[name] = Number(m[1]); } catch { /* gone, or not Linux */ }
+    }
+    return out;
+  }
+  function memLine() {
+    const m = memInfo();
+    const rss = Object.entries(m.rss).map(([k, v]) => `${k}=${v}kB`).join(' ');
+    if (m.memAvailableKb == null && !rss) return '';
+    return ` mem:${m.memAvailableKb != null ? ` avail=${m.memAvailableKb}kB` : ''}${rss ? ` rss ${rss}` : ''}`;
+  }
+  /* ----------------------------- the router's open files (v1.16.2) ----------------------------- */
+  // The owner's AC-1304 (23.05.4, v1.16.1): 49-90 s after the gateway came up,
+  // sing-box said "socket: too many open files" hundreds of times and no
+  // device could browse. procd set no limit, so node and the cores had the
+  // kernel's 4096; irnetfree.init now sets 65536. What each process really got
+  // is read here — at every connect, in the diagnostics, and when a core runs
+  // out — so the next field log carries the budget. The router only: a
+  // desktop's limits are the desktop's business, and none of this runs there.
+  /** The router's own directory listings under /proc; a test hands in fakes. */
+  const listProc = deps.listProc || ((p) => fs.readdirSync(p));
+  /** What irnetfree.init sets (procd `limits nofile`), and below what a core's limit is said at warn. */
+  const ROUTER_NOFILE = 65536;
+  const ROUTER_NOFILE_FLOOR = 16384;
+  /** Per process: descriptors in use (/proc/<pid>/fd) and "Max open files" soft/hard (/proc/<pid>/limits); {} without /proc. */
+  function openFiles() {
+    const out = {};
+    const num = (v) => (v === 'unlimited' ? Infinity : Number(v));
+    for (const [name, pid] of Object.entries(procPids())) {
+      if (!pid) continue;
+      const e = { open: null, soft: null, hard: null };
+      try { const m = /^Max open files\s+(\d+|unlimited)\s+(\d+|unlimited)/m.exec(readProc(`/proc/${pid}/limits`)); if (m) { e.soft = num(m[1]); e.hard = num(m[2]); } } catch { /* gone, or not Linux */ }
+      try { e.open = listProc(`/proc/${pid}/fd`).length; } catch { /* gone, or not Linux */ }
+      if (e.open != null || e.soft != null) out[name] = e;
+    }
+    return out;
+  }
+  const ofNum = (v) => (v == null ? '?' : String(v));
+  /** "node=12/65536 xray=40/65536 sing-box=31/65536" — in use / soft limit. */
+  function openFilesText(of = openFiles()) {
+    return Object.entries(of).map(([k, e]) => `${k}=${ofNum(e.open)}/${ofNum(e.soft)}`).join(' ');
+  }
+  /** At every connect, once the gateway is up: the budget, at warn when a core got less than the init sets. */
+  function noteOpenFiles() {
+    if (!OPENWRT) return;
+    const of = openFiles();
+    if (!Object.keys(of).length) return;   // no /proc to read
+    const now = Object.entries(of).map(([k, e]) => `${k} ${ofNum(e.open)} of ${ofNum(e.soft)}`).join(', ');
+    const low = ['xray', 'sing-box'].filter(k => of[k] && of[k].soft != null && of[k].soft < ROUTER_NOFILE_FLOOR);
+    if (!low.length) { send('log', { line: `Open files at connect: ${now}`, level: 'info' }); return; }
+    const limits = [...new Set(low.map(k => of[k].soft))];
+    const said = limits.length === 1 ? `${low.join(' and ')} may hold only ${limits[0]}` : low.map(k => `${k} may hold only ${of[k].soft}`).join(', ');
+    send('log', {
+      line: `Open files: ${said} (${low.length > 1 ? 'their' : 'its'} "Max open files") — a busy LAN runs that out ("too many open files": no device behind the router can browse). The service's init gives every process ${ROUTER_NOFILE}: restart it (/etc/init.d/irnetfree restart), or reinstall the package if this stays. Now: ${now}`,
+      level: 'warn'
+    });
+  }
+  /** A core's "too many open files": one error line with the numbers, at most one a minute (the cores print it per connection). */
+  let outOfFilesAt = 0;
+  function watchOpenFiles(line) {
+    if (!OPENWRT || !/too many open files/i.test(String(line))) return;
+    const now = Date.now();
+    if (outOfFilesAt && now - outOfFilesAt < T.outOfFilesQuietMs) return;
+    outOfFilesAt = now;
+    const text = openFilesText();
+    send('log', { line: `Out of open files ("too many open files")${text ? ': ' + text : ''} — new connections from the LAN fail until some close`, level: 'error' });
+  }
+  /** The status event just told to the clients, folded into `conn`; one ring line per transition, with its cause. */
+  function noteStatus(p) {
+    if (!p || !p.state) return;
+    switch (p.state) {
+      case 'connecting':
+        // the rebuild inside a recovery is still the recovery, and a boot retry still "waiting"
+        Object.assign(conn, { state: recovering ? 'reconnecting' : 'connecting', reason: null, attempt: recovering ? conn.attempt : 0, retryAt: null, since: null, serverId: p.serverId || conn.serverId, tun: false });
+        break;
+      case 'waiting':
+        Object.assign(conn, { state: 'waiting', reason: p.reason == null ? conn.reason : oneLine(p.reason), attempt: p.attempt || 0, retryAt: p.retryInMs == null ? null : Date.now() + p.retryInMs, since: null, serverId: p.serverId || conn.serverId, tun: false });
+        break;
+      case 'connected':
+        Object.assign(conn, { state: 'connected', reason: null, attempt: 0, retryAt: null, since: Date.now(), serverId: p.serverId || null, label: p.label || null, engine: p.engine || null, tun: !!p.tun });
+        break;
+      case 'reconnecting':
+        Object.assign(conn, { state: 'reconnecting', reason: p.reason == null ? null : oneLine(p.reason), attempt: p.attempt || 0, retryAt: p.retryInMs ? Date.now() + p.retryInMs : null, since: null, tun: false });
+        break;
+      case 'reconnect-failed':
+        Object.assign(conn, { state: p.proxyUp ? 'connected' : 'error', reason: p.reason == null ? null : oneLine(p.reason), attempt: 0, retryAt: null, since: p.proxyUp ? conn.since : null, tun: false });
+        break;
+      case 'error':
+        Object.assign(conn, { state: 'error', reason: oneLine(p.message || p.error || 'error'), attempt: 0, retryAt: null, since: null, tun: false });
+        break;
+      case 'disconnected':
+        Object.assign(conn, { state: 'disconnected', reason: null, attempt: 0, retryAt: null, since: null, serverId: null, label: null, engine: null, tun: false });
+        break;
+      default: return;   // cleanup-failed: the state before it stands
+    }
+    conn.cause = p.cause || null;
+    const detail = [`cause=${conn.cause}`, `gen=${connGen}`];
+    if (conn.attempt) detail.push(`attempt=${conn.attempt}`);
+    if (p.reason) detail.push(`reason=${oneLine(p.reason)}`);
+    if (conn.state === 'error') detail.push(`error=${conn.reason}`);
+    ring.push(`${stamp()} status: ${conn.state} (${detail.join(', ')})${conn.state === 'connected' || conn.state === 'reconnecting' ? memLine() : ''}`);
+    publishKillSwitch();   // the gateway's up/down is what `blocking` follows
+  }
+  /** The connection, as one fact (see above): app:init.conn, the first event of every /events stream, LuCI's status. */
+  function connSnapshot() {
+    return {
+      state: conn.state, reason: conn.reason, cause: conn.cause, attempt: conn.attempt,
+      retryInMs: conn.retryAt == null ? null : Math.max(0, conn.retryAt - Date.now()),
+      since: conn.since, serverId: conn.serverId, label: conn.label, engine: conn.engine, tun: conn.tun,
+      killSwitch: killSwitchState()
+    };
+  }
+
   // to the clients only — for an event whose reason syslog already has
   const tell = (channel, payload) => {
+    if (channel === 'status') {
+      // a boot retry's own "connecting" reads "waiting" as well — no flip
+      // between the two every 15 s while the WAN is not there (B3)
+      if (payload && payload.state === 'connecting' && payload.cause === 'boot' && bootAttempt > 1) {
+        payload = { state: 'waiting', serverId: payload.serverId, attempt: bootAttempt, cause: 'boot' };
+      }
+      noteStatus(payload);
+    } else if (channel === 'log' && payload) ring.push(`${stamp()} [${payload.level || 'info'}] ${oneLine(payload.line)}`);
     for (const cb of listeners) { try { cb(channel, payload); } catch {} }
   };
   const send = (channel, payload) => {
@@ -240,7 +448,6 @@ function createService(opts = {}) {
   // are mirrored there, one line each, marked so `logread -e irnetfree`
   // finds them. Info lines stay out: syslog on a router is a small ring buffer.
   const syslog = deps.syslog || ((level, text) => (level === 'err' ? process.stderr : process.stdout).write(text + '\n'));
-  const oneLine = (s) => String(s == null ? '' : s).replace(/\s*[\r\n]+\s*/g, ' | ').slice(0, 1000);
   // sing-box's own output (`[tun] …`) can be a line per connection when
   // something is wrong: one line of a kind (digits aside) per 10s reaches
   // syslog, with a count of what was held back. The service's own lines are
@@ -296,9 +503,24 @@ function createService(opts = {}) {
   // status or start a watcher. Comparing the token captured at entry against this
   // is how it finds out (see doConnect).
   let connGen = 0;
+  // connGen as the last disconnect left it: while the two are equal nothing has
+  // connected since, so an overtaken call can tell a disconnect (a Cancel while
+  // connecting) from a newer connect, which owns whatever it finds (see main.js).
+  let disconnectGen = 0;
   // Settings the LIVE tunnel was built from (null when disconnected) — see
   // ../main/settingsMeta.js.
   let appliedSettings = null;
+  // The saved servers the live connection dials (every hop, every target), and
+  // whether one of them was edited since it was built: the edit is only in the
+  // store until a reconnect — a pending change like a settings key ('servers'
+  // in pendingKeys), so a Connect on the live server is not "nothing to
+  // rebuild" while it waits (field report S3, fix 18).
+  let liveServerIds = new Set();
+  let serverEditPending = false;
+  // The routing profile and the chains the live connection was built from
+  // (routingProfiles.liveRoutingOf): an edit of either since waits for a
+  // reconnect too (pendingKeys, 'routingProfiles' / 'chains').
+  let liveRouting = null;
   // The physical interface the LIVE connection's direct dials are bound to (see
   // doConnect); null when not under TUN. rebuildActiveConfig() reuses it rather
   // than asking the OS again — with the tunnel up, the default route IS the tunnel.
@@ -306,6 +528,9 @@ function createService(opts = {}) {
   // The addresses the LIVE connection pinned ({ wgEndpointIps, entryHostIps },
   // see doConnect); rebuildActiveConfig() reuses them for the same reason.
   let livePins = null;
+  // The servers the LIVE connection muxes ({ ids, fps }, see muxFor); null when
+  // none. rebuildActiveConfig() keeps them; a drop forgets their verdicts.
+  let liveMux = null;
   let liveDiagnostics = null;
   let macRepairPromise = Promise.resolve();
   let macRepairError = null;
@@ -319,6 +544,13 @@ function createService(opts = {}) {
   let quietStops = 0;
   // Every connect in flight (see doConnect): a drop waits for them (recoverFromDrop).
   const connectsInFlight = new Set();
+  // Every 'stopped' the core manager reported, numbered, with how it ended;
+  // and the number of the one a connect reported as ITS failure (the router's
+  // wait for the SOCKS port: coreGoneError). That death was a drop too — but
+  // the connect's caller retries it, so the drop is not (recoverFromDrop).
+  let coreStops = 0;
+  let coreStopReported = 0;
+  let lastCoreExit = null;
 
   const store = new Store(path.join(dataDir, 'store.json'), {
     servers: [], subscriptions: [], settings: DEFAULT_SETTINGS, activeServerId: null, xrayPath: null
@@ -342,6 +574,19 @@ function createService(opts = {}) {
   // router must not rewrite store.json (flash) on every attempt.
   function setIfChanged(key, value) { if (store.get(key, undefined) !== value) store.set(key, value); }
 
+  /**
+   * The config the picker points at, remembered on its own (see main.js):
+   * `activeServerId` is cleared at every start and `lastServerId` only moves
+   * on a connect, so every restart used to land on the first server. Written
+   * only when it moved, and coalesced — clicking down a list is a write per
+   * click, and on a router every write is flash.
+   */
+  function setSelection(id) {
+    const v = typeof id === 'string' && id ? id : null;
+    if (store.get('selectedServerId', null) !== v) store.setLazy('selectedServerId', v);
+    return v;
+  }
+
   migrateServers();
   migrateSettingsStore();
   // The router's defaults are WRITTEN into the store once, not overlaid under
@@ -353,6 +598,8 @@ function createService(opts = {}) {
     store.set('settings', Object.assign({}, store.get('settings', {}), ROUTER_DEFAULTS));
     store.set('routerDefaultsApplied', true);
   }
+  if (OPENWRT && !(store.get('routerRepair', 0) >= 1)) repairRouterSettings();
+  getRoutingProfiles();   // today's advanced routing becomes profile rp-default, once
   // A new process has no live connection. `activeServerId` means "connected
   // to this, in THIS process" and lives in the store — only a disconnect ever
   // cleared it, so after a reboot, a power cut or a crash it was still there,
@@ -395,11 +642,12 @@ function createService(opts = {}) {
    */
   function makeTun(settings, { quiet = false } = {}) {
     let selected;
-    const opts = { binDir: bundledBinDir, extraDirs: [userBinDir, ...systemBinDirs], onLog: (line, level) => send('log', { line, level }), lang: settings.lang, userData: dataDir,
+    const opts = { binDir: bundledBinDir, extraDirs: [userBinDir, ...systemBinDirs], onLog: (line, level) => { send('log', { line, level }); watchOpenFiles(line); }, lang: settings.lang, userData: dataDir,
       // the macOS health check, and on a router the gateway's own watch on its sing-box
       onUnexpectedExit: () => {
         if (userDisconnecting || isQuitting || tun !== selected) return;
-        send('log', { line: 'The tunnel exited unexpectedly — rebuilding it', level: 'error' });
+        send('log', { line: 'The tunnel exited unexpectedly — rebuilding it' + memLine(), level: 'error' });
+        publishKillSwitch();   // the gateway is down: the LAN is blocked from this moment (K4)
         recoverFromDrop('tunnel-exited');
       } };
     // On a router the backend is not a choice: the gateway wraps sing-box and
@@ -420,21 +668,35 @@ function createService(opts = {}) {
   const xrayOpts = {
     binPath: store.get('xrayPath', null),
     dataDir,
+    // a Cortex-A7 can take far longer than 6 s over `-test`: past the
+    // deadline a config counts as unverified (fix 20) — give it room there
+    testTimeoutMs: OPENWRT ? 30000 : undefined,
     extraBinDirs: [userBinDir, ...systemBinDirs],
-    onLog: (line, level) => { send('log', { line, level }); healCertPin(line); },
+    onLog: (line, level) => { send('log', { line, level }); healCertPin(line); watchOpenFiles(line); },
     onStatus: (state, info) => {
+      if (state === 'stopped') { coreStops++; lastCoreExit = info || null; }
       if ((xrayReloading || quietStops > 0) && state === 'stopped') return;
-      if (state === 'stopped' && !userDisconnecting && !isQuitting && store.get('activeServerId', null)) {
+      const drop = state === 'stopped' && !userDisconnecting && !isQuitting && !!store.get('activeServerId', null);
+      if (drop) {
         // The core died under a live connection (OOM, a panic, kill -9) and
         // nothing asked it to: under TUN the tunnel keeps routing into a SOCKS
         // port nobody answers — on a router the whole LAN offline behind a
         // gateway that still says "up". (headless: no Windows kill switch.)
         // Rebuilt like a network change; deferred a tick so the drop is
-        // reported to the clients first.
-        send('log', { line: `The core exited on its own (code=${info && info.code != null ? info.code : '-'} signal=${(info && info.signal) || '-'}) — rebuilding the connection`, level: 'error' });
-        setTimeout(() => recoverFromDrop('core-exited'), 0);
+        // reported to the clients first. Inside a connect it may be that
+        // connect's own core, which then fails it (coreGoneError) and is not
+        // rebuilt here — so "rebuilding" is not promised; the recovery says
+        // it when it is the one that rebuilds.
+        const seq = coreStops;
+        const how = `code=${info && info.code != null ? info.code : '-'} signal=${(info && info.signal) || '-'}`;
+        send('log', { line: `The core exited on its own (${how})${connectsInFlight.size ? ' while connecting' : ' — rebuilding the connection'}${memLine()}`, level: 'error' });
+        setTimeout(() => recoverFromDrop('core-exited', seq), 0);
       }
-      send('xray-status', { state, info });
+      // `rebuilding`: this stop is a drop the service is about to rebuild (on
+      // a router always, elsewhere with the switch on) — the window keeps
+      // "connected" until the recovery says "reconnecting" (S4), instead of
+      // painting "disconnected" with a red toast for the whole backoff.
+      send('xray-status', { state, info, rebuilding: drop && (OPENWRT || !!getSettings().autoReconnectOnNetworkChange) });
     }
   };
   const xray = deps.xray ? deps.xray(xrayOpts) : new XrayManager(xrayOpts);
@@ -500,10 +762,12 @@ function createService(opts = {}) {
     }
   }
 
+  let lastStats = null;   // the poller's last sample, for the facade's traffic line
   const stats = new StatsPoller({
     binPath: xray.anyBin(),
     apiPort: getSettings().apiPort,
     onStats: (s) => {
+      lastStats = s;
       send('stats', s);
       if (!usage) return;
       usage.tick(s.per);
@@ -516,11 +780,60 @@ function createService(opts = {}) {
     onRaw: (vars) => reportSilentTunnels(vars)
   });
 
-  const downloader = new Downloader({
-    channel: () => getSettings().coreChannel || 'stable',   // plus: the release channel the cores follow
+  const downloaderOpts = {
     destDir: userBinDir,
     onLog: (line, level) => send('log', { line, level }),
     onProgress: (component, pct) => send('asset-progress', { component, pct })
+  };
+  // deps.downloader: a test's Downloader over a fake GitHub (coreVersionsIpc.test.js)
+  const downloader = deps.downloader ? deps.downloader(downloaderOpts) : new Downloader(downloaderOpts);
+
+  /**
+   * After a core's binary changed — a download, or a version chosen in the
+   * picker: what was cached about it. binPath caches ONLY the official core
+   * (and holds a user-located path), so a change to the fork must not clear it.
+   */
+  function afterCoreChanged(component) {
+    if (component === 'xray') xray.binPath = null;
+    xray.forgetVersions();
+    stats.setBin(xray.anyBin());
+  }
+
+  /**
+   * A core is never replaced under a connection (the version picker's
+   * 'cores:install'): a core or the gateway up, a connect in flight, a recovery
+   * between its attempts, or a boot connect waiting for the WAN — anything the
+   * clients are shown as other than disconnected or an error.
+   */
+  function coreChangeBlocked() {
+    return connectsInFlight.size > 0 || recovering || !!recoverTimer
+      || !!store.get('activeServerId', null)
+      || !!(xray && xray.running) || !!(tun && tun.active)
+      || ['connecting', 'waiting', 'reconnecting', 'connected'].includes(conn.state);
+  }
+
+  // the version picker (Settings → Required files → Choose version): the handlers main.js has too
+  const coreVersions = createCoreVersionsApi({
+    downloader,
+    installedVersion: (id) => xray.version(id),
+    busy: coreChangeBlocked,
+    afterInstall: afterCoreChanged,
+    result: () => ({ assets: assetStatus(), tunAvailable: makeTun(getSettings(), { quiet: true }).isAvailable(), xrayReady: xray.binExists() }),
+    onLog: (line, level) => send('log', { line, level })
+  });
+
+  // Routing share links (routeShare.js): the handlers main.js has too
+  const routeShare = createRouteShareApi({
+    store,
+    getSettings,
+    getChains,
+    linkOf: buildShareLink,
+    parseMany,
+    identityOf: (s) => serverIdentity(s, true),
+    // an import only adds; it raises the reconnect state when it moves what the live selection connects
+    liveSelection: () => (appliedSettings ? store.get('activeServerId', null) : null),
+    markLive: () => { serverEditPending = true; },
+    pendingKeys
   });
 
   // The weekly refresh of what the downloader put in place — same as main.js.
@@ -615,6 +928,8 @@ function createService(opts = {}) {
   // Only processes whose command line points into THIS service are touched
   // (openwrtNet.ownOrphanCores). doConnect() waits for this; it never rejects.
   const killPid = deps.kill || ((pid, sig) => process.kill(pid, sig));
+  // app:quit ends the process (a test hands in a spy, never process.exit)
+  const exitProcess = deps.exit || ((code) => process.exit(code));
   async function sweepOrphans() {
     const found = deps.orphans ? deps.orphans() : ownOrphanCores({ dataDir: path.resolve(dataDir), tmpDir: os.tmpdir() });
     if (found.length) {
@@ -634,6 +949,107 @@ function createService(opts = {}) {
 
   /* ----------------------------- settings / data ----------------------------- */
   function getSettings() { return Object.assign({}, DEFAULT_SETTINGS, store.get('settings', {}), ROUTER_FORCED); }
+
+  /* ----------------------------- the kill switch (K1–K6) ----------------------------- */
+  // Armed ⇔ settings.killSwitch && connectIntent: the VPN is meant to be on —
+  // by the user, or restored at boot. Armed, LAN devices' forwarded traffic to
+  // the internet is rejected unless it goes through the tunnel; never the
+  // excluded devices, private destinations, the replies of inbound
+  // connections, or the router's own traffic (killSwitchOpenwrt.js). Its own
+  // table, which the gateway's teardown and the orphan sweep never touch: it
+  // survives rebuilds, recoveries, server switches, a crash of this service
+  // and — through the snippet /etc/init.d/irnetfree-ks replays at boot — a
+  // reboot. The user turning the VPN off (the disconnect clears the intent)
+  // or the setting off disarms it; `blocking` = armed with the gateway down.
+  const ks = deps.killSwitch ? deps.killSwitch({ dataDir }) : createKillSwitch({ run: tunPlatform.run, dataDir, fs });
+  let ksTold = null;   // {enabled|armed|blocking} as last told to the clients
+  function killSwitchState() {
+    const enabled = !!getSettings().killSwitch;
+    const armed = OPENWRT && ks.isArmed();
+    return { enabled, armed, blocking: armed && !(tun && tun.active) };
+  }
+  /** Tell the clients and the log whenever {enabled, armed, blocking} moved — `blocking` is the LAN's internet, said loudly. */
+  function publishKillSwitch() {
+    if (!OPENWRT) return;
+    const st = killSwitchState();
+    const key = `${st.enabled}|${st.armed}|${st.blocking}`;
+    if (key === ksTold) return;
+    const was = ksTold;
+    ksTold = key;
+    if (st.blocking) send('log', { line: 'Kill switch: the tunnel is down — LAN internet is blocked until it is back (excluded devices and the router itself are not)', level: 'warn' });
+    else if (was && was.endsWith('|true')) send('log', { line: 'Kill switch: the tunnel is back — LAN internet restored', level: 'info' });
+    ring.push(`${stamp()} killswitch: ${JSON.stringify(st)}`);
+    tell('killswitch', Object.assign({ engaged: st.blocking, router: true }, st));
+  }
+  // One arm / disarm at a time, in order: a connect's arm and a disconnect's disarm must never race.
+  let ksQueue = Promise.resolve();
+  function syncKillSwitch(why) {
+    if (!OPENWRT) return Promise.resolve();
+    ksQueue = ksQueue.then(async () => {
+      const s = getSettings();
+      const want = !!s.killSwitch && !!store.get('connectIntent', null);
+      const macs = validMacs(s.lanBypassMacs);
+      if (want) {
+        // armed as far as we remember — but is the table still in the kernel?
+        // `fw4 stop` / `fw4 flush`, a package's postinst, a hand `nft flush
+        // ruleset` empty the whole ruleset (review I2); asked on every pass
+        // except a settings change, which rewrites the table anyway
+        if (ks.isArmed() && why !== 'settings' && !(await ks.check())) {
+          send('log', { line: 'Kill switch: the table is gone from the kernel (a firewall flush or restart?) — re-arming', level: 'warn' });
+        }
+        if (!ks.isArmed()) {
+          await ks.arm({ bypassMacs: macs, wanDevs: [] });
+          send('log', { line: `Kill switch armed (${why}): while the VPN is on and the tunnel is down, LAN internet is blocked; ${macs.length} device(s) excluded`, level: 'info' });
+        } else if (why === 'settings') {
+          await ks.setBypassMacs(macs);
+        }
+      } else if (ks.isArmed() || why === 'start') {
+        const was = ks.isArmed();
+        await ks.disarm();   // at start: whatever a killed run or the boot script left behind
+        if (was) send('log', { line: `Kill switch disarmed (${why}): the LAN goes direct whenever the tunnel is down`, level: 'info' });
+      }
+    }).catch((e) => send('log', { line: `Kill switch: ${why} failed: ${(e && e.message) || e}`, level: 'error' }))
+      .then(() => publishKillSwitch());
+    return ksQueue;
+  }
+  // A saved intent means "the VPN is on" only if the boot connect will run (B1,
+  // review I1): with "Connect when the router starts" off the VPN stays off
+  // after this boot, and a saved connection that no longer builds brings
+  // nothing — so the intent is cleared, and nothing (the kill switch above
+  // all) acts on a connection that is not coming: armed with nothing coming
+  // was a dark LAN until someone found the UI.
+  // It runs as the first step of the kill switch queue — after createService
+  // returned, so the caller's listeners see the verdict — and before 'start'.
+  function gateBootIntent() {
+    const target = store.get('connectIntent', null);
+    if (!target) return;
+    const s0 = getSettings();
+    let why = null;
+    if (!s0.autoConnect) why = '"Connect when the router starts" is off, the VPN stays off after this boot';
+    else { try { buildPlan(target, s0); } catch (e) { why = `the last connection (${target}) cannot be built any more — ${(e && e.message) || e}`; } }
+    if (!why) return;
+    send('log', { line: `Auto-connect: ${why}; the saved connection is cleared`, level: s0.autoConnect ? 'error' : 'info' });
+    if (s0.killSwitch) {
+      send('log', { line: s0.autoConnect
+        ? 'Kill switch: not armed — the saved connection cannot be built, nothing will connect; turn the VPN on by hand to arm it'
+        : 'Kill switch: not armed at start — "Connect when the router starts" is off, the VPN stays off after this boot', level: s0.autoConnect ? 'warn' : 'info' });
+    }
+    store.set('connectIntent', null);
+  }
+  if (OPENWRT) ksQueue = ksQueue.then(gateBootIntent);
+  // A new service: armed before the boot connect starts (the boot script
+  // already replayed the snippet at boot; this re-applies the same table).
+  const ksReady = syncKillSwitch('start');
+  // …and while it should be armed, the kernel is asked every T.ksVerifyMs
+  // whether the table is still there, and it is re-armed when not (review I2)
+  let ksTimer = null;
+  if (OPENWRT) {
+    ksTimer = setInterval(() => {
+      if (isQuitting || !getSettings().killSwitch || !store.get('connectIntent', null)) return;
+      syncKillSwitch('verify');
+    }, T.ksVerifyMs);
+    if (ksTimer.unref) ksTimer.unref();
+  }
 
   /**
    * One-time upgrade of the saved servers to the shape the current parser and
@@ -664,6 +1080,41 @@ function createService(opts = {}) {
     if (changed) store.set('settings', settings);
   }
 
+  /**
+   * v1.16.2, once per router (`routerRepair`): what a desktop backup restored
+   * before v1.16.1 overwrote — the restore kept nothing of the router's then
+   * (fix 9 came later). The owner's AC-1304 connected with bypass-ir's
+   * in-country DNS set to 1.1.1.1 / 8.8.8.8, asked in plain text from inside
+   * Iran; a desktop's backup also always carries lanBlockQuic:false (the
+   * desktop has no such switch, and every LAN QUIC flow then held a SOCKS UDP
+   * session — descriptors the gateway ran out of) and autoConnect:false (every
+   * restart then left the LAN direct, the kill switch unarmed).
+   *
+   * Only with a desktop's TRACE in the stored settings: an in-country list of
+   * public resolvers alone (the router's menu offers Iranian ones only), or a
+   * value the router's UI has not been able to set since v1.13.0 — a choice
+   * made on the router itself is left alone. Never touched: the kill switch,
+   * the routing mode, the DoH list, sniffing, LAN access, the rules. Said once
+   * at warn; each value can be set back under Settings, and it never runs again.
+   */
+  function repairRouterSettings() {
+    const raw = Object.assign({}, store.get('settings', {}));
+    const direct = Array.isArray(raw.dnsDirect) ? raw.dnsDirect : null;
+    const publicDirect = !!direct && direct.length > 0 && direct.every(e => PUBLIC_ANYCAST_DNS.has(resolverIp(e) || ''));
+    const fromDesktop = publicDirect || raw.systemProxy === true || raw.launchAtLogin === true
+      || (typeof raw.tunBackend === 'string' && raw.tunBackend !== 'sing-box')
+      || (typeof raw.tunAppMode === 'string' && raw.tunAppMode !== 'off');
+    const did = [];
+    if (fromDesktop && raw.lanBlockQuic === false) { raw.lanBlockQuic = true; did.push('QUIC (UDP 443) from the LAN is refused again'); }
+    if (fromDesktop && raw.autoConnect === false) { raw.autoConnect = true; did.push('"Connect when the router starts" is on again'); }
+    if (publicDirect) {
+      did.push(`the in-country DNS is ${DEFAULT_SETTINGS.dnsDirect.join(', ')} instead of the public ${direct.join(', ')}`);
+      raw.dnsDirect = DEFAULT_SETTINGS.dnsDirect.slice();
+    }
+    store.assign(did.length ? { settings: raw, routerRepair: 1 } : { routerRepair: 1 });
+    if (did.length) send('log', { line: `Router settings repaired once (a desktop backup restored before v1.16.1 had overwritten them): ${did.join('; ')} — each can be set back under Settings`, level: 'warn' });
+  }
+
   function getChains() {
     const chains = store.get('chains', null);
     if (Array.isArray(chains)) return chains;
@@ -671,6 +1122,24 @@ function createService(opts = {}) {
     const seed = legacy.length >= 2 ? [{ id: 'chain-' + Date.now().toString(36), name: 'زنجیره ۱', members: legacy.slice() }] : [];
     store.set('chains', seed);
     return seed;
+  }
+
+  /** The routing profiles, migrated (see main.js): none stored yet → today's advanced-routing settings as `rp-default`, written once. */
+  function getRoutingProfiles() {
+    const { profiles, changed } = migrateProfiles({ stored: store.get('routingProfiles', null), settings: getSettings() });
+    if (changed) store.set('routingProfiles', profiles);
+    return profiles;
+  }
+
+  /** routing:setProfiles (see main.js): each normalized, rp-default mirrored into the settings. */
+  function setRoutingProfiles(list) {
+    if (!Array.isArray(list)) return { ok: false, error: 'not a list of profiles', profiles: getRoutingProfiles(), pendingReconnect: pendingKeys() };
+    const { profiles } = migrateProfiles({ stored: list, settings: getSettings() });
+    store.set('routingProfiles', profiles);
+    const stored = store.get('settings', {});
+    const mirrored = mirrorToSettings(profiles, stored);
+    if (mirrored !== stored) store.set('settings', mirrored);
+    return { ok: true, profiles, pendingReconnect: pendingKeys() };
   }
 
   function getPool() {
@@ -687,32 +1156,46 @@ function createService(opts = {}) {
   }
 
   /* ----------------------------- process routing ----------------------------- */
-  function activeProcNames(settings) {
+  /**
+   * Process names referenced by advanced routing 'process' rules — the rules of
+   * the routing profile `serverId` connects (the live connection's when not
+   * given), else the settings' own (rp-default's mirror), as before.
+   */
+  function activeProcNames(settings, serverId) {
     if (!settings || !settings.advancedRouting) return [];
-    return [...new Set((settings.routeRules || []).filter(r => r && r.type === 'process' && r.value).map(r => String(r.value)))];
+    return [...new Set(procRules(settings, serverId)
+      .filter(r => r && r.type === 'process' && r.value)
+      .map(r => String(r.value)))];
+  }
+
+  function procRules(settings, serverId) {
+    const id = serverId === undefined ? store.get('activeServerId', null) : serverId;
+    if (isAdvancedSelection(id)) {
+      const profiles = getRoutingProfiles();
+      const pid = profileIdOf(id, profiles);
+      const profile = pid && profiles.find(p => p.id === pid);
+      if (profile) return profile.rules || [];
+    }
+    return settings.routeRules || [];
   }
   const loadProcCache = () => store.get('procIpCache', {}) || {};
   // Coalesced: the watcher rewrites this every 20 s for the life of a tunnel,
   // and a save() rewrites the whole store (every server, fsync, rename) for it.
   const saveProcCache = (c) => store.setLazy('procIpCache', c);
 
-  async function effectiveSettings() {
+  /** See main.js: the settings with `procIps` — what each process the connect's rules name uses now. */
+  async function effectiveSettings(serverId) {
     const s = getSettings();
-    const names = activeProcNames(s);
+    const names = activeProcNames(s, serverId);
     if (!names.length) return s;
     const cache = loadProcCache();
     pruneProcCache(cache);
     let ipsByName = {};
     try { const r = await collectProcessIps(names, cache); ipsByName = r.ips; saveProcCache(cache); }
     catch (e) { send('log', { line: 'Process routing resolve failed: ' + e.message, level: 'warn' }); }
-    const rules = (s.routeRules || []).map(r => {
-      if (r && r.type === 'process' && r.value) {
-        const list = ipsByName[r.value] || (cache[r.value] && cache[r.value].ips) || [];
-        return { type: 'ip', value: list.join(','), target: r.target };
-      }
-      return r;
-    });
-    return Object.assign({}, s, { routeRules: rules });
+    const procIps = {};
+    for (const n of names) procIps[n] = ipsByName[n] || (cache[n] && cache[n].ips) || [];
+    return Object.assign({}, s, { procIps });
   }
 
   /* ----------------------------- plan / config ----------------------------- */
@@ -754,13 +1237,13 @@ function createService(opts = {}) {
     let entryAddrs = [];
     const addEntryForTarget = (tg) => {
       if (!tg || tg === 'direct' || tg === 'block') return;
-      if (tg === 'chain') { if (legacyChain[0]) entryAddrs.push(legacyChain[0].address); return; }
+      if (tg === 'chain') { if (legacyChain[0]) entryAddrs.push(...entryAddressesOf(legacyChain[0])); return; }
       if (String(tg).indexOf('chain:') === 0) {
         const m = chainsById[String(tg).slice('chain:'.length)];
-        if (m && m[0]) entryAddrs.push(m[0].address);
+        if (m && m[0]) entryAddrs.push(...entryAddressesOf(m[0]));
         return;
       }
-      if (serversById[tg]) entryAddrs.push(serversById[tg].address);
+      if (serversById[tg]) entryAddrs.push(...entryAddressesOf(serversById[tg]));
     };
 
     if (serverId === '__pool__') {
@@ -778,33 +1261,57 @@ function createService(opts = {}) {
       plan = { mode: 'pool', entries, primary: entries[0].target, serversById, chainsById, chain: legacyChain };
       label = (settings.lang === 'en' ? '🧩 Proxy Pool' : '🧩 استخر پروکسی') + ` (${entries.length})`;
       for (const e of entries) addEntryForTarget(e.target);
-    } else if (serverId === '__advanced__') {
-      const rules = Array.isArray(settings.routeRules) ? settings.routeRules : [];
-      const def = settings.routeDefault || (servers[0] && servers[0].id) || 'direct';
-      plan = { mode: 'advanced', serversById, chainsById, chain: legacyChain, rules, def };
-      label = '🧭 ' + (settings.lang === 'en' ? 'Advanced routing' : 'روتینگ ویژه');
-      const targets = new Set(rules.map(r => r && r.target));
-      targets.add(def);
-      for (const tg of targets) { refuseBroken(tg); addEntryForTarget(tg); }
+    } else if (isAdvancedSelection(serverId)) {
+      // A routing profile (routingProfiles.js): `__advanced__:<id>`, or plain
+      // `__advanced__` — the first one (LuCI, old stores, old selections).
+      const profiles = getRoutingProfiles();
+      const pid = profileIdOf(serverId, profiles);
+      const profile = pid && profiles.find(p => p.id === pid);
+      if (!profile) throw new Error(settings.lang === 'en'
+        ? 'This routing profile no longer exists — choose another one under Routing.'
+        : 'این پروفایلِ روتینگ دیگر وجود ندارد — در بخشِ روتینگ یکی دیگر انتخاب کن.');
+      // its process rules as the addresses those processes use now (effectiveSettings)
+      const rules = resolveProcessRules(Array.isArray(profile.rules) ? profile.rules : [], settings.procIps);
+      const def0 = profile.def || (servers[0] && servers[0].id) || 'direct';
+      if (def0 === 'base' && !profile.base) throw new Error(settings.lang === 'en'
+        ? 'This routing sends everything else out through its base, but it has no base — choose one under Routing.'
+        : 'این روتینگ بقیهٔ ترافیک را از پایه خارج می‌کند ولی پایه‌ای ندارد — در بخشِ روتینگ یک پایه انتخاب کن.');
+      // "exit at the base" is the base itself from here on (routingProfiles.resolveBaseTargets)
+      const { rules: atBase, def, defVia } = resolveBaseTargets({ rules, def: def0, defVia: profile.defVia, base: profile.base });
+      // leaving from a base that is gone is refused, as riding on one is (configBuilder's baseGone):
+      // left out, a rule's traffic would follow the default — perhaps direct
+      const baseHere = (b) => String(b).indexOf('chain:') === 0
+        ? ((chainsById[String(b).slice('chain:'.length)] || []).some(x => x && x.outbound))
+        : !!(serversById[b] && serversById[b].outbound);
+      if (profile.base && (def0 === 'base' || rules.some(r => r && r.target === 'base')) && !baseHere(profile.base)) throw new Error(settings.lang === 'en'
+        ? 'Advanced routing: the base this routing leaves from no longer exists (it was removed, or replaced by a subscription update) — choose another base under Routing.'
+        : 'روتینگ ویژه: پایه‌ای که این روتینگ از آن خارج می‌شود دیگر وجود ندارد (حذف شده، یا با به‌روزرسانیِ اشتراک عوض شده) — در بخش روتینگ پایهٔ دیگری انتخاب کن.');
+      plan = { mode: 'advanced', profileId: profile.id, serversById, chainsById, chain: legacyChain, rules: atBase, def, defVia, base: profile.base, useMode: profile.useMode };
+      label = '🧭 ' + (profile.name || (settings.lang === 'en' ? 'Advanced routing' : 'روتینگ ویژه'));
+      // every target and every base one goes through is refused when broken; the
+      // bypass is cut for what is dialled directly — a base, never a target behind it
+      const { targets, vias, entries } = advancedTargets(plan);
+      for (const tg of [...targets, ...vias]) refuseBroken(tg);
+      for (const tg of entries) addEntryForTarget(tg);
     } else if (chainById[serverId]) {
       refuseBroken('chain:' + serverId);
       const members = membersOf(chainById[serverId]);
       if (members.length < 2) throw new Error(settings.lang === 'en' ? 'This chain needs at least 2 servers' : 'این زنجیره حداقل به ۲ سرور نیاز دارد');
       plan = { mode: 'chain', chain: members, name: chainById[serverId].name };
       label = chainById[serverId].name;
-      entryAddrs = [members[0].address];
+      entryAddrs = entryAddressesOf(members[0]);
     } else if (serverId === '__chain__') {
       refuseBroken('chain');
       if (legacyChain.length < 2) throw new Error(settings.lang === 'en' ? 'The chain needs at least 2 servers' : 'زنجیره حداقل به ۲ سرور نیاز دارد');
       plan = { mode: 'chain', chain: legacyChain };
       label = legacyChain.map(s => s.name).join(' → ');
-      entryAddrs = [legacyChain[0].address];
+      entryAddrs = entryAddressesOf(legacyChain[0]);
     } else {
       const server = byId(serverId);
       if (!server) throw new Error(settings.lang === 'en' ? 'Server not found' : 'سرور پیدا نشد');
       plan = { mode: 'single', server };
       label = server.name;
-      entryAddrs = [server.address];
+      entryAddrs = entryAddressesOf(server, rawApplies(server, settings, RAW_OPTS));
     }
     entryAddrs = [...new Set(entryAddrs.filter(Boolean))];
     return { plan, label, entryAddrs };
@@ -812,17 +1319,24 @@ function createService(opts = {}) {
 
   function buildActive(serverId, settings) {
     const { plan, label, entryAddrs } = buildPlan(serverId, settings);
+    // A JSON server set to run raw: its own config, as written — a single-server
+    // connect only (configBuilder.buildRawConfig). The app's routing mode, the
+    // geo rules it would have skipped and the router's DNS block are not in it.
+    const rawServer = rawServerOf(plan, settings, RAW_OPTS);
 
     const geoSt = assetStatus();
     const geoAssets = !!(geoSt.geoip && geoSt.geosite);
     let geoWarn = null;
     const usesGeo = plan.mode === 'pool' ? false : (
-      (plan.mode === 'advanced' && ((settings.routeRules || []).some(r => r && /^(geoip|geosite):/i.test(String(r.value || ''))))) ||
+      (plan.mode === 'advanced' && ((plan.rules || []).some(r => r && /^(geoip|geosite):/i.test(String(r.value || ''))))) ||
       (plan.mode !== 'advanced' && (settings.routingMode === 'bypass-ir' || settings.routingMode === 'bypass-cn' || (settings.blockAds && plan.mode !== 'advanced'))));
-    if (!geoAssets && usesGeo) {
+    if (!geoAssets && usesGeo && !rawServer) {
       geoWarn = settings.lang === 'en'
         ? 'Geo files (geoip/geosite) are missing — geo-based rules were skipped. Download them under Settings → Required files.'
         : 'فایل‌های geo (geoip/geosite) موجود نیست — قوانین مبتنی بر geo نادیده گرفته شد. از تنظیمات → فایل‌های موردنیاز دانلودشان کن.';
+      // a log line too: on a router bypass-ir then IS global routing, and a
+      // toast at connect time is gone before anyone reads it (field report D4)
+      send('log', { line: geoWarn, level: 'warn' });
     }
 
     // Per-config core selection (see engineChoice.js): a single server's own
@@ -831,6 +1345,8 @@ function createService(opts = {}) {
     // missing) decides the config format.
     let engine = xray.resolveEngine(chooseEngine(plan, settings.defaultEngine)).id;
     let config;
+    // A raw config is Xray's own format: it runs on an Xray core, whatever the choice.
+    if (rawServer && engineFormat(engine) === 'sing-box') engine = xray.resolveEngine('xray').id;
     // A router's LAN has names only because the core answers every port-53
     // packet (dnsBuilder's hijack), and a config on the sing-box core carries
     // none — every device behind the router without DNS, the v1.13.4 failure.
@@ -839,7 +1355,9 @@ function createService(opts = {}) {
       send('log', { line: 'This config is set to the sing-box core, which has no port-53 hijack: the LAN behind the router would have no DNS — running it on Xray instead', level: 'warn' });
       engine = xray.resolveEngine('xray').id;
     }
-    if (engineFormat(engine) === 'sing-box') {
+    if (rawServer) {
+      config = buildRawConfig(rawServer, settings);
+    } else if (engineFormat(engine) === 'sing-box') {
       try {
         config = buildSingboxConfig(plan.server, settings);
       } catch (e) {
@@ -850,6 +1368,12 @@ function createService(opts = {}) {
     if (!config) {
       config = buildConfig(Object.assign({}, plan), Object.assign({}, settings, { geoAssets }));
     }
+    // The router's DNS block (v1.16.2, dnsBuilder.routerDnsTuning): 8 s per
+    // DoH server, the DoH servers raced, a known name answered from cache
+    // through an outage of the exit's DoH. Here, after buildConfig, so the
+    // connect and every rebuild get it and a desktop's config never does —
+    // nor a raw config, whose DNS runs as written.
+    if (OPENWRT && !rawServer && engineFormat(engine) === 'xray' && config.dns) config.dns = routerDnsTuning(config.dns);
     return { plan, label, entryAddrs, config, geoWarn, engine };
   }
 
@@ -1047,6 +1571,65 @@ function createService(opts = {}) {
     return Object.assign({}, settings, { entryHostIps: map });
   }
 
+  // The probe behind muxFor; the mux tests hand in their own verdicts — no test may start a core
+  const muxProbe = deps.probeMux || probeMux;
+  // A router tests one server at a time: three cold test cores at once on its
+  // CPU make the 5 s mux share easy to miss (final review, minor 7)
+  const MUX_PARALLEL = OPENWRT ? 1 : PROBE_PARALLEL;
+
+  /**
+   * Mux for this connect (mux.js, spec §4). `auto` tests every eligible server
+   * the plan dials as a target of its own that has no fresh verdict, or one
+   * marked for a re-test — before the config is built, with the names this
+   * connect resolved, at most three at once (one on a router) and 8 s each —
+   * and remembers the answers (the store's `muxProbes`). A recovery's connect
+   * (`recovery`) tests nothing: it takes what is remembered (mux.js judge).
+   * `on` takes them all untested; `off` changes nothing. `ids` go to
+   * buildConfig as `muxServerIds`; `fps` stay with the live connection, for a
+   * drop to mark for a re-test (recheckLiveMux). A chain's hops never get mux,
+   * nor a config on the sing-box engine.
+   */
+  async function muxFor(serverId, settings, recovery) {
+    const none = { ids: [], fps: [] };
+    const mode = muxMode(settings.mux);
+    // off — unless a server is set to Mux on (its own `mux`, the editor's Advanced tab)
+    if (mode === 'off' && !(store.get('servers', []) || []).some((s) => s && s.mux === 'on')) return none;
+    let plan;
+    try { plan = buildPlan(serverId, settings).plan; } catch { return none; }   // buildActive reports it
+    let engine = xray.resolveEngine(chooseEngine(plan, settings.defaultEngine), { quiet: true }).id;
+    if (OPENWRT && engineFormat(engine) === 'sing-box') engine = xray.resolveEngine('xray', { quiet: true }).id;   // as buildActive runs it
+    if (engineFormat(engine) === 'sing-box') return none;
+    const servers = muxCandidates(plan, rawServerOf(plan, settings, RAW_OPTS));
+    if (!servers.length) return none;
+    const { muxIds, learnt } = await decideMux({
+      mode, servers, cache: store.get('muxProbes', {}), now: Date.now(), recovery: !!recovery,
+      parallel: MUX_PARALLEL,
+      probe: (server) => muxProbe(server, {
+        buildTestConfig: (target, port) => buildTestConfig(target, port, { entryHostIps: settings.entryHostIps, ipv6: settings.ipv6 }),
+        startTest: (config) => xray.startTest(config, testEngineFor(engine)),
+        getFreePort,
+        httpThroughProxy
+      }),
+      log: (line, level) => send('log', { line, level })
+    });
+    if (learnt.length) store.set('muxProbes', rememberVerdicts(store.get('muxProbes', {}), learnt, Date.now()));
+    return { ids: muxIds, fps: servers.filter((s) => muxIds.includes(s.id)).map(muxFingerprint) };
+  }
+
+  /**
+   * A muxed connection that dropped: its servers' ok verdicts are marked for a
+   * re-test (markRecheck) — the recovery's connect still muxes them (it never
+   * tests), the next connect the user or the boot makes tests them again.
+   * Nothing is written when they are marked already.
+   */
+  function recheckLiveMux() {
+    if (!liveMux) return;
+    const cache = store.get('muxProbes', {});
+    const next = markRecheck(cache, liveMux.fps);
+    liveMux = null;
+    if (next !== cache) store.set('muxProbes', next);
+  }
+
   /**
    * A connect, tracked while it is in flight. A drop that lands inside one —
    * the core dying while the gateway is still being built — waits for it
@@ -1060,8 +1643,26 @@ function createService(opts = {}) {
     connectsInFlight.add(p);
     const settled = () => connectsInFlight.delete(p);
     p.then(settled, settled);
+    // A connect that threw before any status could say so (a config the core
+    // refused; a first connect's failed gateway — abortGateway tells only the
+    // caller): the snapshot must not stay on "connecting" for every later page
+    // load. A boot attempt's failure is said by the boot loop itself (waiting).
+    p.catch((e) => {
+      if (conn.state !== 'connecting' || (opts && opts.cause === 'boot')) return;
+      noteStatus({ state: 'error', message: (e && e.message) || String(e), serverId, cause: (opts && opts.cause) || 'user' });
+    });
     return p;
   }
+
+  /**
+   * A connect refused before anything starts: the core's own verdict on the
+   * config (Xray-PattN needed among them), a plan that cannot be built. No
+   * quick retry changes that — a file installed, an edit or a subscription
+   * refresh does — so the router's boot loop and recovery say it as an error
+   * and try again rarely (holdRefused), instead of "Waiting for internet…"
+   * every 15-60 s. A binary missing is not one: it may be back in a minute.
+   */
+  const refusal = (e) => Object.assign(e instanceof Error ? e : new Error(String(e)), { refused: true });
 
   async function connectOnce(serverId, opts = {}) {
     if (networkRepairing) throw new Error('Network recovery is still running');
@@ -1076,6 +1677,8 @@ function createService(opts = {}) {
     const abandoned = { ok: false, stale: true };
     // what the intent was before this call — a router's failed gateway puts it back (abortGateway)
     const prevActive = store.get('activeServerId', null);
+    // who asked (the snapshot's `cause`): the user, the boot, a switch, or the recovery that called
+    const cause = opts.cause || (opts.recovery ? recoveryCause : 'user');
     if (process.platform === 'darwin') {
       await macRepairPromise;
       if (stale()) return abandoned;
@@ -1093,7 +1696,7 @@ function createService(opts = {}) {
     // notice. A connect that finds a watcher already running is covered by it.
     const netBefore = netWatcher ? null : currentNetFingerprint();
 
-    let settings = await effectiveSettings();
+    let settings = await effectiveSettings(serverId);
     if (stale()) return abandoned;
     const byId = (id) => store.get('servers', []).find(s => s.id === id);
 
@@ -1126,6 +1729,13 @@ function createService(opts = {}) {
     // Every address the core will dial by itself, for the gateway's bypass.
     const pinnedIps = [...Object.values(settings.wgEndpointIps || {}), ...Object.values(settings.entryHostIps || {}).flat()];
 
+    // Mux, decided per server (muxFor): in `auto` a server with no fresh verdict
+    // is tested now — with the names just resolved, before the config is built.
+    // Never in a recovery's rebuild, which takes what is remembered.
+    const mux = await muxFor(serverId, settings, !!opts.recovery);
+    if (stale()) return abandoned;
+    if (mux.ids.length) settings = Object.assign({}, settings, { muxServerIds: mux.ids });
+
     // The TUN layer for this connect — the backend setting plus what is
     // installed. A LIVE instance is never replaced: switching servers keeps the
     // running tunnel (tun.start() is a no-op while active); a new choice takes
@@ -1140,10 +1750,12 @@ function createService(opts = {}) {
     // On a router "connected, proxy only" is the whole LAN going direct behind
     // a gateway that says it is up — so there the gateway is not optional: a
     // missing sing-box / nft is a failed connect, before any core is started.
+    // (no refusal(): a binary gone for a while — an opkg upgrade, a file held —
+    // comes back by itself, and the recovery's backoff is what finds it)
     if (OPENWRT && settings.tunMode && !myTun.isAvailable()) {
       throw new Error(settings.lang === 'en'
-        ? 'The gateway needs sing-box and nft on the router: opkg install sing-box nftables (or Settings → Required files for sing-box)'
-        : 'گیت‌وی روی روتر به sing-box و nft نیاز دارد: opkg install sing-box nftables (یا sing-box از تنظیمات → فایل‌های موردنیاز)');
+        ? 'The whole-network tunnel needs sing-box and nft on the router: opkg install sing-box nftables (or Settings → Required files for sing-box)'
+        : 'تونل کل شبکه روی روتر به sing-box و nft نیاز دارد: opkg install sing-box nftables (یا sing-box از تنظیمات → فایل‌های موردنیاز)');
     }
   if (settings.tunMode && myTun.prepare) {
     await myTun.prepare({ strict: settings.leakGuard === 'strict' });
@@ -1173,7 +1785,12 @@ function createService(opts = {}) {
     // keeps the tunnel, whose bypass was cut for exactly these addresses.
     livePins = { wgEndpointIps: settings.wgEndpointIps, entryHostIps: settings.entryHostIps };
 
-    const { plan, label, entryAddrs, config, geoWarn, engine } = buildActive(serverId, settings);
+    let active;
+    try { active = buildActive(serverId, settings); } catch (e) { throw refusal(e); }   // a target gone, a chain short of a member
+    const { plan, label, entryAddrs, config, geoWarn, engine } = active;
+    // A JSON server set to run raw, said once per connect: run as written, or —
+    // in a chain, advanced routing or the pool — used in its full form.
+    for (const note of rawModeNotes(plan, settings, RAW_OPTS)) send('log', note);
     // A router carries a house: one access-log line per connection, through the
     // service's stdout into syslog, is real CPU on a Cortex-A7 (the AC-1304 log
     // was a wall of `accepted udp:…`). Kept when the user asks for a verbose
@@ -1194,12 +1811,55 @@ function createService(opts = {}) {
       }
     }
 
-    send('status', { state: 'connecting', serverId });
+    send('status', { state: 'connecting', serverId, cause });
 
+    // asked beside the validation (cached by the manager after the first ask): see the check below
+    const officialVersion = OPENWRT ? Promise.resolve(xray.version('xray')).catch(() => '') : null;
     const check = await xray.validateWithFallback(config, engine);
     if (stale()) return abandoned;
     if (!check.ok) {
+      // Its check never gave a verdict: killed (the kernel's OOM killer on a
+      // 512 MB router) or out of memory in Go's runtime (xrayManager.validate).
+      // No refusal() — that would wait 10 minutes with the LAN blocked or
+      // direct; the boot loop's and the recovery's own pace try it again, and
+      // memory freed by then lets it finish (v1.16.1 re-review).
+      if (check.killed) {
+        send('log', { line: 'The config check did not finish: ' + check.error, level: 'error' });
+        throw new Error((settings.lang === 'en' ? 'The config check did not finish: ' : 'بررسی کانفیگ تمام نشد: ') + check.error);
+      }
       send('log', { line: 'Config rejected by xray: ' + check.error, level: 'error' });
+      // ECH on an official core older than 25.8.3 — the opkg feed's 24.12.31 /
+      // 25.1.30 — with no Xray-PattN to run it (validateWithFallback): that core
+      // would pass the config and connect without ECH. A refusal: retrying
+      // does not teach the core ECH; updating it does.
+      if (check.echUnsupported) {
+        throw refusal(settings.lang === 'en'
+          ? `This server uses ECH, which Xray ${check.coreVersion} does not know (it would connect without it) — update Xray under Settings → Required files`
+          : `این سرور از ECH استفاده می‌کند و Xray ${check.coreVersion} آن را نمی‌شناسد (بدون ECH وصل می‌شد) — از تنظیمات ← فایل‌های موردنیاز، Xray را به‌روز کن`);
+      }
+      // MASQUE on a core older than it (26.9.30; a WARP account 26.10.10) and
+      // no other core new enough — the opkg feed's cores are such — a refusal
+      // like ECH's: retrying does not teach the core MASQUE; updating it does.
+      if (check.masqueUnsupported) {
+        throw refusal(settings.lang === 'en'
+          ? `This MASQUE server needs Xray ${check.need} or newer — update it under Settings → Required files`
+          : `این سرور MASQUE است و به Xray نسخهٔ ≥ ${check.need} نیاز دارد — از تنظیمات ← فایل‌های موردنیاز به‌روزش کن`);
+      }
+      // The fork's finalmask, refused by the official core, and no fork to
+      // fall back to (xrayManager.validateWithFallback): what to install is
+      // the message — the renderer offers the download on the product name.
+      // (finalmaskIgnored: an official core older than 26.3.27 passes the
+      // config — finalmask is an unknown key to it — and would run it unmasked)
+      if (check.pattnNeeded) {
+        const en = settings.lang === 'en';
+        const why = check.finalmaskIgnored
+          ? (en ? `the official core ${check.coreVersion} does not know finalmask and would run it without its mask`
+            : `هستهٔ رسمی ${check.coreVersion} finalmask را نمی‌شناسد و آن را بدون ماسکش اجرا می‌کرد`)
+          : (en ? `the official core refuses it: ${check.error}` : `هستهٔ رسمی آن را رد می‌کند: ${check.error}`);
+        throw refusal(en
+          ? `This server needs Xray-PattN — install it under Settings → Required files (${why})`
+          : `این سرور به Xray-PattN نیاز دارد — از تنظیمات ← فایل‌های موردنیاز نصبش کن (${why})`);
+      }
       // The official core refuses plaintext VLESS/Trojan to public addresses and the
       // fork that accepts them is not installed — say so, the renderer offers the download.
       const hint = check.plaintextRejected
@@ -1214,16 +1874,56 @@ function createService(opts = {}) {
       // new Error(data.error)), so the hint IS the signal: the renderer keys off
       // the (untranslated) product name in it. A property set here would be
       // dropped in transit — don't add one.
-      throw new Error((settings.lang === 'en' ? 'Config error: ' : 'خطای کانفیگ: ') + check.error + hint);
+      const refused = new Error((settings.lang === 'en' ? 'Config error: ' : 'خطای کانفیگ: ') + check.error + hint);
+      // the core's verdict, unless its check never ran: a spawn short of
+      // memory, its file gone or being replaced (an opkg upgrade) — those come
+      // back by themselves (a check killed while it ran is check.killed, above).
+      // (`refused` is read in this process only — the boot loop and the
+      // recovery — never by the renderer.)
+      throw /binary not found|\bE(NOENT|TXTBSY|NOMEM|AGAIN|MFILE|NFILE)\b/.test(String(check.error || '')) ? refused : refusal(refused);
     }
     const runEngine = check.engine;
+    // The LAN's DNS plan (the hijack's `rules` form, `expectedIPs`) is verified
+    // on the official core from 26.3.27 (dnsBuilder.js); an older one — the
+    // 23.05 feed's xray-core is 24.12.31 — leaves HTTPS/SVCB queries with no
+    // answer at all. Said at every connect on it (field report D2, fix 21).
+    if (OPENWRT && runEngine === 'xray') {
+      const v = await officialVersion;
+      if (stale()) return abandoned;
+      if (versionBelow(v, CORE_DNS_VERIFIED)) {
+        send('log', {
+          line: settings.lang === 'en'
+            ? `The xray core is ${v}; the LAN's DNS is verified on ${CORE_DNS_VERIFIED} and newer — download the core under Settings → Required files`
+            : `هستهٔ xray نسخهٔ ${v} است؛ DNS شبکه روی ${CORE_DNS_VERIFIED} و بالاتر آزموده شده — هسته را از تنظیمات ← فایل‌های موردنیاز دانلود کن`,
+          level: 'warn'
+        });
+      }
+    }
+    // The resolvers a bypass mode asks direct are asked in plain text from
+    // inside the country: a public anycast one there (a desktop backup's
+    // 8.8.8.8 / 1.1.1.1 — dnsDirect is not kept on a restore) is filtered or
+    // answers poisoned, and tells the ISP every name. Said at every connect
+    // (field report D3).
+    if (OPENWRT) {
+      const anycast = resolverBypassIpsOf(config).filter(ip => PUBLIC_ANYCAST_DNS.has(ip));
+      if (anycast.length) {
+        const mode = String(settings.routingMode || '');
+        send('log', {
+          line: settings.lang === 'en'
+            ? `The in-country DNS of ${mode} holds public resolvers (${anycast.join(', ')}): they are asked in plain text from inside the country, where they are filtered or answer poisoned — put in-country resolvers in the direct DNS list`
+            : `DNS داخلی ${mode} رزولورهای عمومی دارد (${anycast.join(', ')}): از داخل کشور بی‌رمز پرسیده می‌شوند، جایی که فیلتر شده‌اند یا جواب مسموم می‌دهند — رزولورهای داخل کشور را در فهرست DNS مستقیم بگذار`,
+          level: 'warn'
+        });
+      }
+    }
 
     // save/restore rather than clear — reapplyConnection() wraps the whole
     // teardown+reconnect in the same flag
+    let ownCore = null;   // the core this call started, while it is still the one running
     const prevReloading = xrayReloading;
     xrayReloading = true;
     try {
-      await xray.start(config, runEngine);
+      if (await xray.start(config, runEngine)) ownCore = xray.proc;
       if (!stale()) liveDiagnostics = JSON.parse(JSON.stringify({ config, plan, socksPort: settings.socksPort, tunRequested: !!settings.tunMode }));
     } catch (e) {
       // start() watches for 1.2 s to catch a config that crashes the core on
@@ -1236,15 +1936,37 @@ function createService(opts = {}) {
       if (stale()) return abandoned;
       throw e;
     } finally { xrayReloading = prevReloading; }
-    // The critical one. doDisconnect() has already stopped the core this just
-    // started, so writing activeServerId back here would resurrect the very
-    // intent that was cancelled — and every side effect below would follow it.
-    if (stale()) return abandoned;
+    // A disconnect that overtook this call (a Cancel while connecting) tore down
+    // what it found — but this call can have started its core AFTER that
+    // teardown: in a server switch start() stops the old core first, and the
+    // disconnect's own stop, waiting on the same exit, is released after it,
+    // with the new core already spawned. Nothing else would ever stop that one.
+    // Stopped here, and only for a disconnect with nothing after it: a newer
+    // connect owns the core it finds (its own start() stops ours first). Ours,
+    // not a crash (quietStops).
+    const giveWay = async () => {
+      if (connGen === disconnectGen && ownCore && xray.proc === ownCore) {
+        quietStops++;
+        try { await xray.stop(); } catch { /* best effort */ } finally { quietStops--; }
+      }
+      return abandoned;
+    };
+    // The critical one. Writing activeServerId back here would resurrect the
+    // very intent that was cancelled — and every side effect below would follow it.
+    if (stale()) return giveWay();
     setIfChanged('activeServerId', serverId);
     setIfChanged('lastServerId', serverId);   // survives a disconnect: "connect to the last server" at launch
     if (OPENWRT) setIfChanged('connectIntent', serverId);   // the router's "stay like this" (see bootIntent)
+    if (OPENWRT) {
+      await syncKillSwitch('connect');   // the VPN is meant to be on from here: armed before the gateway (K2)
+      if (stale()) return giveWay();
+    }
     pinWatch.setLive(directServers(plan));
     appliedSettings = snapshotApplied(getSettings());
+    liveServerIds = planServerIds(plan);
+    serverEditPending = false;
+    liveMux = mux.ids.length ? mux : null;
+    liveRouting = liveRoutingOf({ serverId, plan, profiles: getRoutingProfiles(), chains: getChains() });
 
     if (settings.systemProxy) {
       try {
@@ -1252,7 +1974,7 @@ function createService(opts = {}) {
         send('log', { line: 'System proxy enabled', level: 'info' });
       } catch (e) { send('log', { line: 'System proxy failed: ' + e.message, level: 'error' }); }
     }
-    if (stale()) return abandoned;
+    if (stale()) return giveWay();
 
     // TUN mode (system-wide tunnel via sing-box, or tun2socks as the fallback —
     // see makeTun). Requires root/admin + the backend's files.
@@ -1303,6 +2025,7 @@ function createService(opts = {}) {
           // keepDns: the held override stays on the main service too (see reapplyConnection).
           if (process.platform === 'darwin') await myTun.stop({ keepDns: !!(hold && hold.held) });
           else { try { await myTun.stop(); } catch {} }
+          publishKillSwitch();   // a router's switch: the LAN is blocked across the gap (K3)
         }
         try {
           myTun.lang = settings.lang || 'fa';
@@ -1326,27 +2049,53 @@ function createService(opts = {}) {
           // A slow router: the core takes seconds to bind its SOCKS inbound after
           // start() returns (nine on the AC-1304), and a TUN that comes up first
           // answers every LAN connection "connection refused" until then.
+          // A core that DIED meanwhile is a failed connect, said with its own
+          // last lines — the gateway would only route the whole LAN into a
+          // port nobody will ever open, then rebuild, forever (fix 20). One
+          // still running after the 20 s may just be slow: it gets the gateway.
           if (OPENWRT) {
-            const bound = await waitPort(settings.socksPort, 20000);
-            if (stale()) return abandoned;
-            if (!bound) send('log', { line: `The core has not opened 127.0.0.1:${settings.socksPort} after 20s — starting the gateway anyway`, level: 'warn' });
+            const bound = await waitCorePort(settings.socksPort, 20000, ownCore);
+            if (stale()) return giveWay();
+            // this connect's failure — and so its caller's retry, not the drop's (recoverFromDrop)
+            if (bound === 'exited') { coreStopReported = coreStops; throw coreGoneError(settings); }
+            if (bound !== 'bound') send('log', { line: `The core has not opened 127.0.0.1:${settings.socksPort} after 20s — starting the gateway anyway`, level: 'warn' });
+            // the remote control's destinations, laid with the gateway (setRemoteBypass)
+            if (typeof myTun.setBypass === 'function') await myTun.setBypass(remoteBypass().cidrs);
           }
-          await myTun.start(settings.socksPort, [...entryAddrs, ...resolverBypassIpsOf(config), ...pinnedIps],
+          // The in-country resolvers the core dials `direct` (bypass-ir) are a
+          // route exclusion on a desktop. Not on a router: there the exclusion
+          // is for the WHOLE LAN on every port — dnsmasq's upstream, or a phone
+          // with a hard-coded resolver, then went to them in plain text by the
+          // ISP, and filtered names came back poisoned (field report D3). The
+          // core's own query to them needs no hole: its `direct` outbound is
+          // bound to the WAN device (configBuilder.bindDirectDials,
+          // SO_BINDTODEVICE), which no route in sing-box's table matches. The
+          // entry servers, WireGuard endpoints and pinned addresses stay off.
+          // The router's OWN lookups through them (the relay link's) still go
+          // around the tunnel — this process's UDP 53 only, by a rule for its
+          // user from the router itself (`ownDirect`, TunOpenwrt.layOwnDirect):
+          // the remote way in must not need the VPN.
+          // Likewise the resolver an ECH config is fetched from: bound, so a
+          // hole only where the strict guard firewalls a desktop's adapter.
+          const resolverHoles = OPENWRT ? [] : [...resolverBypassIpsOf(config), ...(settings.leakGuard === 'strict' ? echResolverIpsOf(config) : [])];
+          await myTun.start(settings.socksPort, [...entryAddrs, ...resolverHoles, ...pinnedIps],
             tunAdapterDns,
-            { ipv6: !!settings.ipv6, strict: settings.leakGuard === 'strict', apps: tunApps, bypassMacs: settings.lanBypassMacs, blockQuic: !!settings.lanBlockQuic });   // tun2socks ignores the 4th; only the router reads bypassMacs/blockQuic
+            { ipv6: !!settings.ipv6, strict: settings.leakGuard === 'strict', apps: tunApps, bypassMacs: settings.lanBypassMacs, blockQuic: !!settings.lanBlockQuic, ownDirect: OPENWRT ? resolverBypassIpsOf(config) : [] });   // tun2socks ignores the 4th; only the router reads bypassMacs/blockQuic/ownDirect
           send('log', { line: 'TUN mode active (whole system)', level: 'info' });
+          noteOpenFiles();   // the router's descriptor budget, now that sing-box runs (v1.16.2)
           if (tunApps) {
             send('log', {
               line: `Per-app routing: ${tunApps.mode === 'exclude' ? 'these apps go around the tunnel' : 'only these apps use the tunnel'} — ${tunApps.names.join(', ')}`,
               level: 'info'
             });
           }
-        if (settings.leakGuard === 'strict' && myTun.backendId !== 'sing-box') {
+        // the router's gateway IS sing-box (composed): its strict level is strict_route
+        if (settings.leakGuard === 'strict' && !['sing-box', 'openwrt'].includes(myTun.backendId)) {
           send('log', { line: 'Strict guard on the tun2socks backend: no strict_route and IPv4-only firewall rules — install sing-box for the guard the setting promises', level: 'warn' });
         }
         } catch (e) { tunError = e.message;
         // (the router's failure path is abortGateway, below — never this macOS one)
-        if (!OPENWRT && process.platform === 'darwin' && myTun.active) throw e; send('log', { line: 'TUN start failed: ' + e.message, level: 'error' }); }
+        if (!OPENWRT && process.platform === 'darwin' && myTun.active) throw e; send('log', { line: (e && e.coreGone ? '' : 'TUN start failed: ') + e.message, level: 'error' }); }
       }
       // The leak guard (standard): the TUN adapter's own resolver is ours, but
       // Windows asks the resolvers of EVERY connected adapter in parallel and
@@ -1409,8 +2158,10 @@ function createService(opts = {}) {
       // the first thing this block cut off. Resolve them the way the TUN layer
       // does before they become firewall holes.
       const udpExcludes = await tunPlatform.resolveServerIps(entryAddrs, { ipv6: true }).catch(() => []);
-      await leakGuard.engageUdpBlock({ excludes: udpExcludes });
+      const udp = await leakGuard.engageUdpBlock({ excludes: udpExcludes });
         guardEngaged = true;
+        // its receipt too: a connect overtaken below gives back what it engaged
+        guardToken = (udp && udp.token) || guardToken;
       } catch (e) {
         guardError = e.message;
         send('log', { line: 'UDP block failed: ' + e.message + ' — WebRTC can still reveal your address in proxy mode', level: 'error' });
@@ -1431,7 +2182,7 @@ function createService(opts = {}) {
       // "disconnected".
       if (guardToken) await leakGuard.release({ token: guardToken }).catch(() => {});
       if (myTun && myTun.active) { try { await myTun.stop(); } catch {} }
-      return abandoned;
+      return giveWay();
     }
 
     // On a router a gateway that did not come up is a FAILED connect, not the
@@ -1439,8 +2190,8 @@ function createService(opts = {}) {
     // direct while the panel, the boot retries and the recovery all took it
     // for a success. Undone and thrown, so each of them retries.
     if (OPENWRT && settings.tunMode && tunError) {
-      const overtaken = await abortGateway(serverId, prevActive, myTun, stale, tunError);
-      if (overtaken) return abandoned;
+      const overtaken = await abortGateway(serverId, prevActive, myTun, stale, tunError, cause === 'boot');
+      if (overtaken) return giveWay();
       throw new Error(tunError);
     }
 
@@ -1450,6 +2201,7 @@ function createService(opts = {}) {
 
     stats.setBin(xray.anyBin());
     stats.apiPort = settings.apiPort;
+    stats.skipTags = rawServerOf(plan, settings, RAW_OPTS) ? dialerTagsOf(config) : null;
     watchWgSilence(config);
     // a fresh core counts from zero — tell the meter, or the first poll of the
     // new session reads as growth on the old one (see main.js)
@@ -1480,7 +2232,7 @@ function createService(opts = {}) {
 
     send('status', {
       state: 'connected', serverId, server: byId(serverId) || null, label, engine: runEngine,
-      tun: tun.active, tunError, guardError, geoWarn, lan, pendingReconnect: pendingKeys()
+      tun: tun.active, tunError, guardError, geoWarn, lan, pendingReconnect: pendingKeys(), cause
     });
     // `tunError` is the one failure this function does NOT throw for: TUN is a
     // best-effort upgrade and we stay connected proxy-only without it. Callers
@@ -1488,6 +2240,54 @@ function createService(opts = {}) {
     // recovery) can only find out from here — the status event above is fire and
     // forget. The clients ignore this value; they only await the call.
     return { ok: true, tunError };
+  }
+
+  /**
+   * The router's wait for the core's SOCKS inbound (connectOnce): 'bound',
+   * 'timeout' — or 'exited' as soon as the core this connect started is gone
+   * (start() watches only its first 1.2 s; the A7 needs ~9 s to bind).
+   */
+  async function waitCorePort(port, ms, core) {
+    const gone = () => !xray.running || (!!core && xray.proc !== core);
+    let timer = null;
+    let over = false;
+    const exited = new Promise((resolve) => {
+      const tick = () => {
+        if (over) return;
+        if (gone()) { resolve('exited'); return; }
+        timer = setTimeout(tick, 200);
+        if (timer.unref) timer.unref();
+      };
+      tick();
+    });
+    try {
+      const r = await Promise.race([
+        Promise.resolve(waitPort(port, ms, { stop: gone })).then((b) => (b ? 'bound' : 'timeout')),
+        exited
+      ]);
+      return gone() ? 'exited' : r;
+    } finally { over = true; clearTimeout(timer); }
+  }
+
+  /**
+   * The connect's error for a core that exited before its port opened — in the
+   * user's language: how it ended (an OOM kill prints nothing; the signal and
+   * the memory are the clue), and what it said. A Go panic is quoted by its
+   * own `panic:` line, not the stack frames printed after it.
+   */
+  function coreGoneError(settings) {
+    const all = typeof xray.recentLines === 'function' ? xray.recentLines(60) : [];
+    const key = all.find(l => /^(panic|fatal error):|Failed to start/i.test(l));
+    const last = key ? [key] : all.slice(-5);
+    const ex = lastCoreExit || {};
+    const how = `code=${ex.code != null ? ex.code : '-'} signal=${ex.signal || '-'}`;
+    const en = settings.lang === 'en';
+    const said = last.length ? last.join(' | ') : (en ? '(it printed nothing)' : '(چیزی چاپ نکرد)');
+    const e = new Error(en
+      ? `The core exited (${how}) before it opened 127.0.0.1:${settings.socksPort} — the whole-network tunnel was not started. Its last lines: ${said}${memLine()}`
+      : `هسته پیش از باز کردن 127.0.0.1:${settings.socksPort} بسته شد (${how}) — تونل کل شبکه راه‌اندازی نشد. آخرین خطوط آن: ${said}${memLine()}`);
+    e.coreGone = true;
+    return e;
   }
 
   /**
@@ -1508,8 +2308,10 @@ function createService(opts = {}) {
    *
    * Returns true when a disconnect or a newer connect overtook this call
    * while it awaited: that one owns the state now, so nothing is written.
+   * A boot attempt (`boot`) says nothing here at all: the boot loop reports
+   * its waiting between the retries (B3).
    */
-  async function abortGateway(serverId, prevActive, myTun, stale, message) {
+  async function abortGateway(serverId, prevActive, myTun, stale, message, boot = false) {
     if (myTun && myTun.active) { try { await myTun.stop(); } catch { /* best effort */ } }
     if (stale()) return true;
     quietStops++;
@@ -1526,15 +2328,55 @@ function createService(opts = {}) {
       stopNetWatcher();
       if (stats) stats.stop();
       liveDirectInterface = null;
-      if (prevActive) send('status', { state: 'disconnected' });
-      else tell('status', { state: 'error', message });
+      if (prevActive) send('status', { state: 'disconnected', cause: 'abort' });
+      else if (!boot) tell('status', { state: 'error', message, serverId, cause: 'abort' });
+      // The intent stays (only the user's Disconnect clears it), so an armed
+      // kill switch keeps the LAN blocked — with no retry coming. Said plainly.
+      if (!boot && killSwitchState().blocking) {
+        send('log', { line: 'Kill switch: the connect failed and nothing retries it — LAN internet stays blocked until a connect succeeds or you press Disconnect', level: 'warn' });
+      }
     }
     return false;
   }
 
-  /** Reconnect-relevant settings changed since the live tunnel was built. */
+  /**
+   * Reconnect-relevant settings changed since the live tunnel was built — and
+   * 'servers' for an edit of one it dials, 'routingProfiles' / 'chains' for an edit
+   * of the routing profile / a chain it was built from.
+   */
   function pendingKeys() {
-    return pendingReconnectKeys(appliedSettings, getSettings());
+    const keys = pendingReconnectKeys(appliedSettings, getSettings());
+    if (appliedSettings && serverEditPending) keys.push('servers');
+    if (appliedSettings) for (const k of routingPendingKeys(liveRouting, getRoutingProfiles(), getChains())) if (!keys.includes(k)) keys.push(k);
+    return keys;
+  }
+
+  /** Did an edit change what the core dials? Everything but the name (a label, never in the config) and `_edited` (which fields a subscription refresh keeps), key order aside. */
+  function dialChanged(a, b) {
+    const canon = (v) => (Array.isArray(v) ? v.map(canon) : (v && typeof v === 'object' ? Object.keys(v).sort().reduce((o, k) => { o[k] = canon(v[k]); return o; }, {}) : v));
+    const dialled = (s) => JSON.stringify(canon(Object.assign({}, s, { name: null, _edited: null })));
+    return dialled(a) !== dialled(b);
+  }
+
+  /** The ids of every saved server a plan dials: each hop of a chain, every pool and advanced-routing target, every base one goes through. */
+  function planServerIds(plan) {
+    const ids = new Set();
+    const add = (s) => { if (s && s.id) ids.add(s.id); };
+    const hops = (list) => { for (const s of list || []) add(s); };
+    const target = (tg) => {
+      if (!tg || tg === 'direct' || tg === 'block') return;
+      if (tg === 'chain') return hops(plan.chain);
+      if (String(tg).indexOf('chain:') === 0) return hops((plan.chainsById || {})[String(tg).slice('chain:'.length)]);
+      add((plan.serversById || {})[tg]);
+    };
+    switch (plan && plan.mode) {
+      case 'single': add(plan.server); break;
+      case 'chain': hops(plan.chain); break;
+      case 'pool': for (const e of plan.entries || []) if (e) target(e.target); break;
+      case 'advanced': { const t = advancedTargets(plan); for (const tg of [...t.targets, ...t.vias]) target(tg); break; }
+      default: break;
+    }
+    return ids;
   }
 
   /**
@@ -1554,8 +2396,9 @@ function createService(opts = {}) {
     // serverId captured above back, bring TUN up and report connected: the
     // operator's disconnect undone.
     const gen = connGen;
+    const cause = opts.recovery ? recoveryCause : 'user';
 
-    send('status', { state: 'connecting', serverId });
+    send('status', { state: 'connecting', serverId, cause });
 
     const prevReloading = xrayReloading;
     xrayReloading = true;              // intentional restart, not a drop
@@ -1609,8 +2452,11 @@ function createService(opts = {}) {
       appliedSettings = null;
       // the proxy kept above must not stay aimed at a core that did not come back
       try { await setProxy(false, {}); } catch {}
-      send('status', { state: 'error', message: e.message });
-      return { ok: false, error: e.message };
+      // Inside a recovery the attempt's failure is not an "error" for the
+      // clients: runRecovery says "reconnecting" with the next wait at once,
+      // and the log line carries the reason (S4). A rebuild by hand says it.
+      if (!opts.recovery) send('status', { state: 'error', message: e.message, serverId, cause });
+      return { ok: false, error: e.message, refused: !!(e && e.refused) };
     }
     // A disconnect overtook the connect: it emitted nothing and started nothing,
     // so neither may we.
@@ -1628,21 +2474,110 @@ function createService(opts = {}) {
    * own backoff.
    */
   async function reapplyByHand() {
+    endPendingRecovery();
     const r = await reapplyConnection();
-    if (OPENWRT && r && !r.ok && !r.stale && store.get('activeServerId', null)) recoverFromDrop('gateway-failed');
+    // (its 'error' status is said already: reapplyConnection, by hand)
+    if (OPENWRT && r && !r.ok && !r.stale) handToRecovery('gateway-failed', { refused: !!r.refused, message: r.error, said: true });
     return r;
+  }
+
+  /** recoverQueued's mark for a hand-over that came while a recovery was in flight (handToRecovery). */
+  const HAND_OVER = 'hand-over';
+
+  /**
+   * A rebuild by hand — a Reconnect, an Apply, a Connect on the live
+   * connection — that failed and kept the intent (abortGateway), with nothing
+   * running: the recovery takes it over as after any drop, from its SECOND
+   * attempt, after the first wait — the try by hand was the first. Taken up at
+   * once instead, a core that dies before its port opens was started twice in
+   * a row, and then (through the drop its death also was) again and again with
+   * no backoff at all (review of v1.16.1, critical). `failure`: the core
+   * refused it ({ refused, message, said }) — no quick retry (holdRefused).
+   */
+  function handToRecovery(reason, failure = null) {
+    if (!OPENWRT || !store.get('activeServerId', null) || recoverTimer) return;
+    // A recovery in flight is either the one this hand action overtook (it
+    // goes stale and retries nothing) or one a drop started after it (it owns
+    // the retry, and backs off by itself if it fails). Only its end tells
+    // which, so the hand-over is asked again then — when the connection is up,
+    // or a retry armed, or neither and the hand-over is due. A timer armed
+    // here instead fired into that recovery, was only queued, and left a
+    // handle that read as "a retry is coming" for good (v1.16.1 re-review).
+    // A drop already queued behind it goes first: that one rebuilds too.
+    if (recovering) { if (recoverQueued == null) recoverQueued = HAND_OVER; return; }
+    if ((xray && xray.running) || (tun && tun.active)) return;   // refused before anything was torn down: the old connection still runs
+    recoveryCause = causeOf(reason);
+    if (failure && failure.refused) { holdRefused(reason, failure.message, { said: !!failure.said }); return; }
+    const wait = backoffAfter(0);
+    send('log', { line: `Reconnect failed — retrying in ${wait / 1000}s`, level: 'warn' });
+    send('status', { state: 'reconnecting', reason, attempt: 2, retryInMs: wait, cause: recoveryCause });
+    // every recovery timer lets go of its handle as it fires: whatever the
+    // call then does (queued behind a recovery, an intent gone), a handle
+    // left behind would read as a retry still to come (recoverFromDrop, judgeWanChange, alreadyUp)
+    recoverTimer = setTimeout(() => {
+      recoverTimer = null;
+      recoverFromNetworkChange(reason, 1).catch((e) => {
+        send('log', { line: 'Recovery failed: ' + ((e && e.message) || e), level: 'error' });
+      });
+    }, wait);
+    if (recoverTimer.unref) recoverTimer.unref();
+  }
+
+  /**
+   * On a router: a connect the core refused (refusal() — the config, Xray-PattN
+   * needed, a plan that cannot be built), from the recovery or a hand-over.
+   * The intent stays; the clients hear why as an error (LuCI: "Error: …"), not
+   * "Reconnecting… (attempt n)" with the reason only in syslog; it is tried
+   * again rarely (T.refusedRetryMs) — a file installed, an edit or a
+   * subscription refresh may have changed it — or at once by a Connect.
+   * (v1.16.1 re-review: a finalmask server with no Xray-PattN on a feed core.)
+   */
+  function holdRefused(reason, message, { said = false } = {}) {
+    const wait = T.refusedRetryMs;
+    send('log', { line: `The core refuses this connection — tried again in ${inWords(wait)}, or at once by Connect: ${message}`, level: 'error' });
+    if (!said) send('status', { state: 'error', message, serverId: store.get('activeServerId', null), cause: recoveryCause });
+    sayRefusedBlocking();
+    clearTimeout(recoverTimer);
+    recoverTimer = setTimeout(() => {
+      recoverTimer = null;
+      recoverFromNetworkChange(reason, 0).catch((e) => {
+        send('log', { line: 'Recovery failed: ' + ((e && e.message) || e), level: 'error' });
+      });
+    }, wait);
+    if (recoverTimer.unref) recoverTimer.unref();
+  }
+  /** An armed kill switch holds the LAN through a refusal — said, with the way out. */
+  function sayRefusedBlocking() {
+    if (killSwitchState().blocking) {
+      send('log', { line: 'Kill switch: the core refuses this connection — LAN internet stays blocked until it connects or you press Disconnect', level: 'warn' });
+    }
+  }
+  const inWords = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${ms / 1000}s`);
+
+  /**
+   * A connect or a reconnect by hand ends a drop's pending retry, as a
+   * disconnect does (review I5): the backoff timer would otherwise fire into
+   * the connection just made and rebuild it — a 20-40 s LAN outage shown as
+   * "reconnecting", for nothing.
+   */
+  function endPendingRecovery() {
+    clearTimeout(recoverTimer);
+    recoverTimer = null;
+    recoverQueued = null;
   }
 
   async function rebuildActiveConfig() {
     const serverId = store.get('activeServerId', null);
     if (!serverId || !xray.running) return;
-    let settings = await effectiveSettings();
+    let settings = await effectiveSettings(serverId);
     // Keep the binding the live connection was built with (see doConnect): the
     // tunnel stays up across this reload, and asking the OS now would name it.
     if (liveDirectInterface) settings = Object.assign({}, settings, { directInterface: liveDirectInterface });
     // …and the addresses it pinned: the tunnel's bypass names exactly these, and
     // a name asked again now could answer another (see doConnect)
     if (livePins) settings = Object.assign({}, settings, livePins);
+    // …and what it muxed: a reload is no new connect, and tests nothing
+    if (liveMux) settings = Object.assign({}, settings, { muxServerIds: liveMux.ids });
     // `plan` too: the usage meter needs it to attribute the new core's bytes
     const { plan, config, engine } = buildActive(serverId, settings);
     const prevReloading = xrayReloading;
@@ -1682,6 +2617,11 @@ function createService(opts = {}) {
   }
   // The last recovery that brought the connection back: when, and on which attempt.
   let lastRebuilt = null;
+  // The recovery in flight, for the snapshot's `cause`: a drop being rebuilt
+  // ('recovery') or the network having moved ('netwatch'). Read by the
+  // connect/reapply it calls (their status events carry it).
+  let recoveryCause = 'recovery';
+  const causeOf = (reason) => (DROP_REASONS.has(reason) ? 'recovery' : 'netwatch');
 
   /**
    * A drop. The first one is rebuilt at once. One that comes within
@@ -1693,11 +2633,24 @@ function createService(opts = {}) {
    * quiet spell longer than the window starts it from the beginning again.
    * (A stray late `stopped` from a core already replaced lands here too.)
    */
-  function recoverFromDrop(reason) {
+  function recoverFromDrop(reason, seq = null) {
     const fail = (e) => send('log', { line: 'Recovery failed: ' + ((e && e.message) || e), level: 'error' });
+    // The death of a core whose connect reported it as its own failure
+    // (coreGoneError, `seq`: the core's stop): that connect's caller retries
+    // — the recovery's backoff, the boot loop, a hand-over (handToRecovery) —
+    // or, for a connect by hand that kept nothing, nobody does. Not here too.
+    const reported = () => seq != null && seq === coreStopReported;
+    if (reported()) return;
     // the same gates as recoverFromNetworkChange(), before anything is said or armed
     if (!store.get('activeServerId', null)) return;
+    // what the dropped connection muxed: kept for the rebuild, re-tested by the next connect the user or the boot makes
+    recheckLiveMux();
     if (!OPENWRT && !getSettings().autoReconnectOnNetworkChange) return;
+    // A retry already scheduled (a failed attempt's backoff, a hand-over, an
+    // earlier drop's wait) is the rebuild for this drop too. Taken up again
+    // here, a drop with no successful rebuild to count from ran attempt 0 at
+    // once and cancelled that backoff (review of v1.16.1, critical).
+    if (recoverTimer) return;
     if (recovering) { recoverQueued = reason; return; }
     // A connect in flight (the operator's, the boot's, a settings apply's) is
     // where this drop may have landed: never a second one beside it (see
@@ -1707,7 +2660,7 @@ function createService(opts = {}) {
       Promise.allSettled([...connectsInFlight]).then(() => {
         if (userDisconnecting || isQuitting) return;
         if (reason === 'core-exited' ? !!(xray && xray.running) : !!(tun && tun.active)) return;
-        recoverFromDrop(reason);
+        recoverFromDrop(reason, seq);
       }).catch(fail);
       return;
     }
@@ -1721,9 +2674,13 @@ function createService(opts = {}) {
       return;
     }
     const attempt = lastRebuilt.attempt + 1;
-    send('log', { line: `The connection dropped again ${Math.round(since / 1000)}s after it was rebuilt (${reason}) — waiting ${wait / 1000}s before the next rebuild`, level: 'warn' });
+    send('log', { line: `The connection dropped again ${Math.round(since / 1000)}s after it was rebuilt (${reason}) — waiting ${wait / 1000}s before the next rebuild${memLine()}`, level: 'warn' });
+    // Said at once and kept through the wait (S4): the clients would otherwise
+    // show "disconnected" until the rebuild starts. The attempt is the one
+    // about to run — the number runRecovery will report for it.
+    send('status', { state: 'reconnecting', reason, attempt: attempt + 1, retryInMs: wait, cause: causeOf(reason) });
     clearTimeout(recoverTimer);
-    recoverTimer = setTimeout(() => recoverFromNetworkChange(reason, attempt).catch(fail), wait);
+    recoverTimer = setTimeout(() => { recoverTimer = null; recoverFromNetworkChange(reason, attempt).catch(fail); }, wait);
     if (recoverTimer.unref) recoverTimer.unref();
   }
 
@@ -1781,7 +2738,16 @@ function createService(opts = {}) {
     const queued = recoverQueued;
     if (queued == null) return;
     recoverQueued = null;
+    // a hand action that failed during this recovery: asked again now (see handToRecovery)
+    if (queued === HAND_OVER) { handToRecovery('gateway-failed'); return; }
     if (DROP_REASONS.has(queued)) { recoverFromDrop(queued); return; }
+    // the router's WAN verdict is never replayed blind: the rebuild that just
+    // finished built for the network we have now (review I3; judgeWanChange
+    // does not queue behind a recovery either, this is the belt to its braces)
+    if (queued === 'wan-changed') {
+      send('log', { line: 'A network change judged during the rebuild is not replayed — the rebuild built for the network we have now', level: 'info' });
+      return;
+    }
     await recoverFromNetworkChange(queued, 0);
   }
 
@@ -1794,8 +2760,9 @@ function createService(opts = {}) {
     recoverTimer = null;
 
     const dropped = DROP_REASONS.has(reason);
+    recoveryCause = causeOf(reason);
     send('log', { line: `${dropped ? 'The connection dropped' : 'Network changed'} (${reason}) — rebuilding the connection`, level: 'warn' });
-    send('status', { state: 'reconnecting', reason, attempt: attempt + 1 });
+    send('status', { state: 'reconnecting', reason, attempt: attempt + 1, retryInMs: 0, cause: recoveryCause });
     if (attempt === 0) notify('IRNetFree', isEn() ? 'Network changed — reconnecting' : 'شبکه عوض شد — در حال اتصال مجدد');
 
     // Pick the rebuild path by what the core is ACTUALLY doing. Both paths answer
@@ -1808,13 +2775,17 @@ function createService(opts = {}) {
       res = (xray && xray.running) ? await reapplyConnection({ recovery: true }) : await doConnect(serverId, { recovery: true });
     } catch (e) {
       // doConnect() throws where reapplyConnection() returns { ok: false }.
-      res = { ok: false, error: (e && e.message) || String(e) };
+      res = { ok: false, error: (e && e.message) || String(e), refused: !!(e && e.refused) };
     }
 
     // The operator disconnected (or connected somewhere else) while we were
     // rebuilding. The rebuild abandoned itself without emitting anything; a log
     // line or a retry here would be about a tunnel nobody asked for any more.
     if (res && res.stale) return;
+
+    // Refused by the core before anything started: no backoff step changes
+    // that — said as an error, tried again rarely (holdRefused).
+    if (OPENWRT && res && !res.ok && res.refused) { holdRefused(reason, res.error); return; }
 
     // doConnect() does not throw when TUN was asked for and did not come up: it
     // reports tunError and carries on proxy-only. Calling that a restored
@@ -1869,12 +2840,73 @@ function createService(opts = {}) {
       return;
     }
     send('log', { line: `Reconnect failed — retrying in ${delay / 1000}s`, level: 'warn' });
-    recoverTimer = setTimeout(() => recoverFromNetworkChange(reason, attempt + 1), delay);
+    // still "reconnecting" through the wait, with the attempt about to run (S4)
+    send('status', { state: 'reconnecting', reason, attempt: attempt + 2, retryInMs: delay, cause: recoveryCause });
+    recoverTimer = setTimeout(() => {
+      recoverTimer = null;   // fired: no longer a retry to come, whatever the call below does (see handToRecovery)
+      recoverFromNetworkChange(reason, attempt + 1).catch((e) => {
+        send('log', { line: 'Recovery failed: ' + ((e && e.message) || e), level: 'error' });
+      });
+    }, delay);
     if (recoverTimer.unref) recoverTimer.unref();
+  }
+
+  /**
+   * The router's verdict on a settled WAN change (wanWatch.js, S3): the
+   * tunnel is asked whether it survived — twice, 5 s apart — and only one
+   * that answers neither time is rebuilt, through the same recovery a drop
+   * uses; the device the live connection's direct dials are bound to having
+   * vanished is a rebuild at once. Said either way, with the diff.
+   */
+  async function judgeWanChange(diff) {
+    const what = diff.lines.length ? diff.lines.join('; ') : 'the link moved and settled back';
+    const bound = liveDirectInterface;
+    // A rebuild in flight (a drop's recovery, a backoff retry scheduled, a
+    // connect by hand) builds for the network we have NOW, and a gateway that
+    // is down for a drop cannot answer a probe: judged, this change would only
+    // queue a second, blind rebuild behind the first (review I3). Not judged.
+    const busy = () => recovering || !!recoverTimer || connectsInFlight.size > 0 || !(tun && tun.active);
+    if (busy()) {
+      send('log', { line: `Network changed (${what}) — a rebuild is in flight, which builds for the network we have now; not judged`, level: 'info' });
+      return;
+    }
+    const gen = connGen;   // the connection this verdict is about (review M4)
+    let verdict;
+    try { verdict = await decideWanChange({ diff, boundDev: bound, probe: probeTunnel, probeGapMs: T.wanProbeGapMs }); }
+    catch { verdict = 'rebuild'; }
+    if (gen !== connGen) {
+      send('log', { line: `Network changed (${what}) — the connection moved meanwhile, verdict dropped`, level: 'info' });
+      return;
+    }
+    if (verdict === 'kept') { send('log', { line: `Network changed (${what}) — the tunnel answers, kept`, level: 'info' }); return; }
+    if (busy()) {
+      send('log', { line: `Network changed (${what}) — the tunnel does not answer, but a rebuild is already in flight; not queued`, level: 'info' });
+      return;
+    }
+    const why = bound && diff.devGone.includes(bound) ? `the WAN device the tunnel is bound to (${bound}) is gone` : 'the tunnel does not answer';
+    send('log', { line: `Network changed (${what}) — ${why}, rebuilding`, level: 'warn' });
+    await recoverFromNetworkChange('wan-changed').catch((e) => {
+      send('log', { line: 'Network recovery failed: ' + ((e && e.message) || e), level: 'error' });
+    });
   }
 
   function startNetWatcher() {
     stopNetWatcher();
+    if (OPENWRT) {
+      // The router's watcher: WAN facts only, from netifd (the interfaces
+      // holding a default route — up, device, IPv4 address, gateway; IPv6 by
+      // up and device only), judged by a probe (judgeWanChange). The desktop's
+      // every-address fingerprint rebuilt the gateway on an IPv6 prefix
+      // rotation and on every WAN blip — 20-40 s of the LAN direct each time.
+      netWatcher = createWanWatcher({
+        readDump: async () => JSON.parse(await lanRun('ubus', ['call', 'network.interface', 'dump'], { timeout: 5000 })),
+        settleMs: T.wanSettleMs,
+        intervalMs: T.wanIntervalMs,
+        onChange: ({ diff }) => judgeWanChange(diff)
+      });
+      netWatcher.start();
+      return;
+    }
     netWatcher = new NetWatcher({
       read: () => os.networkInterfaces(),
       // Our own TUN adapter is not part of "the machine's network": a rebuild
@@ -1897,6 +2929,7 @@ function createService(opts = {}) {
    * taken before the watcher exists is comparable with the baseline it adopts.
    */
   function currentNetFingerprint() {
+    if (OPENWRT) return null;   // the router judges WAN changes by a probe (startNetWatcher), never by this
     return fingerprint(os.networkInterfaces(), isOwnTunInterface);
   }
 
@@ -1920,6 +2953,7 @@ function createService(opts = {}) {
   async function stopAllTuns(opts) {
     dnsGuardWatch?.stop();
     await stopTrackedTunnels(startedTuns, tun, process.platform, opts);
+    publishKillSwitch();   // the gateway is down: a rebuild's gap is blocked, a disconnect's is not (disarmed before it)
   }
 
   /** The same sweep for the exit hook, where nothing can be awaited. */
@@ -1937,6 +2971,7 @@ function createService(opts = {}) {
       // the watchers, and a recovery that hung (a stuck privileged shell) must not
       // keep its lock and park every future trigger.
       connGen++;
+      disconnectGen = connGen;
       recoverGen++;
       recovering = false;
       lastRebuilt = null;              // a connection made afresh starts with no crash history
@@ -1966,8 +3001,9 @@ function createService(opts = {}) {
       pinWatch.clear();
       appliedSettings = null;          // nothing live to be out of sync with
       liveDirectInterface = null;
+      liveMux = null;
       cleanupFailed = false;
-      send('status', { state: 'disconnected' });
+      send('status', { state: 'disconnected', cause: 'user' });
     } catch (e) {
       // A CODE, not a sentence: the desktop says this one in the user's language
       // (net.cleanupFailed) and a headless consumer gets something it can branch on.
@@ -1996,6 +3032,13 @@ function createService(opts = {}) {
     const score = (a) => a.startsWith('192.168.') ? 3 : /^172\.(1[6-9]|2\d|3[01])\./.test(a) ? 2 : a.startsWith('10.') ? 1 : 0;
     c.sort((x, y) => score(y) - score(x));
     return c[0] || null;
+  }
+
+  // What latencyTest needs to know about this machine: a server that runs on
+  // sing-box is measured on it, when it is installed.
+  function latencyOpts() {
+    const s = getSettings();
+    return { defaultEngine: s.defaultEngine, hasSingbox: !!xray.resolveBin('sing-box'), dnsRemote: s.dnsRemote };
   }
 
   function resolveTarget(id) {
@@ -2066,6 +3109,18 @@ function createService(opts = {}) {
     } finally { networkRepairing = false; }
   }
 
+  // + WARP (warp.js), as on the desktop: registered straight out or through the
+  // gateway's own SOCKS port, or imported; one MASQUE server per HTTP version.
+  // deps.warp: a test's fake API (`request`) and parser stub (`createServer`).
+  const addWarp = warpHandler(Object.assign({
+    createServer,
+    connected: () => conn.state === 'connected',
+    socksPort: () => (appliedSettings || getSettings()).socksPort,
+    getServers: () => store.get('servers', []),
+    setServers: (list) => store.set('servers', list),
+    log: (line, level) => send('log', { line, level: level || 'info' })
+  }, deps.warp || {}));
+
   const handlers = {
     'diagnostics:connection': connectionDiagnostics,
     'network:repair': repairNetwork,
@@ -2075,6 +3130,9 @@ function createService(opts = {}) {
       subscriptions: store.get('subscriptions', []),
       settings: getSettings(),
       activeServerId: store.get('activeServerId', null),
+      // the picker's own choice, and the last connection made: what a restart restores
+      selectedServerId: store.get('selectedServerId', null),
+      lastServerId: store.get('lastServerId', null),
       chain: store.get('chain', []),
       chains: getChains(),
       pool: getPool(),
@@ -2094,7 +3152,9 @@ function createService(opts = {}) {
       pendingReconnect: pendingKeys(),
       // lifetime traffic per config, so a browser reload does not lose it
       usage: usage ? usage.totals : {},
-      storeError: store.loadError
+      storeError: store.loadError,
+      // the connection as it IS (S1): a page that loads while the tunnel is up starts connected
+      conn: connSnapshot()
     }),
 
     'servers:import': (text) => {
@@ -2106,6 +3166,14 @@ function createService(opts = {}) {
     'servers:add': (link) => { const server = parseLink(link); const e = store.get('servers', []); e.push(server); store.set('servers', e); return server; },
     'servers:addWireguard': (fields) => { const server = makeWireguardServer(fields || {}); const e = store.get('servers', []); e.push(server); store.set('servers', e); return { server, servers: e }; },
     'servers:addProxy': (fields) => { const server = makeProxyServer(fields || {}); const e = store.get('servers', []); e.push(server); store.set('servers', e); return { server, servers: e }; },
+    // a server made in the editor from scratch (parser.createServer); what it lacks, said
+    'servers:create': (fields) => {
+      let server;
+      try { server = createServer(fields || {}); } catch (err) { return { ok: false, error: err.message }; }
+      const e = store.get('servers', []); e.push(server); store.set('servers', e);
+      return { ok: true, server, servers: e };
+    },
+    'servers:addWarp': (args) => addWarp(args || {}),
     // headless: no native dialog; the browser picks the file itself
     'wg:pickConf': () => ({ ok: false, error: 'not available in server mode' }),
     'wg:parseConf': (text) => {
@@ -2116,14 +3184,22 @@ function createService(opts = {}) {
       const servers = store.get('servers', []);
       const idx = servers.findIndex(s => s.id === id);
       if (idx === -1) return { ok: false, error: 'not found', servers };
-      servers[idx] = applyServerEdits(servers[idx], fields || {});
+      const before = servers[idx];
+      // An edit can be refused — a JSON config that does not parse, or has no
+      // proxy outbound left: the reason goes back, the record stays as it was.
+      try { servers[idx] = applyServerEdits(before, fields || {}); } catch (err) { return { ok: false, error: err.message, servers }; }
       store.set('servers', servers);
-      return { ok: true, server: servers[idx], servers };
+      // an edit of a server the live connection dials waits for a reconnect (see liveServerIds)
+      // — one that changes what is dialled: a rename, or a Save with nothing changed, is none
+      const live = !!appliedSettings && liveServerIds.has(id) && dialChanged(before, servers[idx]);
+      if (live) serverEditPending = true;
+      return { ok: true, server: servers[idx], servers, live, pendingReconnect: pendingKeys() };
     },
     'servers:delete': (id) => { const servers = store.get('servers', []).filter(s => s.id !== id); store.set('servers', servers); return servers; },
     'servers:clear': () => { store.set('servers', []); return []; },
     'servers:list': () => store.get('servers', []),
     'servers:link': (id) => { const s = store.get('servers', []).find(x => x.id === id); return s ? buildShareLink(s) : ''; },
+    'selection:set': (id) => setSelection(id),
 
     'chain:get': () => store.get('chain', []),
     'chain:set': (ids) => { const v = Array.isArray(ids) ? ids : []; store.set('chain', v); return v; },
@@ -2132,6 +3208,9 @@ function createService(opts = {}) {
       const v = Array.isArray(chains) ? chains.filter(c => c && c.id).map(c => ({ id: c.id, name: String(c.name || 'Chain').trim() || 'Chain', members: Array.isArray(c.members) ? c.members.filter(Boolean) : [] })) : [];
       store.set('chains', v); return v;
     },
+    // Routing profiles (routingProfiles.js): several saved advanced routings
+    'routing:profiles': () => ({ profiles: getRoutingProfiles() }),
+    'routing:setProfiles': (profiles) => setRoutingProfiles(profiles),
     'pool:list': () => getPool(),
     'pool:set': (entries) => {
       const v = Array.isArray(entries) ? entries.filter(c => c && c.id).map(c => ({
@@ -2140,6 +3219,10 @@ function createService(opts = {}) {
       })) : [];
       store.set('pool', v); return v;
     },
+    'routing:shareProfile': (arg) => routeShare.shareProfile(arg),
+    'routing:shareChain': (arg) => routeShare.shareChain(arg),
+    'routing:importPreview': (arg) => routeShare.importPreview(arg),
+    'routing:import': (arg) => routeShare.importShare(arg),
 
     'subs:list': () => subs.list(),
     'subs:add': async ({ url, name }) => { const res = await subs.add(url, name); return { sub: res.sub, added: res.added, servers: store.get('servers', []) }; },
@@ -2150,9 +3233,35 @@ function createService(opts = {}) {
 
     // by hand: either one ends the boot-time retries — and a connect made
     // afresh starts with no crash history (recoverFromDrop), as after a disconnect
-    'connect': (id) => { bootCancelled = true; lastRebuilt = null; return doConnect(id); },
-    // ...and a disconnect by hand is the one thing that clears the router's connectIntent
-    'disconnect': () => { bootCancelled = true; if (OPENWRT) setIfChanged('connectIntent', null); return doDisconnect(); },
+    'connect': (id) => {
+      bootCancelled = true; lastRebuilt = null;
+      endPendingRecovery();   // a drop's pending retry would rebuild the connection this makes (review I5)
+      // On a router a Connect on the connection that is already up — a page
+      // that loaded while the tunnel was up and had no idea (S1), pressed again
+      // — is not a 20-40 s rebuild of a gateway that is fine (S2). (The crash
+      // history is still cleared above: the user asked for this connection afresh.)
+      if (OPENWRT && alreadyUp(id)) {
+        send('log', { line: `Connect: already connected to ${conn.label || id} with the gateway up — nothing to rebuild`, level: 'info' });
+        return { ok: true, already: true };
+      }
+      const p = doConnect(id, { cause: store.get('activeServerId', null) ? 'switch' : 'user' });
+      if (!OPENWRT) return p;
+      // A Connect on the live connection (a pending edit or setting) that
+      // failed keeps its intent (abortGateway) with nothing running: the
+      // recovery takes it over like a failed Reconnect. A first connect or a
+      // switch ends disconnected, and is not retried.
+      return p.catch((e) => {
+        if (store.get('activeServerId', null) === id) handToRecovery('gateway-failed', { refused: !!(e && e.refused), message: e && e.message });
+        throw e;
+      });
+    },
+    // ...and a disconnect by hand is the one thing that clears the router's connectIntent —
+    // and disarms the kill switch BEFORE the teardown: the user's own "off" never blocks the LAN
+    'disconnect': async () => {
+      bootCancelled = true;
+      if (OPENWRT) { setIfChanged('connectIntent', null); await syncKillSwitch('disconnect'); }
+      return doDisconnect();
+    },
 
     'settings:get': () => getSettings(),
     // returns { settings, pendingReconnect } — see main.js / settingsMeta.js
@@ -2167,9 +3276,15 @@ function createService(opts = {}) {
       if (!tokens.length) return { checked: true, bad: [] };
       return checkGeoTokens(tokens, (cfg) => xray.validate(cfg));
     },
-    'settings:set': (partial) => {
+    'settings:set': async (partial) => {
       const next = Object.assign(getSettings(), partial);
       store.set('settings', next);
+      // the advanced-routing keys are profile rp-default's mirror (routingProfiles.js)
+      if (['routeRules', 'routeDefault', 'advancedUseMode'].some(k => k in partial)) {
+        const profiles = getRoutingProfiles();
+        const synced = mirrorFromSettings(profiles, next);
+        if (synced !== profiles) store.set('routingProfiles', synced);
+      }
       if ('autoUpdateSubs' in partial || 'autoUpdateInterval' in partial) {
         if (next.autoUpdateSubs) subs.startAuto(next.autoUpdateInterval); else subs.stopAuto();
       }
@@ -2185,6 +3300,8 @@ function createService(opts = {}) {
       if ('lanBlockQuic' in partial && tun && tun.active && typeof tun.setBlockQuic === 'function') {
         tun.setBlockQuic(!!next.lanBlockQuic).catch(e => send('log', { line: 'QUIC setting not applied: ' + e.message, level: 'error' }));
       }
+      // the kill switch follows its setting at once, and the excluded devices live (K2)
+      if (OPENWRT && ('killSwitch' in partial || 'lanBypassMacs' in partial)) await syncKillSwitch('settings');
       // "Start with the OS" is a desktop setting: on a server the process is a
       // service already. Refuse it in the store so the switch cannot claim it.
       let error = null;
@@ -2200,7 +3317,12 @@ function createService(opts = {}) {
     'settings:pending': () => pendingKeys(),
     'settings:apply': () => reapplyByHand(),
 
-    'ping:tcp': async (id) => { const { server } = resolveTarget(id); if (!server) return { ok: false, error: 'not found' }; return tcpPing(server.address, server.port); },
+    'ping:tcp': async (id) => {
+      const { server } = resolveTarget(id);
+      if (!server) return { ok: false, error: 'not found' };
+      if (udpOnly(server)) return { ok: false, na: true, error: 'UDP only — no TCP port to ping' };
+      return tcpPing(server.address, server.port);
+    },
     'ping:real': async (id) => {
       const { server, chain } = resolveTarget(id);
       if (!server) return { ok: false, error: 'not found' };
@@ -2208,9 +3330,8 @@ function createService(opts = {}) {
       let test;
       try {
         const port = await getFreePort();
-        const cfg = buildTestConfig(chain && chain.length >= 2 ? chain : server, port);
-        const plan = chain && chain.length >= 2 ? { mode: 'chain', chain } : { mode: 'single', server };
-        test = await xray.startTest(cfg, testEngineFor(chooseEngine(plan, getSettings().defaultEngine)));
+        const t = latencyTest(chain && chain.length >= 2 ? chain : server, port, latencyOpts());
+        test = await xray.startTest(t.config, t.engine);
         return await httpThroughProxy(port, { host: 'cp.cloudflare.com', port: 80, path: '/' });
       } catch (err) { return { ok: false, error: err.message }; }
       finally { if (test) test.cleanup(); }
@@ -2222,9 +3343,8 @@ function createService(opts = {}) {
       let test;
       try {
         const port = await getFreePort();
-        const cfg = buildTestConfig(chain && chain.length >= 2 ? chain : server, port);
-        const plan = chain && chain.length >= 2 ? { mode: 'chain', chain } : { mode: 'single', server };
-        test = await xray.startTest(cfg, testEngineFor(chooseEngine(plan, getSettings().defaultEngine)));
+        const t = latencyTest(chain && chain.length >= 2 ? chain : server, port, latencyOpts());
+        test = await xray.startTest(t.config, t.engine);
         return await uploadThroughProxy(port, {});
       } catch (err) { return { ok: false, error: err.message }; }
       finally { if (test) test.cleanup(); }
@@ -2234,16 +3354,29 @@ function createService(opts = {}) {
       const list = [...new Set((Array.isArray(ids) ? ids : []).filter(Boolean))];
       if (!xray.binExists()) { for (const id of list) out[id] = { ok: false, error: 'xray binary missing' }; return out; }
       const byEngine = new Map();
+      const alone = [];   // measured on a core of their own (latencyTest: sing-box)
+      const opts = latencyOpts();
       for (const id of list) {
         const { server, chain } = resolveTarget(id);
         if (!server) { out[id] = { ok: false, error: 'not found' }; continue; }
         const isChain = chain && chain.length >= 2;
         const plan = isChain ? { mode: 'chain', chain } : { mode: 'single', server };
+        if (!isChain && testsAlone(server, opts)) { alone.push({ id, target: server }); continue; }
         const eng = testEngineFor(chooseEngine(plan, getSettings().defaultEngine));
         if (!byEngine.has(eng)) byEngine.set(eng, []);
         byEngine.get(eng).push({ id, target: isChain ? chain : server });
       }
       const limit = pLimit(REAL_PARALLEL);
+      await Promise.all(alone.map(a => limit(async () => {
+        let test = null;
+        try {
+          const port = await getFreePort();
+          const t = latencyTest(a.target, port, opts);
+          test = await xray.startTest(t.config, t.engine);
+          out[a.id] = await httpThroughProxy(port, { host: 'cp.cloudflare.com', port: 80, path: '/' });
+        } catch (err) { out[a.id] = { ok: false, error: err.message }; }
+        finally { if (test) test.cleanup(); }
+      })));
       for (const [eng, targets] of byEngine) {
         for (let i = 0; i < targets.length; i += REAL_BATCH) {
           const batch = targets.slice(i, i + REAL_BATCH);
@@ -2267,12 +3400,18 @@ function createService(opts = {}) {
     'assets:download': async (component) => {
       try {
         const res = await downloader.download(component);
-        // binPath caches ONLY the official core (and holds a user-located path),
-        // so downloading the fork must not clear it.
-        if (component === 'xray' || component === 'xray-pattn') { if (component === 'xray') xray.binPath = null; xray.forgetVersions(); stats.setBin(xray.anyBin()); }
+        // a core (sing-box too: its version is shown beside it now) — see afterCoreChanged
+        if (CORE_IDS.includes(component)) afterCoreChanged(component);
         return { ok: true, files: res.files, assets: assetStatus(), tunAvailable: makeTun(getSettings(), { quiet: true }).isAvailable(), xrayReady: xray.binExists() };
-      } catch (err) { send('log', { line: 'Download failed (' + component + '): ' + err.message, level: 'error' }); return { ok: false, error: err.message, assets: assetStatus() }; }
+      } catch (err) {
+        send('log', { line: 'Download failed (' + component + '): ' + err.message, level: 'error' });
+        // coreBusy: a version install holds this core (Downloader.holdCore) — the page words it
+        return { ok: false, error: err.message, coreBusy: err.code === 'ECOREBUSY', assets: assetStatus() };
+      }
     },
+    // a core's releases for the picker, and one installed by its tag (refused while connected or connecting)
+    'cores:versions': (arg) => coreVersions.versions(arg),
+    'cores:install': (arg) => coreVersions.install(arg),
     'assets:remove': async () => {
       if (xray.running || (tun && tun.active)) return { ok: false, error: 'disconnect first', assets: assetStatus() };
       const names = downloadedFileNames();
@@ -2324,6 +3463,13 @@ function createService(opts = {}) {
       catch (e) { return { ok: false, error: e.message }; }
     },
     'killswitch:status': () => ({ engaged: false }),
+    // the remote control's destinations (feat/remote calls setRemoteBypass in
+    // process; the QEMU smoke and any token holder reach it here)
+    'remote:bypass': async (arg) => {
+      const a = arg && typeof arg === 'object' ? arg : {};
+      await setRemoteBypass(a.owner, a);
+      return Object.assign({ ok: true }, remoteBypassByOwner.get(a.owner));
+    },
     'usage:get': () => ({ totals: usage ? usage.totals : {}, grand: grandTotal(usage ? usage.totals : {}) }),
     // Forget a lifetime total — one config, or all of them. Written through at
     // once: an absence the next flush might not reach comes back at launch.
@@ -2339,8 +3485,9 @@ function createService(opts = {}) {
     // Backup and restore — see backup.js; the same merge-by-id the desktop does.
     'backup:export': () => JSON.stringify(exportBundle({
       version: appVersion,
-      store: { servers: store.get('servers', []), subscriptions: store.get('subscriptions', []), chains: getChains(), pool: getPool(), settings: getSettings() },
-      usage: usage ? usage.totals : {}
+      store: { servers: store.get('servers', []), subscriptions: store.get('subscriptions', []), chains: getChains(), pool: getPool(), routingProfiles: getRoutingProfiles(), settings: getSettings() },
+      usage: usage ? usage.totals : {},
+      flavor: OPENWRT ? 'openwrt' : null   // a router's own backup brings its router-only settings back (backup:import)
     }), null, 2),
     'backup:import': (text) => {
       let bundle;
@@ -2349,13 +3496,18 @@ function createService(opts = {}) {
       try {
         r = importBundle(bundle, {
           servers: store.get('servers', []), subscriptions: store.get('subscriptions', []),
-          chains: getChains(), pool: getPool(), settings: getSettings(), usage: usage ? usage.totals : {}
-        });
+          chains: getChains(), pool: getPool(), routingProfiles: getRoutingProfiles(), settings: getSettings(), usage: usage ? usage.totals : {}
+        // the keep list is for a backup made elsewhere (a desktop's, or one
+        // from before the mark): the router's own, restored after a reset or
+        // a re-flash, is exactly what should bring its kill switch back
+        }, { keep: OPENWRT && !(bundle && bundle.flavor === 'openwrt') ? ROUTER_KEEPS_ON_IMPORT : [] });
       } catch (err) { return { ok: false, error: err.message }; }
-      store.assign({ servers: r.next.servers.map(migrateStoredServer), subscriptions: r.next.subscriptions, chains: r.next.chains, pool: r.next.pool, settings: r.next.settings });
+      store.assign({ servers: r.next.servers.map(migrateStoredServer), subscriptions: r.next.subscriptions, chains: r.next.chains, pool: r.next.pool, routingProfiles: r.next.routingProfiles, settings: r.next.settings });
       if (usage) { usage.totals = r.next.usage; usage.dirty = true; usageStore.set('totals', usage.totals); usage.markSaved(); }
-      send('log', { line: `Backup restored: ${r.added.servers} servers, ${r.added.subscriptions} subscriptions, ${r.added.chains} chains, ${r.added.pool} pool entries added`, level: 'info' });
-      return { ok: true, added: r.added };
+      send('log', { line: `Backup restored: ${r.added.servers} servers, ${r.added.subscriptions} subscriptions, ${r.added.chains} chains, ${r.added.pool} pool entries, ${r.added.routingProfiles} routing profiles added`, level: 'info' });
+      // `kept`: the router-only keys the backup wanted changed — for the renderer's own words
+      if (r.kept.length) send('log', { line: 'Backup restored on a router: desktop-only settings were kept as the router needs them (TUN, system proxy, per-app routing, leak guard, connect at start, QUIC refusal, kill switch)', level: 'warn' });
+      return { ok: true, added: r.added, kept: r.kept };
     },
 
     // desktop-only / no-op in server mode
@@ -2363,7 +3515,16 @@ function createService(opts = {}) {
     'open:dataDir': () => dataDir,
     'open:external': () => {},
     'win:minimize': () => {}, 'win:maximize': () => {}, 'win:hide': () => {}, 'win:close': () => {},
-    'app:quit': () => { shutdown(); }
+    // The headless service's quit is an orderly EXIT, for procd to restart
+    // (S5): it used to take the gateway down and leave node running with
+    // isQuitting set — no recovery, no boot connect — until a restart by hand.
+    // Answered first, exited a moment later so the reply gets out.
+    'app:quit': async () => {
+      await shutdown();
+      const t = setTimeout(() => exitProcess(0), 200);
+      if (t.unref) t.unref();
+      return { ok: true, exiting: true };
+    }
   };
 
   // plus: the Server and IP-scan tabs register their own channels through a
@@ -2375,7 +3536,7 @@ function createService(opts = {}) {
     addServer: (server) => { const existing = store.get('servers', []); existing.push(server); store.set('servers', existing); return server; },
     resolveTarget,
     log: (line, level = 'info') => send('log', { line, level }),
-    latestVersion: (id, channel) => downloader.latestVersion(id, channel),
+    latestVersion: (id) => downloader.latestVersion(id),   // plus: what a download of the core installs
     platform: process.platform, isElectron: false
   };
   const xserver = createXServer(plusCtx); xserver.register();
@@ -2387,11 +3548,244 @@ function createService(opts = {}) {
     return await h(arg);
   }
 
+  /**
+   * Do two connect ids name the same thing? A plain `__advanced__` (an old boot
+   * intent) and `__advanced__:<id>` (what LuCI lists for it) are the same profile.
+   */
+  function sameTarget(a, b) {
+    if (a === b) return true;
+    if (!isAdvancedSelection(a) || !isAdvancedSelection(b)) return false;
+    const profiles = getRoutingProfiles();
+    const p = profileIdOf(a, profiles);
+    return !!p && p === profileIdOf(b, profiles);
+  }
+
+  /** Connected to exactly `id`, core running, gateway up, nothing rebuilding or in flight: a Connect has nothing to do. */
+  function alreadyUp(id) {
+    return !!id && sameTarget(id, store.get('activeServerId', null)) && !!(xray && xray.running) && !!(tun && tun.active)
+      && !recovering && !recoverTimer && !connectsInFlight.size && conn.state === 'connected'
+      && !pendingKeys().length;   // settings waiting for a reconnect: that is what the Connect is for (review M5)
+  }
+
+  /* ----------------------------- destinations that never ride the tunnel (A10) ----------------------------- */
+  // The remote control's destinations (spec R8/C2), per owner — the relay
+  // agent, cloudflared — with the union applied: while the gateway is up one
+  // `ip rule … pref 8997 to <cidr> lookup main` per cidr (TunOpenwrt.setBypass:
+  // live, swept with the gateway's own rules). Node cannot mark its own
+  // sockets, so the router's own dials are kept off the tunnel by destination.
+  // No xray routing rule for them (review I4): the ip rules already take every
+  // socket of the router's out of the tunnel, and an xray rule would have sent
+  // the agent's one deliberate dial THROUGH the tunnel (the SOCKS fallback, R9)
+  // direct — the path that was blocked. The hosts are kept for the record and
+  // the facade. The kill switch never touches any of this: it filters
+  // forwarded traffic, not OUTPUT.
+  const remoteBypassByOwner = new Map();
+  const REMOTE_OWNERS = ['relay', 'cloudflared'];
+  function remoteBypass() {
+    const hosts = [];
+    const cidrs = [];
+    for (const list of remoteBypassByOwner.values()) {
+      for (const h of list.hosts) if (!hosts.includes(h)) hosts.push(h);
+      for (const c of list.cidrs) if (!cidrs.includes(c)) cidrs.push(c);
+    }
+    return { hosts, cidrs };
+  }
+  async function setRemoteBypass(owner, list) {
+    if (!REMOTE_OWNERS.includes(owner)) throw new Error(`setRemoteBypass: unknown owner "${owner}" (${REMOTE_OWNERS.join(' | ')})`);
+    const l = list && typeof list === 'object' ? list : {};
+    const hosts = [...new Set((Array.isArray(l.hosts) ? l.hosts : []).map(h => String(h == null ? '' : h).trim().toLowerCase()).filter(h => /^[a-z0-9][a-z0-9.-]*$/.test(h)))];
+    const cidrs = normalizeCidrs(Array.isArray(l.cidrs) ? l.cidrs : []);
+    remoteBypassByOwner.set(owner, { hosts, cidrs });
+    if (tun && tun.active && typeof tun.setBypass === 'function') await tun.setBypass(remoteBypass().cidrs);
+  }
+  /**
+   * The in-country resolvers the running config dials direct — else the plain
+   * addresses of the setting. Since v1.16.1 (field report D3) they are no
+   * longer route-excluded on a router: a LAN device's query to them, and
+   * dnsmasq's upstream, ride the tunnel. The router's own control path still
+   * reaches them by the WAN: this process's UDP 53 by a rule of its own
+   * (TunOpenwrt.layOwnDirect — the relay agent's lookup), and a dnsmasq
+   * drop-in by binding its server line to directDevice() (cloudflared's edge
+   * discovery: `server=/…/<resolver>@<device>`). In global mode the config
+   * dials none: this is then the setting, and no rule is laid for it.
+   */
+  function directResolvers() {
+    if (liveDiagnostics && liveDiagnostics.config) {
+      const live = resolverBypassIpsOf(liveDiagnostics.config);
+      if (live.length) return live;
+    }
+    return (getSettings().dnsDirect || []).map(x => String(x == null ? '' : x).trim()).filter(x => tcpNet.isIP(x));
+  }
+  /**
+   * The router's WAN device, for what must leave by it whatever the tunnel
+   * does — a dnsmasq server line bound to it (SO_BINDTODEVICE) skips table
+   * 2022 the way the core's bound `direct` dials do. The live connection's
+   * binding when there is one; else the main table's default route with the
+   * lowest metric (/proc/net/route: the main table only — sing-box's routes
+   * live in 2022), never our own tunnel; null when there is none (no WAN yet).
+   */
+  function directDevice() {
+    if (!OPENWRT) return null;
+    if (liveDirectInterface) return liveDirectInterface;
+    let text = '';
+    try { text = String(readProc('/proc/net/route')); } catch { return null; }
+    let best = null;
+    for (const line of text.split('\n').slice(1)) {
+      const f = line.trim().split(/\s+/);
+      if (f.length < 8 || f[1] !== '00000000' || f[7] !== '00000000') continue;   // a default route
+      if (!(parseInt(f[3], 16) & 1) || isOwnTunInterface(f[0])) continue;            // up, and not ours
+      const metric = parseInt(f[6], 10) || 0;
+      if (!best || metric < best.metric) best = { dev: f[0], metric };
+    }
+    return best ? best.dev : null;
+  }
+
+  /* ----------------------------- what the LuCI facade reads (luciApi.js) ----------------------------- */
+
+  /** The live core's counters, zero when nothing runs: { up, down, upRate, downRate } (bytes, bytes/s). */
+  function traffic() {
+    const s = (xray && xray.running && lastStats) || null;
+    return { up: s ? s.totalUp || 0 : 0, down: s ? s.totalDown || 0 : 0, upRate: s ? s.upSpeed || 0 : 0, downRate: s ? s.downSpeed || 0 : 0 };
+  }
+
+  /** Every connectable config, grouped the way the web UI's picker groups them. */
+  function configsForLuci() {
+    const servers = store.get('servers', []);
+    const subs = store.get('subscriptions', []);
+    const item = (sv) => ({ id: sv.id, name: sv.name || sv.address || sv.id, proto: sv.protocol || 'unknown' });
+    const groups = [];
+    for (const sub of subs) {
+      groups.push({ id: 'sub:' + sub.id, name: sub.name || sub.url || sub.id, kind: 'subscription', items: servers.filter(sv => sv.subId === sub.id).map(item) });
+    }
+    const subIds = new Set(subs.map(x => x.id));
+    const manual = servers.filter(sv => !sv.subId || !subIds.has(sv.subId)).map(item);
+    if (manual.length || !groups.length) groups.push({ id: 'manual', name: 'Manual', kind: 'manual', items: manual });
+    const byId = {};
+    for (const sv of servers) byId[sv.id] = sv;
+    // a chain is connectable with two members that still exist
+    const chains = getChains().filter(c => (c.members || []).filter(id => byId[id]).length >= 2).map(c => ({ id: c.id, name: c.name || 'Chain', proto: 'chain' }));
+    if (chains.length) groups.push({ id: 'chains', name: 'Chains', kind: 'chains', items: chains });
+    const pool = getPool().filter(e => e.enabled && e.socksPort);
+    if (pool.length) groups.push({ id: 'pools', name: 'Proxy pool', kind: 'pools', items: [{ id: '__pool__', name: `Proxy pool (${pool.length})`, proto: 'pool' }] });
+    // one item per routing profile that has rules or a default (routingProfiles.js)
+    const s = getSettings();
+    const profiles = getRoutingProfiles();
+    const routing = profiles.filter(p => (p.rules || []).length || p.def)
+      .map(p => ({ id: selectionIdOf(p.id), name: p.name || 'Advanced routing', proto: 'advanced' }));
+    if (s.advancedRouting && routing.length) groups.push({ id: 'routing', name: 'Advanced routing', kind: 'routing', items: routing });
+    // a plain `__advanced__` (an older selection, the boot intent) is the first profile's item
+    const first = profiles[0] ? selectionIdOf(profiles[0].id) : null;
+    const listed = (id) => (id === '__advanced__' && first ? first : id);
+    return { selectedId: listed(store.get('selectedServerId', null)), activeId: listed(store.get('activeServerId', null)), groups };
+  }
+
+  /** The four router settings LuCI edits. */
+  function settingsForLuci() {
+    const s = getSettings();
+    return { autoConnect: !!s.autoConnect, killSwitch: !!s.killSwitch, lanBlockQuic: !!s.lanBlockQuic, lanBypassMacs: validMacs(s.lanBypassMacs) };
+  }
+  /** …written the way settings:set writes them (validated and applied live by it); the facade validated the values. */
+  async function setSettingsForLuci(partial) {
+    const allowed = {};
+    for (const k of ['autoConnect', 'killSwitch', 'lanBlockQuic']) if (typeof partial[k] === 'boolean') allowed[k] = partial[k];
+    if (Array.isArray(partial.lanBypassMacs)) allowed.lanBypassMacs = validMacs(partial.lanBypassMacs);
+    if (Object.keys(allowed).length) await handlers['settings:set'](allowed);
+    return settingsForLuci();
+  }
+
+  /** The devices behind the router with their "bypass" tick; an excluded device not on the LAN right now still shows. */
+  async function devices() {
+    const list = OPENWRT ? await handlers['net:lanDevices']() : [];
+    const bypass = new Set(validMacs(getSettings().lanBypassMacs));
+    const out = list.map(d => ({ mac: d.mac, ip: d.ip || '', name: d.name || '', online: !!d.online, bypass: bypass.has(d.mac) }));
+    for (const mac of bypass) if (!out.some(d => d.mac === mac)) out.push({ mac, ip: '', name: '', online: false, bypass: true });
+    return out;
+  }
+
+  const logTail = (n) => ring.tail(n);
+
+  /** The secrets no diagnostics text may carry: the UI token, the remote control's device / tunnel tokens. */
+  function secrets() {
+    const out = new Set();
+    try { const t = fs.readFileSync(path.join(dataDir, 'token'), 'utf8').trim(); if (t) out.add(t); } catch { /* no token file (a loopback bind) */ }
+    const walk = (v, depth = 0) => {
+      if (!v || typeof v !== 'object' || depth > 3) return;
+      for (const [k, x] of Object.entries(v)) {
+        if (/token|password|secret/i.test(k) && typeof x === 'string' && x.length >= 6) out.add(x);
+        else if (x && typeof x === 'object') walk(x, depth + 1);
+      }
+    };
+    walk(store.get('remote', null));
+    walk((store.get('settings', null) || {}).remote);
+    // feat/remote keeps its settings (the device token, the tunnel token) in <dataDir>/remote.json
+    try { walk(JSON.parse(fs.readFileSync(path.join(dataDir, 'remote.json'), 'utf8'))); } catch { /* none, or not JSON */ }
+    return [...out];
+  }
+  function redact(text) {
+    let t = text;
+    for (const sec of secrets()) t = t.split(sec).join('[redacted]');
+    return t.replace(/([?&]token=)[^&\s"']+/g, '$1[redacted]');
+  }
+
+  /** One text for "Copy diagnostics": status, versions, memory, the rules, the last 300 lines — no secrets. */
+  async function diagnostics() {
+    const s = getSettings();
+    const lines = [];
+    lines.push(`IRNetFree ${appVersion} — node ${process.version} ${process.platform}/${process.arch}, ${OPENWRT ? 'openwrt' : 'headless'}, service up ${Math.round(process.uptime())}s, ${new Date().toISOString()}`);
+    lines.push('status: ' + JSON.stringify(connSnapshot()));
+    lines.push('settings: ' + JSON.stringify({
+      tunMode: !!s.tunMode, routingMode: s.routingMode, advancedRouting: !!s.advancedRouting, defaultEngine: s.defaultEngine, ipv6: !!s.ipv6, logLevel: s.logLevel,
+      autoConnect: !!s.autoConnect, killSwitch: !!s.killSwitch, lanBlockQuic: !!s.lanBlockQuic, lanBypassMacs: validMacs(s.lanBypassMacs).length
+    }));
+    lines.push('store: ' + JSON.stringify({
+      servers: store.get('servers', []).length, subscriptions: store.get('subscriptions', []).length, chains: getChains().length,
+      connectIntent: store.get('connectIntent', null), activeServerId: store.get('activeServerId', null), selectedServerId: store.get('selectedServerId', null)
+    }));
+    const versions = {};
+    const installed = assetStatus();
+    for (const id of ['xray', 'xray-pattn', 'sing-box']) {
+      if (!installed[id]) continue;
+      try { versions[id] = await Promise.race([xray.version(id), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000).unref())]); }
+      catch (e) { versions[id] = 'error: ' + ((e && e.message) || e); }
+    }
+    lines.push('cores: ' + JSON.stringify(versions));
+    const m = memInfo();
+    if (m.memAvailableKb != null) lines.push(`MemAvailable: ${m.memAvailableKb} kB`);
+    if (Object.keys(m.rss).length) lines.push('RSS: ' + Object.entries(m.rss).map(([k, v]) => `${k}=${v} kB`).join(', '));
+    if (OPENWRT) { const of = openFilesText(); if (of) lines.push(`open files (in use/Max open files): ${of}`); }
+    lines.push(`gateway: ${tun && tun.active ? 'up' : 'down'}, core: ${xray && xray.running ? 'running' : 'stopped'}, kill switch: ${JSON.stringify(killSwitchState())}`);
+    if (OPENWRT) {
+      try { lines.push('ip rule:', String(await lanRun('ip', ['rule', 'show'])).trim()); }
+      catch (e) { lines.push('ip rule: unavailable (' + ((e && e.message) || e) + ')'); }
+    }
+    lines.push('--- log (last 300 lines) ---');
+    lines.push(...ring.tail(300));
+    return { text: redact(lines.join('\n')) };
+  }
+
+  /** HTTP 204 through the tunnel (the local SOCKS inbound), 5 s: { ok, ms } or { ok: false, error }. */
+  async function testThroughTunnel() {
+    if (!(xray && xray.running) || !store.get('activeServerId', null)) return { ok: false, error: 'not connected' };
+    const r = await httpThroughProxy(getSettings().socksPort, { host: 'cp.cloudflare.com', port: 80, path: '/generate_204', timeout: 5000 });
+    return r && r.ok ? { ok: true, ms: r.ms } : { ok: false, error: (r && (r.error || (r.status ? 'HTTP ' + r.status : null))) || 'no answer' };
+  }
+
+  /** The actions LuCI starts; each is the same RPC the web UI uses. */
+  const actions = {
+    connect: (id) => { setSelection(id); return Promise.resolve().then(() => handlers.connect(id)); },
+    select: (id) => setSelection(id),
+    disconnect: () => Promise.resolve().then(() => handlers.disconnect()),
+    reconnect: () => Promise.resolve().then(() => handlers['vpn:reconnect']()),
+    subsUpdate: () => Promise.resolve().then(() => handlers['subs:refreshAll']())
+  };
+  const log = (line, level) => send('log', { line, level: level || 'info' });
+
   function onEvent(cb) { listeners.add(cb); return () => listeners.delete(cb); }
 
   async function shutdown() {
     if (isQuitting) return; isQuitting = true;
     userDisconnecting = true;
+    if (ksTimer) clearInterval(ksTimer);
     try { store.flush(); } catch {}   // whatever setLazy() still holds
     try { assetUpdater.stop(); } catch {}
     try { stopNetWatcher(); } catch {}
@@ -2433,7 +3827,13 @@ function createService(opts = {}) {
   const AUTO_RETRY = OPENWRT
     ? { tries: Infinity, everyMs: T.bootEveryMs, slowAfter: T.bootSlowAfter, slowMs: T.bootSlowMs }
     : { tries: 1, everyMs: 0, slowAfter: Infinity, slowMs: 0 };
+  // The boot connect's attempt in flight or waiting (0: none). While it is a
+  // RETRY its statuses read "waiting for internet" (B3): the first attempt is
+  // a plain connect, every one after it says what it is — the WAN, the modem
+  // or the clock not there yet — instead of flipping connecting↔error.
+  let bootAttempt = 0;
   function autoConnectAtLaunch(attempt = 1) {
+    bootAttempt = 0;
     if (bootCancelled || isQuitting) return;                         // done by hand meanwhile, or going away
     if (store.get('activeServerId', null)) return;                   // connected meanwhile
     const target = OPENWRT ? store.get('connectIntent', null) : (bootIntent || store.get('lastServerId', null));
@@ -2442,19 +3842,47 @@ function createService(opts = {}) {
       send('log', { line: `Auto-connect: the last connection (${target}) cannot be built any more — ${e.message}`, level: 'error' });
       return;
     }
-    doConnect(target).catch((e) => {
+    bootAttempt = attempt;
+    doConnect(target, { cause: 'boot' }).then(() => { bootAttempt = 0; }, (e) => {
+      bootAttempt = 0;
       if (bootCancelled || isQuitting) return;
       const more = attempt < AUTO_RETRY.tries;
-      const wait = attempt >= AUTO_RETRY.slowAfter ? AUTO_RETRY.slowMs : AUTO_RETRY.everyMs;
+      // Refused by the core (refusal(): a finalmask server with no Xray-PattN
+      // on a feed core, a config it rejects, a plan it cannot build) — not the WAN,
+      // the modem or the clock: "Waiting for internet…" every 15-60 s would
+      // hide it (v1.16.1 re-review). Said as an error, tried again rarely.
+      const refused = OPENWRT && !!(e && e.refused);
+      const wait = refused ? T.refusedRetryMs : attempt >= AUTO_RETRY.slowAfter ? AUTO_RETRY.slowMs : AUTO_RETRY.everyMs;
       const of = Number.isFinite(AUTO_RETRY.tries) ? `/${AUTO_RETRY.tries}` : '';
-      send('log', { line: `Auto-connect failed (${attempt}${of}): ${e.message}` + (more ? ` — retrying in ${wait / 1000}s` : ''), level: 'error' });
-      if (more) { const t = setTimeout(() => autoConnectAtLaunch(attempt + 1), wait); if (t.unref) t.unref(); }
+      send('log', { line: `Auto-connect failed (${attempt}${of}): ${e.message}` + (more ? ` — retrying in ${inWords(wait)}` : ''), level: 'error' });
+      if (!more) return;
+      if (refused) {
+        send('status', { state: 'error', message: e.message, serverId: target, cause: 'boot' });
+        sayRefusedBlocking();
+        // afresh then: a plain connect, not a "waiting" retry
+        const t = setTimeout(() => autoConnectAtLaunch(1), wait);
+        if (t.unref) t.unref();
+        return;
+      }
+      // "waiting for internet", not an error, between the attempts (B3)
+      send('status', { state: 'waiting', serverId: target, attempt, retryInMs: wait, reason: e.message, cause: 'boot' });
+      const t = setTimeout(() => autoConnectAtLaunch(attempt + 1), wait);
+      if (t.unref) t.unref();
     });
   }
-  if (st.autoConnect) { const t = setTimeout(() => autoConnectAtLaunch(), T.bootDelayMs); if (t.unref) t.unref(); }
+  // (after the kill switch has been armed from the saved intent — ksReady — so the LAN is covered before the gateway is built)
+  if (st.autoConnect) { const t = setTimeout(() => { ksReady.then(() => autoConnectAtLaunch()); }, T.bootDelayMs); if (t.unref) t.unref(); }
   xserver.autoStart();   // plus: the local server, when asked to start with the app
 
-  return { invoke, onEvent, shutdown, dataDir, getSettings, assetStatus, version: appVersion };
+  return {
+    invoke, onEvent, shutdown, dataDir, getSettings, assetStatus, version: appVersion,
+    // the connection as one fact (S1), for server.js's events stream and the LuCI facade
+    connSnapshot,
+    // what the LuCI facade (luciApi.js) reads and starts
+    memInfo, traffic, configsForLuci, settingsForLuci, setSettingsForLuci, devices, logTail, diagnostics, testThroughTunnel, actions, log,
+    // the remote control's destinations that never ride the tunnel (feat/remote's agent and cloudflared)
+    setRemoteBypass, remoteBypass, directResolvers, directDevice
+  };
 }
 
 module.exports = { createService, DEFAULT_SETTINGS };

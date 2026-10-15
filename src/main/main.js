@@ -5,12 +5,16 @@ const fs = require('fs');
 const os = require('os');
 const { execFile } = require('child_process');
 
-const { parseMany, parseLink, makeWireguardServer, makeProxyServer, applyServerEdits, buildShareLink, migrateStoredServer, parseWireguardConf } = require('./parser');
-const { buildConfig, buildTestConfig, buildMultiTestConfig, resolverBypassIpsOf, wgEndpointHosts, wgResolverAddresses, entryHosts } = require('./configBuilder');
+const { parseMany, parseLink, makeWireguardServer, makeProxyServer, createServer, applyServerEdits, buildShareLink, migrateStoredServer, parseWireguardConf } = require('./parser');
+const { buildConfig, buildTestConfig, buildMultiTestConfig, resolverBypassIpsOf, echResolverIpsOf, wgEndpointHosts, wgResolverAddresses, entryHosts, buildRawConfig, rawServerOf, rawModeNotes, entryAddressesOf, rawApplies, dialerTagsOf } = require('./configBuilder');
+// Raw JSON mode (configBuilder.rawApplies): in proxy mode only — the desktop is no router.
+const RAW_OPTS = { openwrt: false };
+const { latencyTest, testsAlone, udpOnly } = require('./latencyTest');
 const { adapterDnsServers, guardPeers } = require('./dnsBuilder');
 const { buildSingboxConfig } = require('./singboxBuilder');
 const { engineFormat } = require('./engines');
 const { chooseEngine, testEngineFor } = require('./engineChoice');
+const { muxMode, muxCandidates, decideMux, probeMux, rememberVerdicts, markRecheck, muxFingerprint } = require('./mux');
 const { resolveHost } = require('./trustedDns');
 const { fetchLeafPin, pinTargets, directServers, staleCertPins, recheckDue, PinWatch } = require('./certPin');
 const { assetStatus: scanAssets, downloadedFileNames } = require('./assets');
@@ -19,9 +23,9 @@ const { XrayManager, getFreePort, getFreePorts } = require('./xrayManager');
 const { setSystemProxy, useProxyJournal, repairSystemProxy, restoreSystemProxySync } = require('./sysproxy');
 const { tcpPing, httpThroughProxy, uploadThroughProxy, ipInfo, pLimit } = require('./netutils');
 const { Store } = require('./store');
-const { SubscriptionManager } = require('./subscription');
+const { SubscriptionManager, serverIdentity } = require('./subscription');
 const { TunManager, isOwnTunInterface, TUN_GW } = require('./tunManager');
-const { TunSingbox } = require('./tunSingbox');
+const { TunSingbox, TUN_ADDR4 } = require('./tunSingbox');
 const { NativeMacTun } = require('./nativeMacTun');
 const { recoverMacNetwork } = require('./macRecovery');
 const { collectDiagnostics } = require('./connectionDiagnostics');
@@ -37,14 +41,19 @@ const { pickUpdateAsset, parseSha256Sums, sha256File } = require('./appUpdate');
 const { listProcesses, collectProcessIps, pruneProcCache, ProcWatcher } = require('./procRouter');
 const { pendingReconnectKeys, snapshotApplied } = require('./settingsMeta');
 const { migrateSettings } = require('./settingsMigrate');
+const { migrateProfiles, mirrorToSettings, mirrorFromSettings, isAdvancedSelection, profileIdOf, resolveBaseTargets, advancedTargets, resolveProcessRules, liveRoutingOf, routingPendingKeys } = require('./routingProfiles');
 const { NetWatcher, fingerprint } = require('./netWatcher');
 const { DropBudget } = require('./dropBudget');
 const { isWebUrl, isAppPage } = require('./urlGuard');
 const { runElevatedRelaunch } = require('./relaunch');
-const { schtasksCreateArgs, schtasksDeleteArgs, autostartExe, loginItemSettings, startsHidden } = require('./autostart');
-const { trayGroups } = require('./trayMenu');
+const { schtasksCreateArgs, schtasksDeleteArgs, schtasksQueryXmlArgs, taskExeFromXml, autostartStale, autostartExe, loginItemSettings, startsHidden } = require('./autostart');
+const { sharedWgIdentities, localSubnets, lanOverlaps, targetNeeds, routeTargetName, noticeLine, noticeLevel, forWindow, needsTun } = require('./connectNotices');
+const { trayGroups, trayStopItem } = require('./trayMenu');
 const { exportBundle, importBundle } = require('./backup');
+const { createRouteShareApi } = require('./routeShare');
 const { AssetUpdater, cmpVersion } = require('./assetUpdater');
+const { CORE_IDS, createCoreVersionsApi } = require('./coreVersions');
+const { warpHandler } = require('./warp');
 const { createXServer } = require('./xserver');   // plus: the Server tab
 const { createScan } = require('./scan');         // plus: the IP-scan tab
 const https = require('https');
@@ -104,6 +113,11 @@ const drops = new DropBudget();
 // status or start a watcher. Comparing the token captured at entry against this
 // is how it finds out (see doConnect).
 let connGen = 0;
+// connGen as the last disconnect left it. While the two are equal nothing has
+// connected since, so a call that finds itself overtaken can tell a disconnect
+// (a Cancel pressed while connecting: the machine must end up exactly as a
+// disconnect leaves it) from a newer connect (which owns whatever it finds).
+let disconnectGen = 0;
 // A connect or a disconnect by hand: the connect-on-launch timer (ready-to-show)
 // must not overtake it — set synchronously by each, as service.js's is.
 let bootCancelled = false;
@@ -115,6 +129,15 @@ let userDisconnecting = false; // true during an intentional disconnect (kill sw
 // disconnected). Diffing it against the current settings is what tells the user
 // "you changed this, but it won't take effect until you reconnect".
 let appliedSettings = null;
+// The saved servers the live connection dials, and whether one was edited
+// since: the edit waits for a reconnect like a settings key (pendingKeys,
+// 'servers'). The router's service does the same (field report fix 18).
+let liveServerIds = new Set();
+let serverEditPending = false;
+// The routing profile and the chains the live connection was built from
+// (routingProfiles.liveRoutingOf): an edit of either since waits for a
+// reconnect too (pendingKeys, 'routingProfiles' / 'chains').
+let liveRouting = null;
 // The physical interface the LIVE connection's direct dials are bound to (see
 // doConnect); null when not under TUN. rebuildActiveConfig() reuses it rather
 // than asking the OS again — with the tunnel up, the default route IS the tunnel.
@@ -122,6 +145,9 @@ let liveDirectInterface = null;
 // The addresses the LIVE connection pinned ({ wgEndpointIps, entryHostIps },
 // see doConnect); rebuildActiveConfig() reuses them for the same reason.
 let livePins = null;
+// The servers the LIVE connection muxes ({ ids, fps }, see muxFor); null when
+// none. rebuildActiveConfig() keeps them; a drop forgets their verdicts.
+let liveMux = null;
 let liveDiagnostics = null;
 let macRepairPromise = Promise.resolve();
 let macRepairError = null;
@@ -166,6 +192,11 @@ const DEFAULT_SETTINGS = {
   // leak guard under TUN: 'off' | 'standard' (adapter DNS override) | 'strict'
   // (+ strict_route and a firewall for everything off the tunnel)
   leakGuard: 'standard',
+  // who answers DNS inside the sing-box TUN (tunSingbox.tunDnsModeFor): 'app' —
+  // sing-box 1.14+ gets dns_mode "disabled" and every query reaches Xray — or
+  // 'core', sing-box's own default (1.14+: it answers them itself). Never 'core'
+  // under the strict guard; the router's is always the app's.
+  singboxDns: 'app',
   // proxy mode only: block outbound UDP except :53 on physical adapters (WebRTC)
   blockUdpInProxyMode: false,
   // per-app split under the sing-box TUN (see tunApps.js): 'off' | 'exclude'
@@ -205,7 +236,6 @@ const DEFAULT_SETTINGS = {
   // 'off' | 'geo' (the data files only — the default: they cannot break a
   // working config) | 'all' (the installed cores too, when a release is newer)
   autoUpdateAssets: 'geo',
-  coreChannel: 'stable',   // plus: 'latest' follows the official core's 26.9.x pre-releases
   // which surfaces the window shows: 'simple' hides chains, the pool, the log
   // page and the custom-rule editor. A view preference only — renderer-owned,
   // never baked into a config, so it needs no reconnect.
@@ -213,7 +243,12 @@ const DEFAULT_SETTINGS = {
   // which of the three looks the window wears (renderer-only, like theme)
   skin: 'console',
   theme: 'dark',
-  defaultEngine: 'xray'
+  defaultEngine: 'xray',
+  // mux on the servers' own outbounds (mux.js): 'auto' tests each ws /
+  // httpupgrade server once and muxes it where it works, 'on' every such
+  // server untested, 'off' never — the default: nothing changes unless the
+  // user turns it on. Written into the config: a reconnect key.
+  mux: 'off'
 };
 
 function dataDir() {
@@ -274,10 +309,57 @@ function makeTun(settings, { quiet = false } = {}) {
   return (selected = sb);   // neither: the sing-box error message names what to install
 }
 
+// The last connection state told to the window: while it is 'connecting' the
+// tray's Disconnect is the connect's Cancel (trayStopItem).
+let lastStatus = 'disconnected';
+
+// The connection as ONE fact, for app:init (the renderer seeds itself from it
+// on every load — a reload while connected used to start on "disconnected"
+// with no event ever coming to correct it). Mirrors service.js connSnapshot();
+// the desktop has no boot retries, and `armed`/`blocking` is its Windows
+// firewall block (killEngaged).
+const conn = { state: 'disconnected', reason: null, attempt: 0, retryAt: null, since: null, serverId: null, label: null, engine: null, tun: false };
+function noteStatus(p) {
+  if (!p || !p.state) return;
+  const one = (s) => String(s == null ? '' : s).replace(/\s*[\r\n]+\s*/g, ' | ').slice(0, 1000);
+  switch (p.state) {
+    case 'connecting':
+      Object.assign(conn, { state: recovering ? 'reconnecting' : 'connecting', reason: null, attempt: recovering ? conn.attempt : 0, retryAt: null, since: null, serverId: p.serverId || conn.serverId, tun: false });
+      break;
+    case 'connected':
+      Object.assign(conn, { state: 'connected', reason: null, attempt: 0, retryAt: null, since: Date.now(), serverId: p.serverId || null, label: p.label || null, engine: p.engine || null, tun: !!p.tun });
+      break;
+    case 'reconnecting':
+      Object.assign(conn, { state: 'reconnecting', reason: p.reason == null ? null : one(p.reason), attempt: p.attempt || 0, retryAt: p.retryInMs ? Date.now() + p.retryInMs : null, since: null, tun: false });
+      break;
+    case 'reconnect-failed':
+      Object.assign(conn, { state: p.proxyUp ? 'connected' : 'error', reason: p.reason == null ? null : one(p.reason), attempt: 0, retryAt: null, since: p.proxyUp ? conn.since : null, tun: false });
+      break;
+    case 'error':
+      Object.assign(conn, { state: 'error', reason: one(p.message || p.error || 'error'), attempt: 0, retryAt: null, since: null, tun: false });
+      break;
+    case 'disconnected':
+      Object.assign(conn, { state: 'disconnected', reason: null, attempt: 0, retryAt: null, since: null, serverId: null, label: null, engine: null, tun: false });
+      break;
+    default: break;   // cleanup-failed: the state before it stands
+  }
+}
+function connSnapshot() {
+  const s = getSettings();
+  return {
+    state: conn.state, reason: conn.reason, cause: null, attempt: conn.attempt,
+    retryInMs: conn.retryAt == null ? null : Math.max(0, conn.retryAt - Date.now()),
+    since: conn.since, serverId: conn.serverId, label: conn.label, engine: conn.engine, tun: conn.tun,
+    killSwitch: { enabled: !!s.killSwitch, armed: !!killEngaged, blocking: !!killEngaged }
+  };
+}
+
 function send(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(channel, payload);
   }
+  if (channel === 'status' && payload && payload.state) lastStatus = payload.state;
+  if (channel === 'status') noteStatus(payload);
   // the tray marks the live server and lists what a subscription refresh brought
   if (channel === 'status' || channel === 'subs-updated') refreshTray();
 }
@@ -311,6 +393,54 @@ function setAutostart(enabled) {
   // macOS ignores `args`: it opens hidden through its own setting (autostart.js).
   try { app.setLoginItemSettings(loginItemSettings(enabled, process.platform)); return Promise.resolve({ ok: true }); }
   catch (e) { return Promise.resolve({ ok: false, error: e.message }); }
+}
+
+/**
+ * Windows: does the logon task start ANOTHER copy of the app? It runs exactly
+ * the file it was registered with, so a PC can keep starting an old build — one
+ * from before the v1.14 Windows DNS fix — at every logon while this one sits
+ * beside it (windows-android-report L1). Asked by the window once it loads
+ * (autostart:check), never at launch: one READ of the task (`schtasks /Query
+ * /XML`), answered once per run. A packaged build only — a dev run's
+ * electron.exe is never the file a task should start. Resolves { stale,
+ * taskExe?, currentExe? }; any doubt is { stale: false } (autostartStale).
+ */
+let autostartChecked = null;
+function autostartCheck() {
+  if (process.platform !== 'win32' || !app.isPackaged) return Promise.resolve({ stale: false });
+  if (!autostartChecked) {
+    autostartChecked = new Promise((resolve) => {
+      execFile('schtasks', schtasksQueryXmlArgs(), { windowsHide: true, timeout: 15000 }, (err, so) => {
+        if (err) return resolve({ stale: false });   // no task (or not readable): nothing to say
+        const taskExe = taskExeFromXml(String(so || ''));
+        const currentExe = autostartExe();
+        if (!autostartStale(taskExe, currentExe, { same: sameFile })) return resolve({ stale: false });
+        send('log', { line: `The logon task IRNetFree starts ${taskExe}, not this copy (${currentExe}) — at the next logon Windows runs that build instead of this one`, level: 'warn' });
+        resolve({ stale: true, taskExe, currentExe });
+      });
+    });
+  }
+  return autostartChecked;
+}
+
+/** Two paths that name one file (an 8.3 name, a junction); false when either is not there. */
+function sameFile(a, b) {
+  try { return fs.realpathSync.native(a).toLowerCase() === fs.realpathSync.native(b).toLowerCase(); } catch { return false; }
+}
+
+/**
+ * The banner's button: register the logon task for THIS copy, through the
+ * same helper the "launch at login" switch uses — the only write of this
+ * round, and only on the owner's click. The next check reads the task again.
+ */
+async function autostartRepoint() {
+  if (process.platform !== 'win32') return { ok: false, error: 'windows only' };
+  const r = await setAutostart(true);
+  autostartChecked = null;
+  send('log', r.ok
+    ? { line: `The logon task now starts this copy (${autostartExe()})`, level: 'info' }
+    : { line: 'Could not point the logon task at this copy: ' + r.error, level: 'error' });
+  return r;
 }
 
 /* ----------------------------- LAN sharing ----------------------------- */
@@ -506,18 +636,27 @@ function trayMenuTemplate() {
   const active = store.get('activeServerId', null);
   const item = (it) => ({
     label: (it.id === active ? '● ' : '') + it.name,
-    click: () => { bootCancelled = true; drops.reset(); doConnect(it.id).catch((e) => send('log', { line: 'Connect failed: ' + e.message, level: 'error' })); }
+    click: () => { bootCancelled = true; drops.reset(); doConnect(it.id).catch((e) => {
+      send('log', { line: 'Connect failed: ' + e.message, level: 'error' });
+      // 'connecting' already went out, and nothing in the window asked for this
+      // connect to hear its throw: without a terminal status it stays on
+      // "Connecting…" (and the tray on Cancel) — as vpn:reconnect says it.
+      // Unless a disconnect overtook it: its 'disconnected' is the last word.
+      if (connGen !== disconnectGen) send('status', { state: 'error', message: e.message });
+    }); }
   });
   const groups = trayGroups(store.get('servers', []), store.get('subscriptions', [])).map((g) => ({
     label: g.label || (en ? 'Servers' : 'سرورها'),
     submenu: g.items.map(item)
   }));
+  // Disconnect — or, while a connect is in flight, its Cancel
+  const stop = trayStopItem({ active: !!active, state: lastStatus, en });
   return [
     { label: en ? 'Show' : 'نمایش', click: () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show(); } },
     { type: 'separator' },
     ...groups,
     ...(groups.length ? [{ type: 'separator' }] : []),
-    { label: en ? 'Disconnect' : 'قطع اتصال', enabled: !!active, click: () => { bootCancelled = true; doDisconnect(); } },
+    { label: stop.label, enabled: stop.enabled, click: () => { bootCancelled = true; doDisconnect(); } },
     { type: 'separator' },
     { label: en ? 'Quit' : 'خروج', click: () => { isQuitting = true; app.quit(); } }
   ];
@@ -536,14 +675,44 @@ function setServers(list) {
   refreshTray();
 }
 
+/**
+ * The config the picker points at — a server, a chain, advanced routing, the
+ * pool — remembered on its own. `activeServerId` is cleared at every launch (a
+ * new process has no live connection) and `lastServerId` only moves on a
+ * connect, so every restart used to land the picker on the first server. The
+ * renderer resolves it again at launch against what can still be selected
+ * (lastServerId, then the first server, when it cannot). Written only when it
+ * moved, and coalesced: clicking down a list is a write per click.
+ */
+function setSelection(id) {
+  const v = typeof id === 'string' && id ? id : null;
+  if (store.get('selectedServerId', null) !== v) store.setLazy('selectedServerId', v);
+  return v;
+}
+
 /* ----------------------------- core actions ----------------------------- */
 
-/** Process names referenced by advanced routing 'process' rules. */
-function activeProcNames(settings) {
+/**
+ * Process names referenced by advanced routing 'process' rules — the rules of
+ * the routing profile `serverId` connects (the live connection's when not
+ * given), else the settings' own (rp-default's mirror), as before.
+ */
+function activeProcNames(settings, serverId) {
   if (!settings || !settings.advancedRouting) return [];
-  return [...new Set((settings.routeRules || [])
+  return [...new Set(procRules(settings, serverId)
     .filter(r => r && r.type === 'process' && r.value)
     .map(r => String(r.value)))];
+}
+
+function procRules(settings, serverId) {
+  const id = serverId === undefined ? store.get('activeServerId', null) : serverId;
+  if (isAdvancedSelection(id)) {
+    const profiles = getRoutingProfiles();
+    const pid = profileIdOf(id, profiles);
+    const profile = pid && profiles.find(p => p.id === pid);
+    if (profile) return profile.rules || [];
+  }
+  return settings.routeRules || [];
 }
 
 function loadProcCache() { return store.get('procIpCache', {}) || {}; }
@@ -552,13 +721,15 @@ function loadProcCache() { return store.get('procIpCache', {}) || {}; }
 function saveProcCache(c) { store.setLazy('procIpCache', c); }
 
 /**
- * Return a settings copy in which every 'process' route rule is rewritten into
- * a concrete 'ip' rule (live connections of that process unioned with the
- * persisted per-process cache). The stored rules keep type:'process'.
+ * Return a settings copy carrying `procIps`: for every process the connect's
+ * 'process' route rules name (activeProcNames), the addresses it uses — live
+ * connections of that process unioned with the persisted per-process cache.
+ * buildPlan turns each such rule into a concrete 'ip' rule with them
+ * (routingProfiles.resolveProcessRules); the stored rules keep type:'process'.
  */
-async function effectiveSettings() {
+async function effectiveSettings(serverId) {
   const s = getSettings();
-  const names = activeProcNames(s);
+  const names = activeProcNames(s, serverId);
   if (!names.length) return s;
   const cache = loadProcCache();
   pruneProcCache(cache);
@@ -570,20 +741,18 @@ async function effectiveSettings() {
   } catch (e) {
     send('log', { line: 'Process routing resolve failed: ' + e.message, level: 'warn' });
   }
-  const rules = (s.routeRules || []).map(r => {
-    if (r && r.type === 'process' && r.value) {
-      const list = ipsByName[r.value] || (cache[r.value] && cache[r.value].ips) || [];
-      return { type: 'ip', value: list.join(','), target: r.target };
-    }
-    return r;
-  });
-  return Object.assign({}, s, { routeRules: rules });
+  const procIps = {};
+  for (const n of names) procIps[n] = ipsByName[n] || (cache[n] && cache[n].ips) || [];
+  return Object.assign({}, s, { procIps });
 }
 
 /**
  * The connection plan for a target id: { plan, label, entryAddrs }.
  * `entryAddrs` are the addresses the machine dials *directly* (must be bypassed
- * under TUN so the tunnel doesn't loop on itself). No side effects.
+ * under TUN so the tunnel doesn't loop on itself). A server's own are
+ * configBuilder.entryAddressesOf: a link server's address, a JSON server's
+ * entry outbounds (the hop of its own chain, not the exit behind it). No side
+ * effects.
  */
 function buildPlan(serverId, settings) {
   const servers = store.get('servers', []);
@@ -624,13 +793,13 @@ function buildPlan(serverId, settings) {
 
   const addEntryForTarget = (tg) => {
     if (!tg || tg === 'direct' || tg === 'block') return;
-    if (tg === 'chain') { if (legacyChain[0]) entryAddrs.push(legacyChain[0].address); return; }
+    if (tg === 'chain') { if (legacyChain[0]) entryAddrs.push(...entryAddressesOf(legacyChain[0])); return; }
     if (String(tg).indexOf('chain:') === 0) {
       const m = chainsById[String(tg).slice('chain:'.length)];
-      if (m && m[0]) entryAddrs.push(m[0].address);
+      if (m && m[0]) entryAddrs.push(...entryAddressesOf(m[0]));
       return;
     }
-    if (serversById[tg]) entryAddrs.push(serversById[tg].address);
+    if (serversById[tg]) entryAddrs.push(...entryAddressesOf(serversById[tg]));
   };
 
   if (serverId === '__pool__') {
@@ -653,14 +822,38 @@ function buildPlan(serverId, settings) {
     plan = { mode: 'pool', entries, primary, serversById, chainsById, chain: legacyChain };
     label = (settings.lang === 'en' ? '🧩 Proxy Pool' : '🧩 استخر پروکسی') + ` (${entries.length})`;
     for (const e of entries) addEntryForTarget(e.target);
-  } else if (serverId === '__advanced__') {
-    const rules = Array.isArray(settings.routeRules) ? settings.routeRules : [];
-    const def = settings.routeDefault || (servers[0] && servers[0].id) || 'direct';
-    plan = { mode: 'advanced', serversById, chainsById, chain: legacyChain, rules, def };
-    label = '🧭 ' + (settings.lang === 'en' ? 'Advanced routing' : 'روتینگ ویژه');
-    const targets = new Set(rules.map(r => r && r.target));
-    targets.add(def);
-    for (const tg of targets) { refuseBroken(tg); addEntryForTarget(tg); }
+  } else if (isAdvancedSelection(serverId)) {
+    // A routing profile (routingProfiles.js): `__advanced__:<id>`, or plain
+    // `__advanced__` — the first one (LuCI, old stores, old selections).
+    const profiles = getRoutingProfiles();
+    const pid = profileIdOf(serverId, profiles);
+    const profile = pid && profiles.find(p => p.id === pid);
+    if (!profile) throw new Error(settings.lang === 'en'
+      ? 'This routing profile no longer exists — choose another one under Routing.'
+      : 'این پروفایلِ روتینگ دیگر وجود ندارد — در بخشِ روتینگ یکی دیگر انتخاب کن.');
+    // its process rules as the addresses those processes use now (effectiveSettings)
+    const rules = resolveProcessRules(Array.isArray(profile.rules) ? profile.rules : [], settings.procIps);
+    const def0 = profile.def || (servers[0] && servers[0].id) || 'direct';
+    if (def0 === 'base' && !profile.base) throw new Error(settings.lang === 'en'
+      ? 'This routing sends everything else out through its base, but it has no base — choose one under Routing.'
+      : 'این روتینگ بقیهٔ ترافیک را از پایه خارج می‌کند ولی پایه‌ای ندارد — در بخشِ روتینگ یک پایه انتخاب کن.');
+    // "exit at the base" is the base itself from here on (routingProfiles.resolveBaseTargets)
+    const { rules: atBase, def, defVia } = resolveBaseTargets({ rules, def: def0, defVia: profile.defVia, base: profile.base });
+    // leaving from a base that is gone is refused, as riding on one is (configBuilder's baseGone):
+    // left out, a rule's traffic would follow the default — perhaps direct
+    const baseHere = (b) => String(b).indexOf('chain:') === 0
+      ? ((chainsById[String(b).slice('chain:'.length)] || []).some(x => x && x.outbound))
+      : !!(serversById[b] && serversById[b].outbound);
+    if (profile.base && (def0 === 'base' || rules.some(r => r && r.target === 'base')) && !baseHere(profile.base)) throw new Error(settings.lang === 'en'
+      ? 'Advanced routing: the base this routing leaves from no longer exists (it was removed, or replaced by a subscription update) — choose another base under Routing.'
+      : 'روتینگ ویژه: پایه‌ای که این روتینگ از آن خارج می‌شود دیگر وجود ندارد (حذف شده، یا با به‌روزرسانیِ اشتراک عوض شده) — در بخش روتینگ پایهٔ دیگری انتخاب کن.');
+    plan = { mode: 'advanced', profileId: profile.id, serversById, chainsById, chain: legacyChain, rules: atBase, def, defVia, base: profile.base, useMode: profile.useMode };
+    label = '🧭 ' + (profile.name || (settings.lang === 'en' ? 'Advanced routing' : 'روتینگ ویژه'));
+    // every target and every base one goes through is refused when broken; the
+    // bypass is cut for what is dialled directly — a base, never a target behind it
+    const { targets, vias, entries } = advancedTargets(plan);
+    for (const tg of [...targets, ...vias]) refuseBroken(tg);
+    for (const tg of entries) addEntryForTarget(tg);
   } else if (chainById[serverId]) {
     refuseBroken('chain:' + serverId);
     const members = membersOf(chainById[serverId]);
@@ -669,7 +862,7 @@ function buildPlan(serverId, settings) {
       : 'این زنجیره حداقل به ۲ سرور نیاز دارد');
     plan = { mode: 'chain', chain: members, name: chainById[serverId].name };
     label = chainById[serverId].name;
-    entryAddrs = [members[0].address];
+    entryAddrs = entryAddressesOf(members[0]);
   } else if (serverId === '__chain__') {
     refuseBroken('chain');
     if (legacyChain.length < 2) throw new Error(settings.lang === 'en'
@@ -677,13 +870,13 @@ function buildPlan(serverId, settings) {
       : 'زنجیره حداقل به ۲ سرور نیاز دارد');
     plan = { mode: 'chain', chain: legacyChain };
     label = legacyChain.map(s => s.name).join(' → ');
-    entryAddrs = [legacyChain[0].address];
+    entryAddrs = entryAddressesOf(legacyChain[0]);
   } else {
     const server = byId(serverId);
     if (!server) throw new Error(settings.lang === 'en' ? 'Server not found' : 'سرور پیدا نشد');
     plan = { mode: 'single', server };
     label = server.name;
-    entryAddrs = [server.address];
+    entryAddrs = entryAddressesOf(server, rawApplies(server, settings, RAW_OPTS));
   }
   entryAddrs = [...new Set(entryAddrs.filter(Boolean))];
   return { plan, label, entryAddrs };
@@ -696,6 +889,10 @@ function buildPlan(serverId, settings) {
  */
 function buildActive(serverId, settings) {
   const { plan, label, entryAddrs } = buildPlan(serverId, settings);
+  // A JSON server set to run raw: its own config, as written — a single-server
+  // connect only (configBuilder.buildRawConfig). The app's routing mode, and
+  // the geo rules it would have skipped, are not in that config.
+  const rawServer = rawServerOf(plan, settings, RAW_OPTS);
 
   // Are the geo databases installed? If not, geosite:/geoip: rules would make
   // xray refuse to start — buildConfig drops them and we warn the user.
@@ -704,11 +901,11 @@ function buildActive(serverId, settings) {
   let geoWarn = null;
   const usesGeo = plan.mode === 'pool' ? false : (
     (plan.mode === 'advanced' &&
-      ((settings.routeRules || []).some(r => r && /^(geoip|geosite):/i.test(String(r.value || ''))))) ||
+      ((plan.rules || []).some(r => r && /^(geoip|geosite):/i.test(String(r.value || ''))))) ||
     (plan.mode !== 'advanced' &&
       (settings.routingMode === 'bypass-ir' || settings.routingMode === 'bypass-cn' ||
         (settings.blockAds && plan.mode !== 'advanced'))));
-  if (!geoAssets && usesGeo) {
+  if (!geoAssets && usesGeo && !rawServer) {
     geoWarn = settings.lang === 'en'
       ? 'Geo files (geoip/geosite) are missing — geo-based rules were skipped. Download them under Settings → Required files.'
       : 'فایل‌های geo (geoip/geosite) موجود نیست — قوانین مبتنی بر geo نادیده گرفته شد. از تنظیمات → فایل‌های موردنیاز دانلودشان کن.';
@@ -719,9 +916,13 @@ function buildActive(serverId, settings) {
   // member needs it. The EFFECTIVE engine (after fallback when the binary is
   // missing) decides the config format.
   let engine = xray.resolveEngine(chooseEngine(plan, settings.defaultEngine)).id;
+  // A raw config is Xray's own format: it runs on an Xray core, whatever the choice.
+  if (rawServer && engineFormat(engine) === 'sing-box') engine = xray.resolveEngine('xray').id;
 
   let config;
-  if (engineFormat(engine) === 'sing-box') {
+  if (rawServer) {
+    config = buildRawConfig(rawServer, settings);
+  } else if (engineFormat(engine) === 'sing-box') {
     try {
       config = buildSingboxConfig(plan.server, settings);
     } catch (e) {
@@ -922,6 +1123,57 @@ async function withEntryHostIps(serverId, settings) {
 }
 
 /**
+ * Mux for this connect (mux.js, spec §4). `auto` tests every eligible server
+ * the plan dials as a target of its own that has no fresh verdict, or one
+ * marked for a re-test — before the config is built, with the names this
+ * connect resolved, at most three at once (one on a router) and 8 s each —
+ * and remembers the answers (the store's `muxProbes`). A recovery's connect
+ * (`recovery`) tests nothing: it takes what is remembered (mux.js judge).
+ * `on` takes them all untested; `off` changes nothing. `ids` go to
+ * buildConfig as `muxServerIds`; `fps` stay with the live connection, for a
+ * drop to mark for a re-test (recheckLiveMux). A chain's hops never get mux,
+ * nor a config on the sing-box engine.
+ */
+async function muxFor(serverId, settings, recovery) {
+  const none = { ids: [], fps: [] };
+  const mode = muxMode(settings.mux);
+  // off — unless a server is set to Mux on (its own `mux`, the editor's Advanced tab)
+  if (mode === 'off' && !(store.get('servers', []) || []).some((s) => s && s.mux === 'on')) return none;
+  let plan;
+  try { plan = buildPlan(serverId, settings).plan; } catch { return none; }   // buildActive reports it
+  let engine = xray.resolveEngine(chooseEngine(plan, settings.defaultEngine), { quiet: true }).id;
+  if (engineFormat(engine) === 'sing-box') return none;
+  const servers = muxCandidates(plan, rawServerOf(plan, settings, RAW_OPTS));
+  if (!servers.length) return none;
+  const { muxIds, learnt } = await decideMux({
+    mode, servers, cache: store.get('muxProbes', {}), now: Date.now(), recovery: !!recovery,
+    probe: (server) => probeMux(server, {
+      buildTestConfig: (target, port) => buildTestConfig(target, port, { entryHostIps: settings.entryHostIps, ipv6: settings.ipv6 }),
+      startTest: (config) => xray.startTest(config, testEngineFor(engine)),
+      getFreePort,
+      httpThroughProxy
+    }),
+    log: (line, level) => send('log', { line, level })
+  });
+  if (learnt.length) store.set('muxProbes', rememberVerdicts(store.get('muxProbes', {}), learnt, Date.now()));
+  return { ids: muxIds, fps: servers.filter((s) => muxIds.includes(s.id)).map(muxFingerprint) };
+}
+
+/**
+ * A muxed connection that dropped: its servers' ok verdicts are marked for a
+ * re-test (markRecheck) — the recovery's connect still muxes them (it never
+ * tests), the next connect the user or the boot makes tests them again.
+ * Nothing is written when they are marked already.
+ */
+function recheckLiveMux() {
+  if (!liveMux) return;
+  const cache = store.get('muxProbes', {});
+  const next = markRecheck(cache, liveMux.fps);
+  liveMux = null;
+  if (next !== cache) store.set('muxProbes', next);
+}
+
+/**
  * Arm the "this tunnel is talking to nobody" watch for the WireGuard outbounds
  * of the config we are about to run, and forget the previous connection's.
  */
@@ -971,7 +1223,24 @@ function doConnect(serverId, opts) {
   connectsInFlight.add(p);
   const settled = () => connectsInFlight.delete(p);
   p.then(settled, settled);
+  // after `settled` (registered first): this connect is no longer "in flight"
+  if (!(opts && opts.recovery)) p.catch(() => releaseGuardAfterFailedConnect().catch(() => {}));
   return p;
+}
+
+/**
+ * A connect that failed before any tunnel came up (a refused config, the core
+ * not starting): a guard still held for a reconnect that was given up points
+ * every adapter at a resolver nothing answers, and the window's "give my
+ * internet back" banner went away with this connect's 'connecting'. Given back
+ * here, as a TUN that fails to start does — unless a tunnel is up or another
+ * connect is being built (the guard is theirs). A recovery keeps its hold.
+ */
+async function releaseGuardAfterFailedConnect() {
+  if (guardInUse()) return null;
+  const r = await releaseStrandedGuard(leakGuard);
+  if (r && r.released) send('log', { line: 'The connect failed before a tunnel came up — the adapters’ DNS, held for the last connection, is theirs again', level: 'info' });
+  return r;
 }
 
 /**
@@ -1018,7 +1287,7 @@ async function connectOnce(serverId, opts = {}) {
     if (stale()) return abandoned;
     send('killswitch', { engaged: false });
   }
-  let settings = await effectiveSettings();
+  let settings = await effectiveSettings(serverId);
   if (stale()) return abandoned;
   const byId = (id) => store.get('servers', []).find(s => s.id === id);
 
@@ -1054,6 +1323,13 @@ async function connectOnce(serverId, opts = {}) {
   settings = Object.assign({}, settings, { wgEndpointIps: wgSet.wgEndpointIps, entryHostIps: entrySet.entryHostIps });
   // Every address the core will dial by itself, for the tunnel's bypass.
   const pinnedIps = [...Object.values(settings.wgEndpointIps || {}), ...Object.values(settings.entryHostIps || {}).flat()];
+
+  // Mux, decided per server (muxFor): in `auto` a server with no fresh verdict
+  // is tested now — with the names just resolved, before the config is built.
+  // Never in a recovery's rebuild, which takes what is remembered.
+  const mux = await muxFor(serverId, settings, !!opts.recovery);
+  if (stale()) return abandoned;
+  if (mux.ids.length) settings = Object.assign({}, settings, { muxServerIds: mux.ids });
 
   // The TUN layer for this connect — the backend setting plus what is
   // installed. A LIVE instance is never replaced: switching servers keeps the
@@ -1095,18 +1371,26 @@ async function connectOnce(serverId, opts = {}) {
   livePins = { wgEndpointIps: settings.wgEndpointIps, entryHostIps: settings.entryHostIps };
 
   const { plan, label, entryAddrs, config, geoWarn, engine } = buildActive(serverId, settings);
+  // A JSON server set to run raw, said once per connect: run as written, or —
+  // in a chain, advanced routing or the pool — used in its full form.
+  for (const note of rawModeNotes(plan, settings, RAW_OPTS)) send('log', note);
+  // What the window is told besides the log, on Windows (v1.16.3): each one a
+  // toast once this connect stands. Said only — nothing below reads them.
+  const notices = [];
   // Managed DNS off drops every resolver a routing target brings — a
   // corporate WireGuard's own DNS above all. The names inside that network
   // then never resolve, and nothing else in the log says why.
   if (settings.dnsManaged === false) {
-    const corp = wgResolverAddresses(plan);
+    const corp = routedWgResolvers(plan);
     if (corp.length) {
       send('log', {
         line: `Managed DNS is off, so the resolver of your WireGuard (${corp.join(', ')}) is not in this config and names inside that network will not resolve — turn Settings → DNS → "DNS managed by the app" back on`,
         level: 'warn'
       });
+      if (process.platform === 'win32') notices.push({ id: 'corpDnsOff', servers: corp.join(', ') });
     }
   }
+  if (process.platform === 'win32') notices.push(...connectHints(plan, { tun: !!settings.tunMode }));
 
   send('status', { state: 'connecting', serverId });
 
@@ -1116,6 +1400,22 @@ async function connectOnce(serverId, opts = {}) {
   if (stale()) return abandoned;
   if (!check.ok) {
     send('log', { line: 'Config rejected by xray: ' + check.error, level: 'error' });
+    // ECH on an official core older than 25.8.3 with no Xray-PattN to run it
+    // (xrayManager.validateWithFallback): that core would pass the config and
+    // connect without ECH — what to update is the message.
+    if (check.echUnsupported) {
+      throw new Error(settings.lang === 'en'
+        ? `This server uses ECH, which Xray ${check.coreVersion} does not know (it would connect without it) — update Xray under Settings → Required files`
+        : `این سرور از ECH استفاده می‌کند و Xray ${check.coreVersion} آن را نمی‌شناسد (بدون ECH وصل می‌شد) — از تنظیمات ← فایل‌های موردنیاز، Xray را به‌روز کن`);
+    }
+    // MASQUE on a core older than it (26.9.30; a WARP account 26.10.10) and no
+    // other core new enough (xrayManager.validateWithFallback): the old core
+    // refuses it in words that name no version, or dials WARP without its key.
+    if (check.masqueUnsupported) {
+      throw new Error(settings.lang === 'en'
+        ? `This MASQUE server needs Xray ${check.need} or newer — update it under Settings → Required files`
+        : `این سرور MASQUE است و به Xray نسخهٔ ≥ ${check.need} نیاز دارد — از تنظیمات ← فایل‌های موردنیاز به‌روزش کن`);
+    }
     // The official core refuses plaintext VLESS/Trojan to public addresses and the
     // fork that accepts them is not installed — say so, the renderer offers the download.
     const hint = check.plaintextRejected
@@ -1137,10 +1437,11 @@ async function connectOnce(serverId, opts = {}) {
   // mistaken for an unexpected drop (which would trip the kill switch) or flash
   // "disconnected" in the UI. Save/restore rather than clear: reapplyConnection()
   // wraps the whole teardown+reconnect in the same flag.
+  let ownCore = null;   // the core this call started, while it is still the one running
   const prevReloading = xrayReloading;
   xrayReloading = true;
   try {
-    await xray.start(config, runEngine);
+    if (await xray.start(config, runEngine)) ownCore = xray.proc;
     if (!stale()) liveDiagnostics = JSON.parse(JSON.stringify({ config, plan, socksPort: settings.socksPort, tunRequested: !!settings.tunMode }));
   } catch (e) {
     // start() watches for 1.2 s to catch a config that crashes the core on
@@ -1156,10 +1457,33 @@ async function connectOnce(serverId, opts = {}) {
   } finally {
     xrayReloading = prevReloading;
   }
-  // The critical one. doDisconnect() has already stopped the core it just
-  // started, so writing activeServerId back here would resurrect the very intent
-  // the user cancelled — and every side effect below would follow it.
-  if (stale()) return abandoned;
+  // A disconnect that overtook this call (Cancel, pressed while connecting) tore
+  // down what it found — but this call can have started things AFTER that
+  // teardown ran. The core of a server switch above all: start() stops the old
+  // core first, and the disconnect's own stop, waiting on the same exit, is
+  // released after it, with the new core already spawned — nothing else would
+  // ever stop that one. And the kill switch a switch arms (below), whose netsh
+  // can land after the disconnect's disarm: the internet blocked behind a
+  // window that says "disconnected". Both are undone here, and only for a
+  // disconnect with nothing after it: a newer connect owns what it finds (its
+  // own start() stops our core first, and it decides about the kill switch).
+  const giveWay = async (armedHere = false) => {
+    if (connGen === disconnectGen) {
+      if (ownCore && xray.proc === ownCore) {
+        const prev = xrayReloading;
+        xrayReloading = true;   // ours, not a drop
+        try { await xray.stop(); } catch { /* best effort */ } finally { xrayReloading = prev; }
+      }
+      if (armedHere) {
+        try { await disarmKillSwitch(); } catch { /* best effort */ }
+        send('killswitch', { engaged: false });
+      }
+    }
+    return abandoned;
+  };
+  // The critical one. Writing activeServerId back here would resurrect the very
+  // intent the user cancelled — and every side effect below would follow it.
+  if (stale()) return giveWay();
 
   store.set('activeServerId', serverId);
   // `activeServerId` is cleared by a disconnect; this one survives it, for
@@ -1169,6 +1493,10 @@ async function connectOnce(serverId, opts = {}) {
   // Everything below is a connect-time side effect, so from here on the live
   // tunnel matches these settings exactly — record what it was built from.
   appliedSettings = snapshotApplied(getSettings());
+  liveServerIds = planServerIds(plan);
+  serverEditPending = false;
+  liveMux = mux.ids.length ? mux : null;
+  liveRouting = liveRoutingOf({ serverId, plan, profiles: getRoutingProfiles(), chains: getChains() });
 
   if (settings.systemProxy) {
     try {
@@ -1178,7 +1506,7 @@ async function connectOnce(serverId, opts = {}) {
       send('log', { line: 'System proxy failed: ' + e.message, level: 'error' });
     }
   }
-  if (stale()) return abandoned;
+  if (stale()) return giveWay();
 
   updateTray(true, label);
 
@@ -1275,9 +1603,15 @@ async function connectOnce(serverId, opts = {}) {
         // nothing here, but one dialled on its own would loop back into the
         // tunnel it is building) — kept off it even when the backend's own
         // lookup of a name answers otherwise, or nothing, under a held rebuild.
-        await myTun.start(settings.socksPort, [...entryAddrs, ...resolverBypassIpsOf(config), ...pinnedIps],
+        // The strict guard firewalls the physical adapter, so the resolver the
+        // core fetches an ECH config from needs its hole too (configBuilder:
+        // its socket is bound to the NIC — elsewhere that alone is enough).
+        const echHoles = settings.leakGuard === 'strict' ? echResolverIpsOf(config) : [];
+        await myTun.start(settings.socksPort, [...entryAddrs, ...resolverBypassIpsOf(config), ...echHoles, ...pinnedIps],
           tunAdapterDns,
-          { ipv6: !!settings.ipv6, strict: settings.leakGuard === 'strict', apps: tunApps });   // tun2socks ignores the 4th
+          { ipv6: !!settings.ipv6, strict: settings.leakGuard === 'strict', apps: tunApps,
+            // sing-box 1.14+: the app's DNS unless the user left it to sing-box — never under the strict guard
+            dnsPolicy: settings.leakGuard !== 'strict' && settings.singboxDns === 'core' ? 'core' : 'app' });   // tun2socks ignores the 4th
         send('log', { line: 'TUN mode active (whole system)', level: 'info' });
         if (tunApps) {
           send('log', {
@@ -1364,8 +1698,12 @@ async function connectOnce(serverId, opts = {}) {
       // the first thing this block cut off. Resolve them the way the TUN layer
       // does before they become firewall holes.
       const udpExcludes = await tunPlatform.resolveServerIps(entryAddrs, { ipv6: true }).catch(() => []);
-      await leakGuard.engageUdpBlock({ excludes: udpExcludes });
+      const udp = await leakGuard.engageUdpBlock({ excludes: udpExcludes });
       guardEngaged = true;
+      // Its receipt too: a disconnect landing during the lookup above released
+      // the guard BEFORE this engage, and the gate below then had no receipt to
+      // give the block back with — UDP stayed blocked after the Cancel.
+      guardToken = (udp && udp.token) || guardToken;
     } catch (e) {
       guardError = e.message;
       send('log', { line: 'UDP block failed: ' + e.message + ' — WebRTC can still reveal your address in proxy mode', level: 'error' });
@@ -1387,7 +1725,7 @@ async function connectOnce(serverId, opts = {}) {
     // holding the machine's default routes while the UI says 'disconnected'.
     if (guardToken) await leakGuard.release({ token: guardToken }).catch(() => {});
     if (myTun && myTun.active) { try { await myTun.stop(); } catch {} }
-    return abandoned;
+    return giveWay(switchArmed);
   }
 
   // LAN sharing: open the firewall on Windows + report the address other
@@ -1405,8 +1743,8 @@ async function connectOnce(serverId, opts = {}) {
   }
   // The server switch's own block (see the tunnel rebuild above) goes the way
   // a settings reapply's does: once this connect stands — not over a core
-  // that died (its drop rebuilds under it), and not for an intent a
-  // disconnect or a newer connect overtook (theirs to decide).
+  // that died (its drop rebuilds under it), and not for an intent a newer
+  // connect overtook (theirs to decide; a disconnect's is giveWay's).
   if (switchArmed && !stale() && xray.running) {
     await disarmKillSwitch();
     send('killswitch', { engaged: false });
@@ -1414,7 +1752,12 @@ async function connectOnce(serverId, opts = {}) {
   }
   // Last gate before the irreversible half: the watchers and the 'connected'
   // status. Past this line nothing awaits, so nothing can overtake us.
-  if (stale()) return abandoned;
+  // A disconnect that landed during the LAN rule above may have removed it
+  // before it was added: gone again with the rest.
+  if (stale()) {
+    if (settings.allowLan && connGen === disconnectGen) { try { await removeLanFirewall(); } catch {} }
+    return giveWay(switchArmed);
+  }
   // The core only had to survive start()'s grace period; the tunnel and the
   // guard took seconds more. One that died in between is not a connection —
   // calling it one told a recovery it was done, and lifted the kill switch over
@@ -1424,6 +1767,7 @@ async function connectOnce(serverId, opts = {}) {
   // Start live traffic stats
   stats.setBin(xray.anyBin());
   stats.apiPort = settings.apiPort;
+  stats.skipTags = rawServerOf(plan, settings, RAW_OPTS) ? dialerTagsOf(config) : null;
   watchWgSilence(config);
   // A fresh core starts its counters at zero, so the meter has to be told —
   // otherwise the first poll of the new session reads as growth on the old one
@@ -1456,7 +1800,8 @@ async function connectOnce(serverId, opts = {}) {
   updateOverlay('on');
   send('status', {
     state: 'connected', serverId, server: byId(serverId) || null, label, engine: runEngine,
-    tun: tun.active, tunError, guardError, geoWarn, lan, pendingReconnect: pendingKeys()
+    tun: tun.active, tunError, guardError, geoWarn, lan, pendingReconnect: pendingKeys(),
+    notices: tun.active ? notices : notices.filter((n) => !needsTun(n))
   });
   // `tunError` is the one failure this function does NOT throw for: TUN is a
   // best-effort upgrade and we stay connected proxy-only without it. Callers
@@ -1466,9 +1811,90 @@ async function connectOnce(serverId, opts = {}) {
   return { ok: true, tunError };
 }
 
-/** Reconnect-relevant settings the user changed since the live tunnel was built. */
+/**
+ * Reconnect-relevant settings the user changed since the live tunnel was built
+ * — and 'servers' for an edit of one it dials, 'routingProfiles' / 'chains' for an
+ * edit of the routing profile / a chain it was built from.
+ */
 function pendingKeys() {
-  return pendingReconnectKeys(appliedSettings, getSettings());
+  const keys = pendingReconnectKeys(appliedSettings, getSettings());
+  if (appliedSettings && serverEditPending) keys.push('servers');
+  if (appliedSettings) for (const k of routingPendingKeys(liveRouting, getRoutingProfiles(), getChains())) if (!keys.includes(k)) keys.push(k);
+  return keys;
+}
+
+/** Did an edit change what the core dials? Everything but the name (a label, never in the config) and `_edited` (which fields a subscription refresh keeps), key order aside. */
+function dialChanged(a, b) {
+  const canon = (v) => (Array.isArray(v) ? v.map(canon) : (v && typeof v === 'object' ? Object.keys(v).sort().reduce((o, k) => { o[k] = canon(v[k]); return o; }, {}) : v));
+  const dialled = (s) => JSON.stringify(canon(Object.assign({}, s, { name: null, _edited: null })));
+  return dialled(a) !== dialled(b);
+}
+
+/** The ids of every saved server a plan dials: each hop of a chain, every pool and advanced-routing target, every base one goes through. */
+function planServerIds(plan) {
+  const ids = new Set();
+  const add = (s) => { if (s && s.id) ids.add(s.id); };
+  const hops = (list) => { for (const s of list || []) add(s); };
+  const target = (tg) => {
+    if (!tg || tg === 'direct' || tg === 'block') return;
+    if (tg === 'chain') return hops(plan.chain);
+    if (String(tg).indexOf('chain:') === 0) return hops((plan.chainsById || {})[String(tg).slice('chain:'.length)]);
+    add((plan.serversById || {})[tg]);
+  };
+  switch (plan && plan.mode) {
+    case 'single': add(plan.server); break;
+    case 'chain': hops(plan.chain); break;
+    case 'pool': for (const e of plan.entries || []) if (e) target(e.target); break;
+    case 'advanced': { const t = advancedTargets(plan); for (const tg of [...t.targets, ...t.vias]) target(tg); break; }
+    default: break;
+  }
+  return ids;
+}
+
+/**
+ * The resolvers of the WireGuard records this plan dials (planServerIds), for
+ * the "managed DNS is off" warning. An advanced or pool plan carries EVERY
+ * stored server in serversById, and wgResolverAddresses reads them all — so a
+ * corporate WireGuard that no rule routes to was warned about on every connect.
+ * A single server and a chain are what they dial, as before.
+ */
+function routedWgResolvers(plan) {
+  if (!plan || (plan.mode !== 'advanced' && plan.mode !== 'pool')) return plan ? wgResolverAddresses(plan) : [];
+  const byId = plan.serversById || {};
+  return wgResolverAddresses({ mode: 'chain', chain: [...planServerIds(plan)].map((id) => byId[id]).filter(Boolean) });
+}
+
+/**
+ * Windows (v1.16.3): what this PC does to a plan that the plan itself cannot
+ * show (connectNotices.js) — a WireGuard identity the plan uses that another
+ * stored record also holds (W1), and a local network inside a private range
+ * advanced routing sends to a tunnel (W4). Each is a line here; those that can
+ * be the cause (forWindow) also go, through the 'connected' status, to the
+ * window as a toast — a LAN inside a broad range that holds nothing the target
+ * needs stays an info line. W4 is about the TUN's routes, so it is asked only
+ * of a connect that asks for the tunnel (`tun`); proxy mode sends private
+ * ranges around the proxy anyway. Nothing is changed. A hint must never cost a
+ * connect: whatever goes wrong in here is swallowed.
+ */
+function connectHints(plan, { tun = false } = {}) {
+  const out = [];
+  try {
+    const found = sharedWgIdentities(planServerIds(plan), store.get('servers', []), store.get('subscriptions', []));
+    if (tun && plan && plan.mode === 'advanced') {
+      // our own adapters (an earlier tunnel still up on a server switch) are not "your local network"
+      const own = [TUN_LOCAL_IP, String(TUN_ADDR4).split('/')[0]];
+      const lans = localSubnets(os.networkInterfaces(), (name, address) => isOwnTunInterface(name) || own.includes(address));
+      const chains = getChains();
+      // the rules as stored (the routing profile's), not the connect's resolved process rules
+      const profile = getRoutingProfiles().find(p => p.id === plan.profileId);
+      found.push(...lanOverlaps(lans, profile ? profile.rules : getSettings().routeRules, (tg) => routeTargetName(tg, plan, chains), (tg) => targetNeeds(tg, plan)));
+    }
+    for (const n of found) {
+      send('log', { line: noticeLine(n), level: noticeLevel(n) });
+      if (forWindow(n)) out.push(n);
+    }
+  } catch { /* said nothing; the connect goes on exactly as before */ }
+  return out;
 }
 
 /**
@@ -1502,6 +1928,16 @@ async function reapplyConnection(opts = {}) {
   if (getSettings().killSwitch) {
     const r = await armKillSwitch();
     armed = !!(r && r.ok);
+    // A disconnect (Cancel) that landed during the arm has already said
+    // 'disconnected': a 'connecting' after it put the window back on
+    // "Connecting…" for good, over nothing. And its disarm may have run before
+    // this netsh added the rule — the internet blocked behind a window that says
+    // disconnected — so a block put in for a disconnect's machine is lifted
+    // again. A newer connect decides about the kill switch itself.
+    if (gen !== connGen) {
+      if (armed && connGen === disconnectGen) { try { await disarmKillSwitch(); } catch {} send('killswitch', { engaged: false }); }
+      return { ok: false, stale: true };
+    }
     send('killswitch', { engaged: armed, error: r && r.error });
     if (armed) send('log', { line: 'Kill switch engaged for a settings reconnect — internet blocked until the tunnel is back', level: 'warn' });
     else if (process.platform === 'win32') send('log', { line: 'Kill switch could not be armed for the reconnect (run as admin): ' + (r && r.error), level: 'warn' });
@@ -1618,13 +2054,15 @@ async function reapplyConnection(opts = {}) {
 async function rebuildActiveConfig() {
   const serverId = store.get('activeServerId', null);
   if (!serverId || !xray.running) return;
-  let settings = await effectiveSettings();
+  let settings = await effectiveSettings(serverId);
   // Keep the binding the live connection was built with (see doConnect): the
   // tunnel stays up across this reload, and asking the OS now would name it.
   if (liveDirectInterface) settings = Object.assign({}, settings, { directInterface: liveDirectInterface });
   // …and the addresses it pinned: the tunnel's bypass names exactly these, and
   // a name asked again now could answer another (see doConnect)
   if (livePins) settings = Object.assign({}, settings, livePins);
+  // …and what it muxed: a reload is no new connect, and tests nothing
+  if (liveMux) settings = Object.assign({}, settings, { muxServerIds: liveMux.ids });
   // `plan` too: the usage meter needs it to attribute the new core's bytes
   const { plan, config, engine } = buildActive(serverId, settings);
   // Suppress the transient 'stopped' status from the old instance so the UI
@@ -1860,6 +2298,41 @@ function reportReconnectFailed(reason, res) {
   notify('IRNetFree', isEn() ? 'Could not reconnect — open the app' : 'اتصال مجدد ناموفق — برنامه را باز کنید');
 }
 
+/**
+ * Is the guard's override some connection's own DNS right now? The core
+ * running over a live TUN (the guard engaged for it, or held over its
+ * rebuild), or a connect in flight — which holds, or is about to take, its own
+ * guard receipt. Never true after a give-up: every give-up leaves either no
+ * core or no tunnel (the proxy up, only TUN missing).
+ */
+function guardInUse() {
+  return connectsInFlight.size > 0 || !!(xray && xray.running && tun && tun.active);
+}
+
+/**
+ * guard:release — the banner's "give my internet back" after a give-up with
+ * the guard held. A release without a receipt is unconditional (the user's own
+ * intent), so asked while a connection uses the guard it would put every
+ * physical adapter back on the ISP's resolvers under a tunnel that carries the
+ * traffic: a DNS leak with the window saying connected (the banner used to
+ * outlive its give-up and offer exactly that). Refused then — a disconnect
+ * gives the resolvers back — and otherwise as it always was.
+ */
+async function releaseGuardOnRequest() {
+  if (guardInUse()) {
+    send('log', { line: 'Not giving the adapters their own DNS back: a connection is up (or being built) and the leak guard belongs to it — disconnect to restore them', level: 'warn' });
+    return {
+      ok: false,
+      refused: 'connected',
+      error: isEn()
+        ? 'A connection is up and the adapters’ DNS is its own — disconnect to give it back'
+        : 'اتصال برقرار است و DNS آداپتورها مال همین اتصال است — برای برگرداندنش قطع کن'
+    };
+  }
+  try { if (leakGuard) await leakGuard.release(); return { ok: true }; }
+  catch (e) { return { ok: false, error: e.message }; }
+}
+
 /** The recovery reasons that are a drop of the connection, not the network moving. */
 const DROP_REASONS = new Set(['core-exited', 'tunnel-exited', 'reload-failed']);
 
@@ -1879,6 +2352,8 @@ const DROP_REASONS = new Set(['core-exited', 'tunnel-exited', 'reload-failed']);
  */
 async function onConnectionDrop(reason) {
   if (userDisconnecting || isQuitting || !store.get('activeServerId', null)) return;
+  // what the dropped connection muxed: kept for the rebuild, re-tested by the next connect the user or the boot makes
+  recheckLiveMux();
   updateOverlay('off');
   const s = getSettings();
   // The block THIS drop put in (not one a reapply or an earlier drop already
@@ -2045,6 +2520,7 @@ async function doDisconnect() {
     // watchers, and a recovery that hung (a stuck PowerShell, an ignored macOS
     // password prompt) must not keep its lock and park every future trigger.
     connGen++;
+    disconnectGen = connGen;
     recoverGen++;
     recovering = false;
     drops.reset();                   // the next connection starts with a full budget
@@ -2077,6 +2553,7 @@ async function doDisconnect() {
     pinWatch.clear();
     appliedSettings = null;          // nothing live to be out of sync with
     liveDirectInterface = null;
+    liveMux = null;
     updateTray(false);
     updateOverlay('off');
     cleanupFailed = false;
@@ -2204,6 +2681,32 @@ function getChains() {
   return seed;
 }
 
+/**
+ * The routing profiles (routingProfiles.js), migrated: none stored yet → today's
+ * advanced-routing settings as `rp-default`, written once — at start, beside
+ * the other store migrations; any later caller finds them stored.
+ */
+function getRoutingProfiles() {
+  const { profiles, changed } = migrateProfiles({ stored: store.get('routingProfiles', null), settings: getSettings() });
+  if (changed) store.set('routingProfiles', profiles);
+  return profiles;
+}
+
+/**
+ * Save the routing profiles (routing:setProfiles): each normalized, rp-default
+ * mirrored into the settings' routeRules / routeDefault / advancedUseMode. An
+ * edit of the live profile waits for a reconnect (pendingKeys).
+ */
+function setRoutingProfiles(list) {
+  if (!Array.isArray(list)) return { ok: false, error: 'not a list of profiles', profiles: getRoutingProfiles(), pendingReconnect: pendingKeys() };
+  const { profiles } = migrateProfiles({ stored: list, settings: getSettings() });
+  store.set('routingProfiles', profiles);
+  const stored = store.get('settings', {});
+  const mirrored = mirrorToSettings(profiles, stored);
+  if (mirrored !== stored) store.set('settings', mirrored);
+  return { ok: true, profiles, pendingReconnect: pendingKeys() };
+}
+
 /* ----------------------------- IPC handlers ----------------------------- */
 async function connectionDiagnostics(probe) {
   return collectDiagnostics(Object.assign({}, liveDiagnostics || {}, {
@@ -2256,6 +2759,30 @@ async function repairNetwork() {
   } finally { networkRepairing = false; }
 }
 
+/**
+ * After a core's binary changed — a download, or a version chosen in the
+ * picker: what was cached about it. binPath caches ONLY the official core — and
+ * holds the path the user picked with "Locate xray…" — so a change to the fork
+ * must not clear it.
+ */
+function afterCoreChanged(component) {
+  if (component === 'xray') xray.binPath = null;
+  xray.forgetVersions();
+  stats.setBin(xray.anyBin());
+}
+
+/**
+ * A core is never replaced under a connection (the version picker's
+ * 'cores:install'): the core or a tunnel up, a connect in flight, a recovery
+ * between its attempts, or the window told anything but disconnected or an error.
+ */
+function coreChangeBlocked() {
+  return connectsInFlight.size > 0 || recovering || !!recoverTimer
+    || !!store.get('activeServerId', null)
+    || !!(xray && xray.running) || !!(tun && tun.active)
+    || ['connecting', 'reconnecting', 'connected'].includes(conn.state);
+}
+
 function registerIpc() {
   ipcMain.handle('diagnostics:connection', (e, probe) => connectionDiagnostics(probe));
   ipcMain.handle('network:repair', () => repairNetwork());
@@ -2265,6 +2792,9 @@ function registerIpc() {
     subscriptions: store.get('subscriptions', []),
     settings: getSettings(),
     activeServerId: store.get('activeServerId', null),
+    // the picker's own choice, and the last connection made: what a restart restores
+    selectedServerId: store.get('selectedServerId', null),
+    lastServerId: store.get('lastServerId', null),
     chain: store.get('chain', []),
     chains: getChains(),
     pool: getPool(),
@@ -2282,7 +2812,9 @@ function registerIpc() {
     usage: usage ? usage.totals : {},
     // set when the saved data was unreadable at startup (the window did not
     // exist yet, so the store-error event could not have been delivered)
-    storeError: store.loadError
+    storeError: store.loadError,
+    // the connection as it IS: a renderer reload while connected starts connected
+    conn: connSnapshot()
   }));
 
   ipcMain.handle('servers:import', (e, text) => {
@@ -2317,6 +2849,30 @@ function registerIpc() {
     return { server, servers: existing };
   });
 
+  // a server made in the editor from scratch (parser.createServer); what it lacks, said
+  ipcMain.handle('servers:create', (e, fields) => {
+    let server;
+    try { server = createServer(fields || {}); } catch (err) { return { ok: false, error: err.message }; }
+    const existing = store.get('servers', []);
+    existing.push(server);
+    setServers(existing);
+    return { ok: true, server, servers: existing };
+  });
+
+  // + WARP (warp.js): a WARP device registered — straight out, or through the
+  // live connection's own SOCKS port — or imported, and one MASQUE server per
+  // HTTP version made by createServer and saved like servers:create. One
+  // sign-up at a time; the reason a refusal has comes back as a code.
+  const addWarp = warpHandler({
+    createServer,
+    connected: () => conn.state === 'connected',
+    socksPort: () => (appliedSettings || getSettings()).socksPort,
+    getServers: () => store.get('servers', []),
+    setServers,
+    log: (line, level) => send('log', { line, level: level || 'info' })
+  });
+  ipcMain.handle('servers:addWarp', (e, args) => addWarp(args || {}));
+
   // Read a WireGuard .conf the user picks, and parse .conf text into form fields.
   ipcMain.handle('wg:pickConf', async () => {
     const res = await dialog.showOpenDialog(mainWindow, {
@@ -2337,9 +2893,16 @@ function registerIpc() {
     const servers = store.get('servers', []);
     const idx = servers.findIndex(s => s.id === id);
     if (idx === -1) return { ok: false, error: 'not found', servers };
-    servers[idx] = applyServerEdits(servers[idx], fields || {});
+    const before = servers[idx];
+    // An edit can be refused — a JSON config that does not parse, or has no
+    // proxy outbound left: the reason goes back, the record stays as it was.
+    try { servers[idx] = applyServerEdits(before, fields || {}); } catch (err) { return { ok: false, error: err.message, servers }; }
     setServers(servers);
-    return { ok: true, server: servers[idx], servers };
+    // an edit of a server the live connection dials waits for a reconnect (see liveServerIds)
+    // — one that changes what is dialled: a rename, or a Save with nothing changed, is none
+    const live = !!appliedSettings && liveServerIds.has(id) && dialChanged(before, servers[idx]);
+    if (live) serverEditPending = true;
+    return { ok: true, server: servers[idx], servers, live, pendingReconnect: pendingKeys() };
   });
 
   ipcMain.handle('chain:get', () => store.get('chain', []));
@@ -2361,6 +2924,10 @@ function registerIpc() {
     return valid;
   });
 
+  // Routing profiles (routingProfiles.js): several saved advanced routings
+  ipcMain.handle('routing:profiles', () => ({ profiles: getRoutingProfiles() }));
+  ipcMain.handle('routing:setProfiles', (e, profiles) => setRoutingProfiles(profiles));
+
   // Proxy pool (multi-config): each enabled entry becomes its own local
   // SOCKS/HTTP port routed to its own exit.
   ipcMain.handle('pool:list', () => getPool());
@@ -2380,6 +2947,27 @@ function registerIpc() {
     store.set('pool', valid);
     return valid;
   });
+
+  // Routing share links (routeShare.js): a profile or a chain with every server
+  // and chain it needs, as one irnetfree://routing/ text — copy, preview, import.
+  // The same handlers the router's service has.
+  const routeShare = createRouteShareApi({
+    store,
+    getSettings,
+    getChains,
+    linkOf: buildShareLink,
+    parseMany,
+    identityOf: (s) => serverIdentity(s, true),
+    afterWrite: () => refreshTray(),
+    // an import only adds; it raises the reconnect state when it moves what the live selection connects
+    liveSelection: () => (appliedSettings ? store.get('activeServerId', null) : null),
+    markLive: () => { serverEditPending = true; },
+    pendingKeys
+  });
+  ipcMain.handle('routing:shareProfile', (e, arg) => routeShare.shareProfile(arg));
+  ipcMain.handle('routing:shareChain', (e, arg) => routeShare.shareChain(arg));
+  ipcMain.handle('routing:importPreview', (e, arg) => routeShare.importPreview(arg));
+  ipcMain.handle('routing:import', (e, arg) => routeShare.importShare(arg));
 
   // Relaunch the app elevated (Windows) so TUN mode can configure routes.
   ipcMain.handle('app:relaunchAdmin', async () => {
@@ -2425,6 +3013,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('servers:list', () => store.get('servers', []));
+  ipcMain.handle('selection:set', (e, id) => setSelection(id));
   // Serialize a server (with ALL its settings) back into a shareable link.
   ipcMain.handle('servers:link', (e, id) => {
     const s = store.get('servers', []).find(x => x.id === id);
@@ -2467,6 +3056,12 @@ function registerIpc() {
     const prev = getSettings();
     const next = Object.assign({}, prev, partial);
     store.set('settings', next);
+    // the advanced-routing keys are profile rp-default's mirror (routingProfiles.js)
+    if (['routeRules', 'routeDefault', 'advancedUseMode'].some(k => k in partial)) {
+      const profiles = getRoutingProfiles();
+      const synced = mirrorFromSettings(profiles, next);
+      if (synced !== profiles) store.set('routingProfiles', synced);
+    }
     // react to auto-update changes live
     if ('autoUpdateSubs' in partial || 'autoUpdateInterval' in partial) {
       if (next.autoUpdateSubs) subs.startAuto(next.autoUpdateInterval);
@@ -2509,6 +3104,13 @@ function registerIpc() {
   ipcMain.handle('settings:apply', () => reapplyConnection());
 
   // Resolve a ping/test target: a single server OR a named chain's entry hop.
+  // What latencyTest needs to know about this machine: a server that runs on
+  // sing-box is measured on it, when it is installed.
+  function latencyOpts() {
+    const s = getSettings();
+    return { defaultEngine: s.defaultEngine, hasSingbox: !!xray.resolveBin('sing-box'), dnsRemote: s.dnsRemote };
+  }
+
   function resolveTarget(id) {
     const servers = store.get('servers', []);
     const server = servers.find(s => s.id === id);
@@ -2527,6 +3129,7 @@ function registerIpc() {
   ipcMain.handle('ping:tcp', async (e, id) => {
     const { server } = resolveTarget(id);
     if (!server) return { ok: false, error: 'not found' };
+    if (udpOnly(server)) return { ok: false, na: true, error: 'UDP only — no TCP port to ping' };
     return tcpPing(server.address, server.port);
   });
 
@@ -2539,9 +3142,8 @@ function registerIpc() {
     let test;
     try {
       const port = await getFreePort();
-      const cfg = buildTestConfig(chain && chain.length >= 2 ? chain : server, port);
-      const plan = chain && chain.length >= 2 ? { mode: 'chain', chain } : { mode: 'single', server };
-      test = await xray.startTest(cfg, testEngineFor(chooseEngine(plan, getSettings().defaultEngine)));
+      const t = latencyTest(chain && chain.length >= 2 ? chain : server, port, latencyOpts());
+      test = await xray.startTest(t.config, t.engine);
       const result = await httpThroughProxy(port, { host: 'cp.cloudflare.com', port: 80, path: '/' });
       return result;
     } catch (err) {
@@ -2560,9 +3162,8 @@ function registerIpc() {
     let test;
     try {
       const port = await getFreePort();
-      const cfg = buildTestConfig(chain && chain.length >= 2 ? chain : server, port);
-      const plan = chain && chain.length >= 2 ? { mode: 'chain', chain } : { mode: 'single', server };
-      test = await xray.startTest(cfg, testEngineFor(chooseEngine(plan, getSettings().defaultEngine)));
+      const t = latencyTest(chain && chain.length >= 2 ? chain : server, port, latencyOpts());
+      test = await xray.startTest(t.config, t.engine);
       return await uploadThroughProxy(port, {});
     } catch (err) {
       return { ok: false, error: err.message };
@@ -2581,16 +3182,29 @@ function registerIpc() {
     const list = [...new Set((Array.isArray(ids) ? ids : []).filter(Boolean))];
     if (!xray.binExists()) { for (const id of list) out[id] = { ok: false, error: 'xray binary missing' }; return out; }
     const byEngine = new Map();
+    const alone = [];   // measured on a core of their own (latencyTest: sing-box)
+    const opts = latencyOpts();
     for (const id of list) {
       const { server, chain } = resolveTarget(id);
       if (!server) { out[id] = { ok: false, error: 'not found' }; continue; }
       const isChain = chain && chain.length >= 2;
       const plan = isChain ? { mode: 'chain', chain } : { mode: 'single', server };
+      if (!isChain && testsAlone(server, opts)) { alone.push({ id, target: server }); continue; }
       const eng = testEngineFor(chooseEngine(plan, getSettings().defaultEngine));
       if (!byEngine.has(eng)) byEngine.set(eng, []);
       byEngine.get(eng).push({ id, target: isChain ? chain : server });
     }
     const limit = pLimit(REAL_PARALLEL);
+    await Promise.all(alone.map(a => limit(async () => {
+      let test = null;
+      try {
+        const port = await getFreePort();
+        const t = latencyTest(a.target, port, opts);
+        test = await xray.startTest(t.config, t.engine);
+        out[a.id] = await httpThroughProxy(port, { host: 'cp.cloudflare.com', port: 80, path: '/' });
+      } catch (err) { out[a.id] = { ok: false, error: err.message }; }
+      finally { if (test) test.cleanup(); }
+    })));
     for (const [eng, targets] of byEngine) {
       for (let i = 0; i < targets.length; i += REAL_BATCH) {
         const batch = targets.slice(i, i + REAL_BATCH);
@@ -2637,26 +3251,38 @@ function registerIpc() {
     else send('log', { line: 'Refused to open a link that is not http(s): ' + String(url).slice(0, 100), level: 'warn' });
   });
   ipcMain.handle('open:dataDir', () => { shell.openPath(dataDir()); return dataDir(); });
+  // Windows: which copy the logon task starts (a read), and the banner's fix (the owner's click)
+  ipcMain.handle('autostart:check', () => autostartCheck());
+  ipcMain.handle('autostart:repoint', () => autostartRepoint());
 
   // runtime components (xray / tun2socks / wintun / geo files)
   ipcMain.handle('assets:status', () => assetStatus());
   ipcMain.handle('assets:download', async (e, component) => {
     try {
       const res = await downloader.download(component);
-      // refresh stats binary + xray path in case a core was (re)installed.
-      // binPath caches ONLY the official core — and holds the path the user
-      // picked with "Locate xray…" — so downloading the fork must not clear it.
-      if (component === 'xray' || component === 'xray-pattn') {
-        if (component === 'xray') xray.binPath = null;
-        xray.forgetVersions();
-        stats.setBin(xray.anyBin());
-      }
+      // refresh the stats binary, the cached versions and the xray path in case
+      // a core was (re)installed — sing-box too: its version is shown beside it
+      if (CORE_IDS.includes(component)) afterCoreChanged(component);
       return { ok: true, files: res.files, assets: assetStatus(), tunAvailable: makeTun(getSettings(), { quiet: true }).isAvailable(), xrayReady: xray.binExists() };
     } catch (err) {
       send('log', { line: 'Download failed (' + component + '): ' + err.message, level: 'error' });
-      return { ok: false, error: err.message, assets: assetStatus() };
+      // coreBusy: a version install holds this core (Downloader.holdCore) — the page words it
+      return { ok: false, error: err.message, coreBusy: err.code === 'ECOREBUSY', assets: assetStatus() };
     }
   });
+
+  // the version picker (Required files → Choose version): a core's releases, and
+  // one installed by its tag — the same handlers the router's service has
+  const coreVersions = createCoreVersionsApi({
+    downloader,
+    installedVersion: (id) => xray.version(id),
+    busy: coreChangeBlocked,
+    afterInstall: afterCoreChanged,
+    result: () => ({ assets: assetStatus(), tunAvailable: makeTun(getSettings(), { quiet: true }).isAvailable(), xrayReady: xray.binExists() }),
+    onLog: (line, level) => send('log', { line, level })
+  });
+  ipcMain.handle('cores:versions', (e, arg) => coreVersions.versions(arg));
+  ipcMain.handle('cores:install', (e, arg) => coreVersions.install(arg));
 
   ipcMain.handle('xray:locate', async () => {
     const res = await dialog.showOpenDialog(mainWindow, {
@@ -2786,7 +3412,7 @@ function registerIpc() {
   // Backup: everything the user has, as one JSON string the renderer saves.
   ipcMain.handle('backup:export', () => JSON.stringify(exportBundle({
     version: app.getVersion(),
-    store: { servers: store.get('servers', []), subscriptions: store.get('subscriptions', []), chains: getChains(), pool: getPool(), settings: getSettings() },
+    store: { servers: store.get('servers', []), subscriptions: store.get('subscriptions', []), chains: getChains(), pool: getPool(), routingProfiles: getRoutingProfiles(), settings: getSettings() },
     usage: usage ? usage.totals : {}
   }), null, 2));
   // Restore: a merge by id (backup.js) — nothing on this machine is lost, and
@@ -2798,13 +3424,13 @@ function registerIpc() {
     try {
       r = importBundle(bundle, {
         servers: store.get('servers', []), subscriptions: store.get('subscriptions', []),
-        chains: getChains(), pool: getPool(), settings: getSettings(), usage: usage ? usage.totals : {}
+        chains: getChains(), pool: getPool(), routingProfiles: getRoutingProfiles(), settings: getSettings(), usage: usage ? usage.totals : {}
       });
     } catch (err) { return { ok: false, error: err.message }; }
-    store.assign({ servers: r.next.servers.map(migrateStoredServer), subscriptions: r.next.subscriptions, chains: r.next.chains, pool: r.next.pool, settings: r.next.settings });
+    store.assign({ servers: r.next.servers.map(migrateStoredServer), subscriptions: r.next.subscriptions, chains: r.next.chains, pool: r.next.pool, routingProfiles: r.next.routingProfiles, settings: r.next.settings });
     if (usage) { usage.totals = r.next.usage; usage.dirty = true; usageStore.set('totals', usage.totals); usage.markSaved(); }
     refreshTray();
-    send('log', { line: `Backup restored: ${r.added.servers} servers, ${r.added.subscriptions} subscriptions, ${r.added.chains} chains, ${r.added.pool} pool entries added`, level: 'info' });
+    send('log', { line: `Backup restored: ${r.added.servers} servers, ${r.added.subscriptions} subscriptions, ${r.added.chains} chains, ${r.added.pool} pool entries, ${r.added.routingProfiles} routing profiles added`, level: 'info' });
     return { ok: true, added: r.added };
   });
 
@@ -2831,11 +3457,9 @@ function registerIpc() {
     }
   });
   // The way out when a reconnect has been given up on and the guard is still
-  // holding: puts the adapters' own resolvers back, deliberately, on request.
-  ipcMain.handle('guard:release', async () => {
-    try { if (leakGuard) await leakGuard.release(); return { ok: true }; }
-    catch (e) { return { ok: false, error: e.message }; }
-  });
+  // holding: puts the adapters' own resolvers back, deliberately, on request —
+  // never under a live tunnel (releaseGuardOnRequest).
+  ipcMain.handle('guard:release', () => releaseGuardOnRequest());
 
   // Delete the files the app downloaded into the writable bin (userData/bin).
   // Does NOT touch a user-located xray (store.xrayPath) or the bundled bin.
@@ -2867,7 +3491,7 @@ function registerIpc() {
     addServer: (server) => { const existing = store.get('servers', []); existing.push(server); setServers(existing); return server; },
     resolveTarget,
     log: (line, level = 'info') => send('log', { line, level }),
-    latestVersion: (id, channel) => downloader.latestVersion(id, channel),
+    latestVersion: (id) => downloader.latestVersion(id),   // plus: what a download of the core installs
     platform: process.platform, isElectron: true
   };
   xserver = createXServer(plusCtx); xserver.register();
@@ -2946,6 +3570,7 @@ app.whenReady().then(() => {
 
   migrateServers();
   migrateSettingsStore();
+  getRoutingProfiles();   // today's advanced routing becomes profile rp-default, once
   // A new process has no live connection. An activeServerId still in the store
   // is what a crash or a kill left: the tray marked it "●", and a network change
   // at launch would "recover" a connection nobody asked for. Connect-on-launch
@@ -3018,7 +3643,6 @@ app.whenReady().then(() => {
   });
 
   downloader = new Downloader({
-    channel: () => getSettings().coreChannel || 'stable',   // plus: the release channel the cores follow
     destDir: ubin,
     onLog: (line, level) => send('log', { line, level }),
     onProgress: (component, pct) => send('asset-progress', { component, pct })

@@ -24,6 +24,109 @@ jobs:
       # No `npm ci` on purpose — the tests use only Node core modules.
       - run: npm test
 
+  cores:
+    # The only place a core is handed what this app writes: every config shape
+    # (plans, DNS modes, TUN, the v1.18 link forms) through `xray run -test` on
+    # the suggested Xray and Xray-PattN, the TUN configs through `sing-box check`.
+    # The versions come from src/main/coreVersions.js, so a bump is checked here.
+    name: cores accept the configs (suggested versions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Fetch the suggested cores
+        run: |
+          set -euo pipefail
+          XV=$(node -p "require('./src/main/coreVersions').SUGGESTED.xray")
+          PV=$(node -p "require('./src/main/coreVersions').SUGGESTED['xray-pattn']")
+          SV=$(node -p "require('./src/main/coreVersions').SUGGESTED['sing-box']")
+          echo "xray $XV · xray-pattn $PV · sing-box $SV"
+          mkdir -p "$RUNNER_TEMP/x" "$RUNNER_TEMP/p" "$RUNNER_TEMP/s"
+          curl -fsSL --retry 3 -o x.zip "https://github.com/XTLS/Xray-core/releases/download/v$XV/Xray-linux-64.zip"
+          unzip -q x.zip -d "$RUNNER_TEMP/x"
+          curl -fsSL --retry 3 -o p.zip "https://github.com/patterniha/Xray-core/releases/download/v$PV/Xray-linux-64.zip"
+          unzip -q p.zip -d "$RUNNER_TEMP/p"
+          curl -fsSL --retry 3 -o s.tgz "https://github.com/SagerNet/sing-box/releases/download/v$SV/sing-box-$SV-linux-amd64.tar.gz"
+          tar -xzf s.tgz -C "$RUNNER_TEMP/s" --strip-components=1
+          chmod +x "$RUNNER_TEMP/x/xray" "$RUNNER_TEMP/p/xray" "$RUNNER_TEMP/s/sing-box"
+      - name: Xray (suggested) accepts every config, sing-box every TUN config
+        run: IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" node scripts/validate-configs.js
+      - name: Xray-PattN (suggested) accepts every config
+        # also when the official core refused something: one run says it for both
+        if: ${{ !cancelled() }}
+        run: IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" node scripts/validate-configs.js
+      - name: A WireGuard base that is also the exit is one session (a real peer, loopback)
+        # scripts/probe-wg-base.js: a WireGuard base, then a chain ending in one, with
+        # "exit at the base" and a target through it — both lines must answer every
+        # time. The client is the suggested Xray, the peer the suggested sing-box. The
+        # two hops stand for remote servers and run Xray 26.3.27: with the hops on
+        # 26.9.30 nothing passes through them in this harness, whatever the client.
+        # Then the same with Xray-PattN as the client: 26.9.22 could not bring up a
+        # WireGuard whose endpoint is an IP (XTLS/Xray-core#6803, fixed by #6804 from
+        # the fork's 26.9.24), and the app writes endpoints as IPs — so it gates too.
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/h"
+          curl -fsSL --retry 3 -o h.zip "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip"
+          unzip -q h.zip -d "$RUNNER_TEMP/h" && chmod +x "$RUNNER_TEMP/h/xray"
+          IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" IRNF_HOP_EXE="$RUNNER_TEMP/h/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" node scripts/probe-wg-base.js
+          IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" IRNF_HOP_EXE="$RUNNER_TEMP/h/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" IRNF_PROBE_PORT=39900 IRNF_PROBE_ROUNDS=3 node scripts/probe-wg-base.js
+      - name: MASQUE carries TCP and UDP over HTTP/3 and HTTP/2 (a real server, loopback)
+        # scripts/probe-masque.js: a MASQUE server (Xray's masque inbound, IETF
+        # CONNECT-IP, RFC 9484) and a client through it, both the core under test,
+        # with a certificate that core made and the client pins. HTTP/3 and HTTP/2
+        # against one server port: a page every round, the same over IPv6, 2 MB in
+        # one piece, UDP echoed through SOCKS5 UDP ASSOCIATE — and a wrong password
+        # gets nothing on either. The app does not write MASQUE yet (the client
+        # config is written by hand); this is the proof the suggested cores carry
+        # the tunnel before it does. Then the same on Xray-PattN; both always run.
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        run: |
+          rc=0
+          IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" node scripts/probe-masque.js || rc=1
+          IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" IRNF_PROBE_PORT=40000 node scripts/probe-masque.js || rc=1
+          exit $rc
+
+  tun-dns:
+    # The real TUN, which `sing-box check` cannot speak for: does a name asked
+    # through the app's sing-box TUN reach Xray (the managed DNS, a WireGuard's
+    # private names) — or does sing-box answer it itself and send it past the
+    # tunnel, as 1.14's default dns_mode "hijack" does? In a network namespace of
+    # its own (the runner's network is not touched), with the app's own configs
+    # (scripts/tun-dns-probe.js). Both lines the app runs: the last 1.13 and the
+    # 1.14 GitHub calls latest. On 1.14 a control run without dns_mode must show
+    # the bug, or the probe could not see it.
+    name: real TUN DNS (sing-box ${{ matrix.singbox }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        singbox: ['1.13.14', '1.14.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Fetch Xray (suggested) and sing-box ${{ matrix.singbox }}
+        run: |
+          set -euo pipefail
+          XV=$(node -p "require('./src/main/coreVersions').SUGGESTED.xray")
+          SV='${{ matrix.singbox }}'
+          echo "xray $XV · sing-box $SV"
+          mkdir -p "$RUNNER_TEMP/x" "$RUNNER_TEMP/s"
+          curl -fsSL --retry 3 -o x.zip "https://github.com/XTLS/Xray-core/releases/download/v$XV/Xray-linux-64.zip"
+          unzip -q x.zip -d "$RUNNER_TEMP/x"
+          curl -fsSL --retry 3 -o s.tgz "https://github.com/SagerNet/sing-box/releases/download/v$SV/sing-box-$SV-linux-amd64.tar.gz"
+          tar -xzf s.tgz -C "$RUNNER_TEMP/s" --strip-components=1
+          chmod +x "$RUNNER_TEMP/x/xray" "$RUNNER_TEMP/s/sing-box"
+      - name: A name asked through the TUN reaches Xray and never the ISP resolver
+        run: sudo IRNF_TUN_PROBE=1 IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" "$(command -v node)" scripts/tun-dns-probe.js
+
   android:
     # The Android app is a hand-written port of src/main/parser.js and
     # configBuilder.js, and nobody working on it can compile Kotlin locally

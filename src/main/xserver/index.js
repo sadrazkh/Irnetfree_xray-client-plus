@@ -144,17 +144,20 @@ function createXServer(ctx, deps = {}) {
       return Object.assign(applied, { link: r.link || null, status: core.status() });
     },
 
-    /** The core the server runs on: what is installed, which channel, and — when asked — what GitHub has. */
+    /**
+     * The core the server runs on: what is installed and — when asked — the
+     * version a download installs (GitHub's latest stable, or the app's suggested
+     * one when newer). Any other version is the core picker's (upstream's
+     * Settings → Required files), which the tab opens.
+     */
     'xserver:coreInfo': async (arg) => {
       const a = arg && typeof arg === 'object' ? arg : {};
       const engine = getModel().engine;
-      const channel = (ctx.getSettings && ctx.getSettings().coreChannel) || 'stable';
       let version = '';
       try { version = await ctx.xray.version(engine); } catch { /* not installed */ }
-      const info = { engine, version: version || '', channel, installed: !!ctx.xray.binExists(engine), latestStable: null, latestAny: null };
+      const info = { engine, version: version || '', installed: !!ctx.xray.binExists(engine), latest: null };
       if (a.online && typeof ctx.latestVersion === 'function') {
-        try { info.latestStable = await ctx.latestVersion(engine, 'stable'); } catch { /* offline */ }
-        try { info.latestAny = await ctx.latestVersion(engine, 'latest'); } catch { /* offline */ }
+        try { info.latest = (await ctx.latestVersion(engine)) || null; } catch { /* offline */ }
       }
       return info;
     },

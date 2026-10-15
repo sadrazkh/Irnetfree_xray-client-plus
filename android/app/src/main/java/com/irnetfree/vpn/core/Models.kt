@@ -36,8 +36,28 @@ data class ServerConfig(
     // field names, accumulated over every save). A subscription refresh keeps
     // these and nothing else of the old record's connection (SubRefresh.carry):
     // what the user did is recorded when they do it, never inferred afterwards.
-    val edited: List<String> = emptyList()
+    val edited: List<String> = emptyList(),
+    // A server imported from a whole Xray JSON config (JsonImport.kt): source
+    // "json", the config itself, the helper outbounds its main outbound dials
+    // through (with their original tags), and how it runs — "full" inside the
+    // app (the default) or "raw", exactly as written. `outbound` is still the
+    // main outbound, so ping, chains, routing and mux see an ordinary server.
+    // `jsonInfo` is derived from `json` on import and on every save.
+    val source: String = "",
+    val json: JSONObject? = null,
+    val extraOutbounds: List<JSONObject> = emptyList(),
+    val jsonMode: String = JsonImport.MODE_FULL,
+    val jsonInfo: JsonInfo? = null,
+    // Mux for this server (the editor's Advanced tab, the desktop's `mux`):
+    // "" the app's setting, "on" muxed untested (when eligible), "off" never;
+    // its own concurrency numbers over Mux.MUX's. Never in a link.
+    val mux: String = "",
+    val muxConcurrency: Int? = null,
+    val xudpConcurrency: Int? = null
 ) {
+    /** Imported from an Xray JSON config, with the config at hand. */
+    val isJson: Boolean get() = source == JsonImport.SOURCE && json != null
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id); put("name", name); put("protocol", protocol)
         put("address", address); put("port", port); put("outbound", outbound)
@@ -47,6 +67,17 @@ data class ServerConfig(
         if (dnsDomains.isNotEmpty()) put("dnsDomains", JSONArray(dnsDomains))
         if (certPin.isNotEmpty()) { put("certPin", certPin); put("certPinAt", certPinAt); put("certPinCheckedAt", certPinCheckedAt) }
         if (edited.isNotEmpty()) put("edited", JSONArray(edited))
+        if (mux.isNotEmpty()) put("mux", mux)
+        muxConcurrency?.let { n: Int -> put("muxConcurrency", n) }
+        xudpConcurrency?.let { n: Int -> put("xudpConcurrency", n) }
+        if (source.isNotEmpty()) put("source", source)
+        val cfg = json
+        if (cfg != null) {
+            put("json", cfg)
+            put("extraOutbounds", JSONArray().apply { extraOutbounds.forEach { o: JSONObject -> put(o) } })
+            put("jsonMode", jsonMode)
+            jsonInfo?.let { info: JsonInfo -> put("jsonInfo", info.toJson()) }
+        }
     }
 
     companion object {
@@ -75,12 +106,53 @@ data class ServerConfig(
                 certPin = CertPin.normalizePin(o.optString("certPin")),
                 certPinAt = o.optString("certPinAt"),
                 certPinCheckedAt = o.optLong("certPinCheckedAt", 0),
-                edited = strList(o.optJSONArray("edited"))
+                edited = strList(o.optJSONArray("edited")),
+                source = o.optString("source", ""),
+                json = o.optJSONObject("json"),
+                extraOutbounds = objList(o.optJSONArray("extraOutbounds")),
+                jsonMode = JsonImport.modeOf(o.optString("jsonMode", JsonImport.MODE_FULL)),
+                // derived: re-read from the config when an older record lacks it
+                jsonInfo = JsonInfo.fromJson(o.optJSONObject("jsonInfo")) ?: o.optJSONObject("json")?.let { c: JSONObject -> JsonImport.jsonInfo(c) },
+                mux = o.optString("mux", "").let { v: String -> if (v == "on" || v == "off") v else "" },
+                muxConcurrency = if (o.has("muxConcurrency")) o.optInt("muxConcurrency").takeIf { n: Int -> n > 0 } else null,
+                xudpConcurrency = if (o.has("xudpConcurrency")) o.optInt("xudpConcurrency").takeIf { n: Int -> n > 0 } else null
             )
         }
 
+        fun objList(a: JSONArray?): List<JSONObject> =
+            if (a == null) emptyList() else (0 until a.length()).mapNotNull { i: Int -> a.optJSONObject(i) }
+
         fun strList(a: JSONArray?): List<String> =
             if (a == null) emptyList() else (0 until a.length()).mapNotNull { a.opt(it) as? String }.map { it.trim() }.filter { it.isNotEmpty() }
+    }
+}
+
+/** One routing rule of a JSON config, in words: what it matches → where it sends it. */
+data class JsonRule(val match: String, val to: String)
+
+/**
+ * What a JSON server's own config holds that full mode does not use — its
+ * routing rules, its DNS, its balancers, its observatory (JsonImport.jsonInfo,
+ * the desktop's jsonInfo). The edit sheet lists it; nothing else reads it.
+ */
+data class JsonInfo(
+    val rules: List<JsonRule> = emptyList(),
+    val dns: Boolean = false,
+    val balancers: Int = 0,
+    val observatory: Boolean = false
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("rules", JSONArray().apply { rules.forEach { r: JsonRule -> put(JSONObject().put("match", r.match).put("to", r.to)) } })
+        .put("dns", dns).put("balancers", balancers).put("observatory", observatory)
+
+    companion object {
+        fun fromJson(o: JSONObject?): JsonInfo? {
+            if (o == null) return null
+            val a = o.optJSONArray("rules") ?: JSONArray()
+            val rules = (0 until a.length()).mapNotNull { i: Int -> a.optJSONObject(i) }
+                .map { r: JSONObject -> JsonRule(r.optString("match"), r.optString("to")) }
+            return JsonInfo(rules, o.optBoolean("dns"), o.optInt("balancers"), o.optBoolean("observatory"))
+        }
     }
 }
 
@@ -148,11 +220,62 @@ data class Subscription(
     }
 }
 
-/** One advanced-routing rule: match a kind/value and send it to a target. */
-data class RouteRule(val type: String, val value: String, val target: String) {
-    fun toJson(): JSONObject = JSONObject().apply { put("type", type); put("value", value); put("target", target) }
+/**
+ * One advanced-routing rule: match a kind/value and send it to a target.
+ * `via` (RoutingProfiles): "" or "inherit" = the profile's base, if it has
+ * one; "none" = dial the target directly; a server id or `chain:<id>` = ride
+ * on that base. Written only when set, so a rule without one stores as before.
+ */
+data class RouteRule(val type: String, val value: String, val target: String, val via: String = "") {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("type", type); put("value", value); put("target", target)
+        if (via.isNotEmpty()) put("via", via)
+    }
     companion object {
-        fun fromJson(o: JSONObject) = RouteRule(o.optString("type", "domain"), o.optString("value"), o.optString("target", "proxy"))
+        fun fromJson(o: JSONObject) = RouteRule(
+            o.optString("type", "domain"), o.optString("value"), o.optString("target", "proxy"),
+            // isNull first: Android's org.json hands back "null" for a JSON null
+            if (o.isNull("via")) "" else o.optString("via", "")
+        )
+    }
+}
+
+/**
+ * One saved advanced routing (RoutingProfiles.kt, the desktop's
+ * routingProfiles.js): its rules, the default for everything else, the
+ * default's via, whether the simple routing mode applies under the rules, and
+ * an optional base every target inherits ("via a base"). `base` is a server id
+ * or `chain:<id>`, null = none.
+ */
+data class RoutingProfile(
+    val id: String,
+    val name: String,
+    val rules: List<RouteRule> = emptyList(),
+    val def: String = "",
+    val defVia: String = RoutingProfiles.VIA_INHERIT,
+    val useMode: Boolean = false,
+    val base: String? = null
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id); put("name", name)
+        put("rules", JSONArray().apply { rules.forEach { r: RouteRule -> put(r.toJson()) } })
+        put("def", def); put("defVia", defVia); put("useMode", useMode)
+        put("base", base ?: JSONObject.NULL)
+    }
+    companion object {
+        fun fromJson(o: JSONObject): RoutingProfile {
+            val a = o.optJSONArray("rules") ?: JSONArray()
+            val rules = (0 until a.length()).mapNotNull { i: Int -> a.optJSONObject(i) }.map { r: JSONObject -> RouteRule.fromJson(r) }
+            return RoutingProfiles.normalize(RoutingProfile(
+                id = if (o.isNull("id")) "" else o.optString("id"),
+                name = if (o.isNull("name")) "" else o.optString("name"),
+                rules = rules,
+                def = if (o.isNull("def")) "" else o.optString("def"),
+                defVia = if (o.isNull("defVia")) RoutingProfiles.VIA_INHERIT else o.optString("defVia"),
+                useMode = o.optBoolean("useMode", false),
+                base = if (o.isNull("base")) null else o.optString("base")
+            ))
+        }
     }
 }
 
@@ -277,6 +400,120 @@ data class AppSettings(
     }
 }
 
+/**
+ * LAN sharing: while connected, the other devices on the phone's Wi-Fi or on
+ * its hotspot use the phone as a proxy — a SOCKS5 and an HTTP inbound of their
+ * own, on every interface, routed exactly like the tunnel's traffic (the same
+ * rules, the same DNS plan) on whichever core runs (ConfigBuilder,
+ * SingboxConfig). The tunnel's own socks-in/http-in stay on 127.0.0.1 with
+ * their per-session credentials (LocalAuth.kt); these are separate inbounds.
+ *
+ * Off by default. Password on by default, with a generated username and
+ * password the user can read, copy and change; off, anyone on the network can
+ * use the connection. Stored under a key of its own (LanShareStore), not inside
+ * AppSettings: the Settings screen writes AppSettings back whole from the copy
+ * it opened with, and a change made in this section meanwhile was lost with it.
+ */
+data class LanShare(
+    val enabled: Boolean = false,
+    val socksPort: Int = DEFAULT_SOCKS,
+    val httpPort: Int = DEFAULT_HTTP,
+    val auth: Boolean = true,
+    val user: String = "",
+    val pass: String = ""
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("enabled", enabled); put("socksPort", socksPort); put("httpPort", httpPort)
+        put("auth", auth); put("user", user); put("pass", pass)
+    }
+
+    /**
+     * Why this share cannot open beside [s]'s own inbounds and the pool's, in
+     * words for the user; null = it can. Checked by the Settings section as it
+     * is typed and again at connect, where a share that no longer fits (the
+     * tunnel's port was changed onto it since) is left out of that connection.
+     */
+    fun problem(s: AppSettings, pool: List<PoolEntry>): String? {
+        for ((name, p) in listOf("SOCKS" to socksPort, "HTTP" to httpPort)) {
+            if (p < MIN_PORT || p > MAX_PORT) return "The LAN $name port must be between $MIN_PORT and $MAX_PORT"
+        }
+        if (socksPort == httpPort) return "The LAN SOCKS and HTTP ports must differ"
+        for (p in listOf(socksPort, httpPort)) {
+            if (p == s.socksPort) return "Port $p is the tunnel's own SOCKS port"
+            if (p == s.httpPort) return "Port $p is the tunnel's own HTTP port"
+            if (p == s.apiPort) return "Port $p is reserved for the core's API port"
+            val e = pool.firstOrNull { it.socksPort == p || it.httpPort == p }
+            if (e != null) return "Port $p belongs to the proxy pool (${e.name})"
+        }
+        if (auth) credentialProblem(user, pass)?.let { m -> return m }
+        return null
+    }
+
+    /** Blank credentials filled in with generated ones; set ones are kept. */
+    fun withCredentials(): LanShare =
+        if (user.isNotEmpty() && pass.isNotEmpty()) this
+        else copy(user = user.ifEmpty { newUser() }, pass = pass.ifEmpty { newPass() })
+
+    companion object {
+        const val DEFAULT_SOCKS = 10810
+        const val DEFAULT_HTTP = 10811
+        const val MIN_PORT = 1024
+        const val MAX_PORT = 65535
+        /** The inbound tags, in both config formats: TunnelSetup.withoutLan finds them by these. */
+        const val SOCKS_TAG = "lan-socks"
+        const val HTTP_TAG = "lan-http"
+        /** Every interface: the phone's Wi-Fi address and its hotspot's alike. */
+        const val LISTEN = "0.0.0.0"
+
+        // No 0/O, 1/l/i: these get typed on a TV or a laptop by hand.
+        private const val ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+        private val rng = java.security.SecureRandom()
+        private fun pick(n: Int): String = buildString { repeat(n) { append(ALPHABET[rng.nextInt(ALPHABET.length)]) } }
+        fun newUser(): String = "irnf-" + pick(4)
+        fun newPass(): String = pick(12)
+
+        fun fromJson(o: JSONObject): LanShare = LanShare(
+            enabled = o.optBoolean("enabled", false),
+            socksPort = o.optInt("socksPort", DEFAULT_SOCKS),
+            httpPort = o.optInt("httpPort", DEFAULT_HTTP),
+            auth = o.optBoolean("auth", true),
+            user = o.optString("user", ""),
+            pass = o.optString("pass", "")
+        )
+
+        /**
+         * Printable ASCII only (no spaces): SOCKS5 sends them as bytes, and a
+         * person types them on another device. The username carries no ":" —
+         * HTTP's Basic auth splits the pair on the first one.
+         */
+        fun credentialProblem(user: String, pass: String): String? {
+            fun bad(v: String) = v.any { c -> c.code < 33 || c.code > 126 }
+            return when {
+                user.isEmpty() -> "Enter a username, or turn the password off"
+                pass.isEmpty() -> "Enter a password, or turn the password off"
+                user.length > 64 || pass.length > 64 -> "The username and the password take at most 64 characters each"
+                bad(user) || bad(pass) -> "Letters, digits and plain symbols only — no spaces"
+                user.contains(':') -> "The username cannot contain \":\""
+                else -> null
+            }
+        }
+
+        /**
+         * Do [a] and [b] open the same share — the same ports and, with a
+         * password, the same credentials? Off (or null) on both sides is the
+         * same too. What the running tunnel opened (VpnState.lanShared) against
+         * what Settings holds now: different means "applies on the next connect".
+         */
+        fun same(a: LanShare?, b: LanShare?): Boolean {
+            val x = a?.takeIf { it.enabled }
+            val y = b?.takeIf { it.enabled }
+            if (x == null || y == null) return x == null && y == null
+            return x.socksPort == y.socksPort && x.httpPort == y.httpPort && x.auth == y.auth &&
+                (!x.auth || (x.user == y.user && x.pass == y.pass))
+        }
+    }
+}
+
 /** What to connect through. single / chain / pool / advanced. */
 sealed class ConnectionPlan {
     data class Single(val server: ServerConfig) : ConnectionPlan()
@@ -285,10 +522,40 @@ sealed class ConnectionPlan {
         val entries: List<PoolEntry>, val primary: String,
         val serversById: Map<String, ServerConfig>, val chainsById: Map<String, List<ServerConfig>>
     ) : ConnectionPlan()
+    /**
+     * A routing profile's plan. [defVia] and [base] are the profile's ("via a
+     * base", RoutingProfiles.effectiveVia); without them nothing goes through a
+     * base and the config is the one of before. [useMode] is the profile's
+     * "apply the routing mode under these rules" — null = the settings' own.
+     */
     data class Advanced(
         val rules: List<RouteRule>, val def: String,
-        val serversById: Map<String, ServerConfig>, val chainsById: Map<String, List<ServerConfig>>
+        val serversById: Map<String, ServerConfig>, val chainsById: Map<String, List<ServerConfig>>,
+        val defVia: String = RoutingProfiles.VIA_INHERIT, val base: String? = null,
+        val useMode: Boolean? = null, val profileId: String = ""
     ) : ConnectionPlan()
+
+    /**
+     * The same plan — the same servers, chain, pool or rules — with each
+     * record replaced by [fresh]'s record of that id (one [fresh] no longer
+     * has is kept as it was). How a connect picks up the certificate pins it
+     * has just learnt: rebuilding the plan from the store's CURRENT selection
+     * instead connected whatever had been selected meanwhile, under the label
+     * and notification of the server that was asked for.
+     */
+    fun withRecords(fresh: (String) -> ServerConfig?): ConnectionPlan {
+        fun f(s: ServerConfig): ServerConfig = fresh(s.id) ?: s
+        fun servers(m: Map<String, ServerConfig>): Map<String, ServerConfig> = m.mapValues { e: Map.Entry<String, ServerConfig> -> f(e.value) }
+        fun chains(m: Map<String, List<ServerConfig>>): Map<String, List<ServerConfig>> =
+            m.mapValues { e: Map.Entry<String, List<ServerConfig>> -> e.value.map { s: ServerConfig -> f(s) } }
+        val p: ConnectionPlan = this
+        return when (p) {
+            is Single -> Single(f(p.server))
+            is Chain -> Chain(p.name, p.members.map { s: ServerConfig -> f(s) })
+            is Pool -> p.copy(serversById = servers(p.serversById), chainsById = chains(p.chainsById))
+            is Advanced -> p.copy(serversById = servers(p.serversById), chainsById = chains(p.chainsById))
+        }
+    }
 }
 
 fun newId(prefix: String): String =

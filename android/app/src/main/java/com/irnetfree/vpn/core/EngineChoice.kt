@@ -27,8 +27,9 @@ object EngineChoice {
         is ConnectionPlan.Single -> listOf(plan.server)
         is ConnectionPlan.Chain -> plan.members
         is ConnectionPlan.Pool -> targetsServers(plan.entries.map { it.target }, plan.serversById, plan.chainsById)
+        // the bases a profile's targets ride on are dialled too (spec §2: planServers includes bases)
         is ConnectionPlan.Advanced ->
-            targetsServers(plan.rules.map { it.target } + plan.def, plan.serversById, plan.chainsById)
+            targetsServers(plan.rules.map { it.target } + plan.def + RoutingProfiles.basesOf(plan), plan.serversById, plan.chainsById)
     }
 
     private fun targetsServers(
@@ -45,10 +46,33 @@ object EngineChoice {
         return out
     }
 
+    /**
+     * A Hysteria2 server that asked for "allow insecure" and names no certificate
+     * (engineChoice.js needsInsecureCore): the Xray cores have no way left to
+     * accept an unverified certificate (allowInsecure is gone; CertPin's
+     * trust-on-first-use is a TCP handshake, and Hysteria is QUIC) — sing-box
+     * still has one. A self-signed certificate is how most of them are set up.
+     */
+    fun needsInsecureCore(server: ServerConfig?): Boolean {
+        val st = server?.outbound?.optJSONObject("streamSettings") ?: return false
+        val tls = st.optJSONObject("tlsSettings") ?: return false
+        return st.optString("network") == "hysteria" && tls.optBoolean("allowInsecure") &&
+            tls.optString("pinnedPeerCertSha256").isBlank() && tls.optString("verifyPeerCertByName").isBlank() &&
+            server.certPin.isBlank()
+    }
+
+    /**
+     * A MASQUE server (a JSON one too): only the Xray cores run it — sing-box
+     * has no MASQUE and no WARP at all — whatever the record says (engineChoice.js isMasque).
+     */
+    fun isMasque(server: ServerConfig?): Boolean = Masque.isMasque(server)
+
     /** The core for this plan. `defaultEngine` is the app-wide setting. */
     fun chooseEngine(plan: ConnectionPlan?, defaultEngine: String = XRAY): String {
         val def = if (defaultEngine == PATTN) PATTN else XRAY
-        if (plan is ConnectionPlan.Single) return plan.server.engine?.takeIf { it.isNotBlank() } ?: def
+        if (plan is ConnectionPlan.Single && isMasque(plan.server)) return if (plan.server.engine == PATTN) PATTN else def
+        if (plan is ConnectionPlan.Single) return plan.server.engine?.takeIf { it.isNotBlank() }
+            ?: if (needsInsecureCore(plan.server)) SINGBOX else def
         return if (planServers(plan).any { it.engine == PATTN }) PATTN else def
     }
 

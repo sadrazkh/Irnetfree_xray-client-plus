@@ -142,6 +142,16 @@ test('pinTargets: probe = directly dialled, asked for allowInsecure, no pin yet;
   assert.deepEqual(pinTargets(twice), { probe: [A, B], behind: [C] });
 });
 
+test('a routing profile’s target through a base is reached through it: the base is dialled directly, the target is behind', () => {
+  // profile base `a`; rule → b through it; default c with no via; a chain base for the second rule
+  const adv = { mode: 'advanced', profileId: 'p1', serversById: byId, chainsById: { c1: [B, A] }, chain: [],
+    base: 'a', rules: [{ target: 'b' }, { target: 'c', via: 'chain:c1' }], def: 'safe', defVia: 'none' };
+  assert.deepEqual(directServers(adv).map(s => s.id), ['a', 'b', 'safe'], 'the base, the chain base’s first hop, the default');
+  const viaOnly = Object.assign({}, adv, { rules: [{ target: 'c' }] });
+  assert.deepEqual(directServers(viaOnly).map(s => s.id), ['a', 'safe']);
+  assert.deepEqual(pinTargets(viaOnly), { probe: [A], behind: [C] }, 'c is only reachable through a');
+});
+
 /* ----------------------------- the core’s mismatch line ----------------------------- */
 
 // Captured from Xray 26.3.27 and PattN 26.9.1 dialling the fixture server with a wrong
@@ -250,4 +260,16 @@ test('recheckDue: a pin checked within the window is left alone; older, missing 
   assert.equal(recheckDue(null, now), false);
   assert.equal(recheckDue(fresh, now, 0), true, 'a zero window asks every time');
   assert.equal(RECHECK_AFTER_MS, 6 * 3600 * 1000);
+});
+
+/* --------------------- a link that already says how to verify (pcs / vcn), and QUIC --------------------- */
+
+test('wantsPin: not for a link that names its certificate (pcs) or the name to check (vcn), nor for Hysteria', () => {
+  const { wantsPin } = require('../src/main/certPin');
+  const { parseLink } = require('../src/main/parser');
+  assert.equal(wantsPin(parseLink('trojan://pw@a.example.com:443?allowInsecure=1')), true);
+  assert.equal(wantsPin(parseLink('trojan://pw@a.example.com:443?allowInsecure=1&pcs=' + 'ab'.repeat(32))), false);
+  assert.equal(wantsPin(parseLink('trojan://pw@a.example.com:443?allowInsecure=1&vcn=real.example')), false);
+  assert.equal(wantsPin(parseLink('hysteria2://pw@h.example.com:443?insecure=1')), false, 'a TCP handshake would reach another service');
+  assert.equal(wantsPin(parseLink('trojan://pw@a.example.com:443')), false);
 });

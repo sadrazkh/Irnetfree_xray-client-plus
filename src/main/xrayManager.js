@@ -12,11 +12,180 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { DEFAULT_ENGINE, engineExe, engineRunArgs, engineTestArgs, engineLabel, xrayEngines } = require('./engines');
+const { DEFAULT_ENGINE, engineExe, engineRunArgs, engineTestArgs, engineLabel, xrayEngines, engineFormat } = require('./engines');
+const { adaptForCore, needsCoreVersion } = require('./coreCompat');
 const net = require('net');
 
 /** Upstream's plaintext-outbound refusal (infra/conf/xray.go); the patterniha fork lifts it. */
 const PLAINTEXT_REJECT = /without TLS.*prohibited/i;
+/**
+ * The official core refusing the fork's `finalmask` (measured on 26.3.27 over
+ * all 44 of the owner's patterniha servers: "infra/conf: LengthMin can't be 0").
+ * Only read for a config that carries a finalmask — a freedom fragment can say
+ * the same words about itself (usesFinalmask).
+ */
+const FINALMASK_REJECT = /LengthMin can't be 0|finalmask/i;
+
+/**
+ * Go's own runtime out of memory: the heap ("fatal error: runtime: out of
+ * memory", or "runtime: out of memory: cannot allocate …" then "fatal error:
+ * out of memory") or a thread it could not create. Exit code 2 — the check
+ * died of the router's memory, not of the config (a refusal is "Failed to
+ * start: …", exit 23).
+ */
+const GO_OUT_OF_MEMORY = /\bruntime: (out of memory|cannot allocate memory|failed to create new OS thread)|\bfatal error: out of memory/;
+
+/**
+ * Does any outbound carry a (non-empty) `streamSettings.finalmask`? Not one on
+ * Hysteria or mKCP: their masks (salamander, hopping, mKCP's header and seed)
+ * are the official core's own, written for its version (coreCompat.js) — no
+ * reason to move them onto the fork. Nor MASQUE's: the official core applies
+ * its UDP masks and quicParams to HTTP/3 and its TCP masks to HTTP/2 itself.
+ */
+function usesFinalmask(config) {
+  return ((config && config.outbounds) || []).some((o) => {
+    const ss = o && o.streamSettings;
+    const fm = ss && ss.finalmask;
+    if (/^(hysteria|kcp|mkcp|masque)$/i.test(String((ss && ss.network) || ''))) return false;
+    return !!fm && typeof fm === 'object' && Object.keys(fm).length > 0;
+  });
+}
+
+/**
+ * The first official release that knows `finalmask` at all. Before it the key
+ * is ignored like any unknown one — `-test` says "Configuration OK." and the
+ * server runs with its mask silently dropped (the OpenWrt 23.05 feed's
+ * xray-core is 24.12.31).
+ */
+const FINALMASK_SINCE = '26.3.27';
+
+/**
+ * ECH from a link: the official core knows `echConfigList` from 25.7.26 and
+ * `echSockopt` (the ECH query bound to the NIC under TUN) from 25.8.3. An older
+ * one passes the config — unknown keys — and connects WITHOUT ECH, the very
+ * thing the link asked to hide. The router's opkg fallback (24.12.31, 25.1.30)
+ * is such a core.
+ */
+const ECH_SINCE = '25.8.3';
+
+/** Does any outbound ask for ECH? */
+function usesEch(config) {
+  return ((config && config.outbounds) || []).some((o) => {
+    const tls = o && o.streamSettings && o.streamSettings.tlsSettings;
+    return !!tls && typeof tls.echConfigList === 'string' && tls.echConfigList.trim() !== '';
+  });
+}
+
+/**
+ * MASQUE (XTLS/Xray-core #6807, #6810): the outbound and its transport from
+ * 26.9.30 — an older core refuses the config in words that never name a
+ * version ("unknown config id: masque"). A WARP account (`masqueSettings.warp`,
+ * #6878) from 26.10.10: 26.9.30 PASSES it, an unknown key, and dials WARP with
+ * no key at all — every handshake refused, nothing in the log saying why. Both
+ * are asked of the core that would run it, before its -test.
+ */
+const MASQUE_SINCE = '26.9.30';
+const MASQUE_WARP_SINCE = '26.10.10';
+
+const masqueOutbounds = (config) => ((config && config.outbounds) || []).filter((o) => o && o.protocol === 'masque');
+
+/** Does any outbound dial MASQUE? */
+function usesMasque(config) {
+  return masqueOutbounds(config).length > 0;
+}
+
+/** Does any MASQUE outbound carry a WARP account? */
+function usesMasqueWarp(config) {
+  return masqueOutbounds(config).some((o) => {
+    const ms = o.streamSettings && o.streamSettings.masqueSettings;
+    return !!ms && !!ms.warp && typeof ms.warp === 'object';
+  });
+}
+
+/**
+ * Core log flood control (spec 2026-10-05 §4). The router's field report:
+ * hundreds of identical WebSocket dial errors within the same milliseconds,
+ * each one a line through syslog and the window's log on a slow CPU, in the
+ * very storm the core was trying to get out of. A line the core repeats is
+ * forwarded at most FLOOD_MAX times per FLOOD_WINDOW_MS; the rest become one
+ * "×N more" line, said when the window closes or as soon as a different line
+ * is forwarded. The lines are compared without their timestamp and their
+ * [connection id] — what makes every one of a storm's lines different.
+ */
+const FLOOD_MAX = 5;
+const FLOOD_WINDOW_MS = 10000;
+// "2026/10/05 12:34:56.123456 " (Xray); "+0330 2026-10-05 12:34:56 " (sing-box)
+const LOG_TIMESTAMP = /^(?:[+-]\d{4} )?\d{4}[/-]\d{2}[/-]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*/;
+// "[2394738294] " (Xray); "[3524466123 1.2s] " (sing-box)
+const LOG_CONN_ID = /\[\d+(?: [^\]\s]+)?\]\s*/g;
+
+/** A core line as the gate compares it: no timestamp, no connection id. */
+function floodKey(line) {
+  return String(line == null ? '' : line).trim().replace(LOG_TIMESTAMP, '').replace(LOG_CONN_ID, '').trim();
+}
+
+/**
+ * The gate one running core's lines pass through: `line(text, level)` forwards
+ * to `emit(text, level)` or holds it back; `flush()` says what is held (the
+ * core exited). `opts.max` / `opts.windowMs` for a test.
+ */
+function floodGate(emit, opts = {}) {
+  const max = opts.max || FLOOD_MAX;
+  const windowMs = opts.windowMs || FLOOD_WINDOW_MS;
+  // key → { start, sent, held, level, timer }, in the order the windows opened
+  const windows = new Map();
+  const pending = new Set();   // keys with lines held back
+  const sayHeld = (key) => {
+    const w = windows.get(key);
+    pending.delete(key);
+    if (!w || !w.held) return;
+    const n = w.held;
+    w.held = 0;
+    if (w.timer) { clearTimeout(w.timer); w.timer = null; }
+    emit(`×${n} more: ${key}`, w.level);
+  };
+  const close = (key) => { sayHeld(key); windows.delete(key); };
+  function line(text, level) {
+    const key = floodKey(text);
+    const now = Date.now();
+    let w = windows.get(key);
+    if (w && now - w.start >= windowMs) { close(key); w = null; }
+    if (!w) {
+      // windows long closed, oldest first: a line the core printed once is not kept for ever
+      for (const [k, old] of windows) {
+        if (now - old.start < windowMs) break;
+        if (!old.held) windows.delete(k);
+      }
+      w = { start: now, sent: 0, held: 0, level, timer: null };
+      windows.set(key, w);
+    }
+    if (w.sent < max) {
+      // a different line: what is held back is said first, in the order it happened
+      for (const k of [...pending]) if (k !== key) sayHeld(k);
+      w.sent++;
+      emit(text, level);
+      return;
+    }
+    w.held++;
+    w.level = level;
+    pending.add(key);
+    if (!w.timer) {
+      w.timer = setTimeout(() => close(key), Math.max(0, w.start + windowMs - now));
+      if (w.timer.unref) w.timer.unref();
+    }
+  }
+  return { line, flush: () => { for (const k of [...pending]) sayHeld(k); } };
+}
+
+/** "24.12.31" below "26.3.27", compared as numbers; a string with no x.y.z in it is never below anything. */
+function versionBelow(v, min) {
+  const parse = (s) => { const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(s || '')); return m ? m.slice(1, 4).map(Number) : null; };
+  const a = parse(v);
+  const b = parse(min);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i];
+  return false;
+}
 
 class XrayManager {
   constructor(opts = {}) {
@@ -27,11 +196,19 @@ class XrayManager {
     this.extraBinDirs = (opts.extraBinDirs || []).filter(Boolean);
     this.onLog = opts.onLog || (() => {}); // (line, level)
     this.onStatus = opts.onStatus || (() => {}); // ('running'|'stopped'|'error', info)
+    // How long `-test` may take before the config counts as UNVERIFIED (and
+    // starts anyway). 6 s on a desktop; the router asks for ~30 s — on a
+    // Cortex-A7 a slow refusal used to pass as "unverified" and only show up
+    // as a dead connection (field report S2, fix 20).
+    this.testTimeoutMs = opts.testTimeoutMs || 6000;
     this.proc = null;
     this.running = false;
+    this.recent = '';                     // the running core's last output (recentLines)
     this._versions = {};                  // engineId -> version string
     /** Validations that PASSED, keyed by core file + geo files + config bytes (see validationKey). */
     this._validated = new Map();
+    /** Test cores started so far: each one's config file is its own (startTest). */
+    this._testSeq = 0;
     this.currentConfigPath = path.join(this.dataDir, 'config.json');
   }
 
@@ -175,6 +352,18 @@ class XrayManager {
   /** Forget cached versions (after a download / removal). */
   forgetVersions() { this._versions = {}; this._validated.clear(); }
 
+  /**
+   * The config in the form THIS core's version takes (coreCompat.js: mKCP's
+   * header and seed, hysteria's port hopping moved between 2026 releases).
+   * Only a config holding such a transport costs the `version` call.
+   */
+  async forCore(config, engineId) {
+    if (!needsCoreVersion(config)) return config;
+    const { id } = this.resolveEngine(engineId, { quiet: true });
+    if (engineFormat(id) !== 'xray') return config;
+    return adaptForCore(config, await this.version(id));
+  }
+
   /** Write config to disk. */
   writeConfig(config, file) {
     const target = file || this.currentConfigPath;
@@ -202,6 +391,11 @@ class XrayManager {
   }
 
   validate(config, engineId) {
+    if (!needsCoreVersion(config)) return this._validate(config, engineId);
+    return this.forCore(config, engineId).then(c => this._validate(c, engineId));
+  }
+
+  _validate(config, engineId) {
     return new Promise((resolve) => {
       const { id, bin } = this.resolveEngine(engineId);
       if (!bin) return resolve({ ok: false, error: 'core binary not found' });
@@ -233,29 +427,119 @@ class XrayManager {
         resolve(res);
       };
       proc.on('error', (err) => finish({ ok: false, error: err.message }));
-      proc.on('exit', (code) => {
+      proc.on('exit', (code, signal) => {
         if (code === 0) return finish({ ok: true });
+        // Killed — the kernel's OOM killer on a 512 MB router, mostly — or
+        // ended by Go's runtime out of memory: no verdict on the config at all.
+        // Its banner ("… Reading config: …") is all it printed, and read as the
+        // reason it made a refusal of a check that never finished (v1.16.1
+        // re-review). `killed` says so to the caller, whatever the words.
+        const oom = signal ? null : out.split(/\r?\n/).map(l => l.trim()).find(l => GO_OUT_OF_MEMORY.test(l));
+        if (signal || oom) {
+          const what = signal ? `was killed (${signal})` : `ran out of memory (${oom})`;
+          return finish({ ok: false, killed: true, error: `${path.basename(bin)} -test ${what} — the config was not checked` });
+        }
         // Older xray builds may not know the -test flag; don't false-reject.
         if (/flag provided but not defined|not defined:.*test|unknown (flag|command)/i.test(out)) {
+          this.onLog(`${path.basename(bin)} does not know -test — the config was not verified before it starts`, 'warn');
           return finish({ ok: true, unverified: true });
         }
         finish({ ok: false, error: extractXrayError(out) || `xray -test exited with code ${code}` });
       });
-      // safety timeout — don't hang the UI if -test never returns
-      setTimeout(() => { if (!settled) { try { proc.kill(); } catch {} finish({ ok: true, unverified: true }); } }, 6000);
+      // safety timeout — don't hang the UI if -test never returns. Said out
+      // loud: a config that is refused after this would otherwise look like a
+      // connection that came up and carries nothing.
+      const limit = this.testTimeoutMs;
+      setTimeout(() => {
+        if (settled) return;
+        try { proc.kill(); } catch {}
+        this.onLog(`${path.basename(bin)} did not finish its config check within ${limit / 1000} s — the config was not verified; starting it anyway`, 'warn');
+        finish({ ok: true, unverified: true });
+      }, limit);
     });
   }
 
   /**
    * Validate on the requested engine. If the OFFICIAL core rejects the config
    * only because it is plaintext VLESS/Trojan to a public address and the
-   * patterniha fork is installed, validate on the fork instead — that is the one
-   * thing the fork exists for. Returns { ok, engine, error?, fellBack?,
-   * plaintextRejected? } so the caller knows which core to start and can tell
-   * the user to install the fork when it is missing.
+   * patterniha fork is installed, validate on the fork instead; a config
+   * carrying the fork's `finalmask` goes to the fork first (see below) —
+   * those are the things the fork exists for. Returns { ok, engine, error?,
+   * fellBack?, plaintextRejected?, pattnNeeded?, finalmaskIgnored?,
+   * echUnsupported?, masqueUnsupported?, coreVersion?, need? } so the caller
+   * knows which core to start and can tell the user to install the fork when
+   * it is missing (`pattnNeeded`: a finalmask the official core refuses — or,
+   * `finalmaskIgnored`, one it is too old to know and would drop) or to update
+   * the official core (`echUnsupported`: ECH on a core older than ECH_SINCE,
+   * no fork to run it; `masqueUnsupported`: MASQUE on a core older than
+   * `need`, no other core new enough to run it).
    */
   async validateWithFallback(config, engineId) {
     const first = this.resolveEngine(engineId);
+    // MASQUE on a core older than it (MASQUE_SINCE; a WARP account
+    // MASQUE_WARP_SINCE): the other Xray core when it is installed and says
+    // a version new enough, else refused in plain words — updating the core
+    // is the answer, a retry is not. A version that cannot be read takes the
+    // ordinary path, as for ECH.
+    const need = usesMasqueWarp(config) ? MASQUE_WARP_SINCE : (usesMasque(config) ? MASQUE_SINCE : '');
+    if (need && engineFormat(first.id) === 'xray') {
+      const v = await this.version(first.id);
+      if (versionBelow(v, need)) {
+        const other = first.id === 'xray' ? 'xray-pattn' : 'xray';
+        const ov = this.resolveBin(other) ? await this.version(other) : '';
+        if (/\d+\.\d+\.\d+/.test(ov) && !versionBelow(ov, need)) {
+          const onOther = await this.validate(config, other);
+          if (!onOther.ok) return { ok: false, engine: other, error: onOther.error, plaintextRejected: false, ...killedOf(onOther) };
+          this.onLog(`This MASQUE server needs Xray ${need} or newer and ${engineLabel(first.id)} is ${v} — running it on ${engineLabel(other)} ${ov}`, 'info');
+          return { ok: true, engine: other, fellBack: true };
+        }
+        return { ok: false, engine: first.id, masqueUnsupported: true, coreVersion: v, need, plaintextRejected: false,
+          error: `${first.id} ${v} does not know MASQUE${need === MASQUE_WARP_SINCE ? ' with a WARP account' : ''} (${need} and newer do)` };
+      }
+    }
+    // A config carrying the fork's `finalmask` runs on the fork when it is
+    // there, and the official core is not asked: one older than 26.3.27
+    // PASSES it (an unknown key) and runs the server unmasked; a newer one
+    // refuses the fork's values — a failing -test, paid on every connect.
+    if (first.id === 'xray' && usesFinalmask(config)) {
+      if (this.resolveBin('xray-pattn')) {
+        const onFork = await this.validate(config, 'xray-pattn');
+        if (!onFork.ok) return { ok: false, engine: 'xray-pattn', error: onFork.error, plaintextRejected: false, ...killedOf(onFork) };
+        this.onLog(`This config carries finalmask (the patterniha fork's transport mask) — running it on ${engineLabel('xray-pattn')}`, 'info');
+        return { ok: true, engine: 'xray-pattn', fellBack: true };
+      }
+      const r = await this.validate(config, 'xray');
+      if (!r.ok) {
+        if (r.killed) return { ok: false, engine: 'xray', error: r.error, plaintextRejected: false, killed: true };
+        return { ok: false, engine: 'xray', error: r.error, plaintextRejected: PLAINTEXT_REJECT.test(r.error || ''), ...(FINALMASK_REJECT.test(r.error || '') ? { pattnNeeded: true } : {}) };
+      }
+      const v = await this.version('xray');
+      if (versionBelow(v, FINALMASK_SINCE)) {
+        return {
+          ok: false, engine: 'xray', pattnNeeded: true, finalmaskIgnored: true, coreVersion: v,
+          error: `xray ${v} does not know finalmask (${FINALMASK_SINCE} and newer do) — it would run this server without its mask`
+        };
+      }
+      return { ok: true, engine: 'xray' };
+    }
+    // ECH on an official core too old to know it: -test would say
+    // "Configuration OK." and the core would connect without ECH. The fork
+    // (built from upstream's main) runs it; without the fork the connect is
+    // refused in plain words. A version that cannot be read takes the
+    // ordinary path, as it does for finalmask.
+    if (first.id === 'xray' && usesEch(config)) {
+      const v = await this.version('xray');
+      if (versionBelow(v, ECH_SINCE)) {
+        if (this.resolveBin('xray-pattn')) {
+          const onFork = await this.validate(config, 'xray-pattn');
+          if (!onFork.ok) return { ok: false, engine: 'xray-pattn', error: onFork.error, plaintextRejected: false, ...killedOf(onFork) };
+          this.onLog(`This config uses ECH, which xray ${v} does not know — running it on ${engineLabel('xray-pattn')}`, 'info');
+          return { ok: true, engine: 'xray-pattn', fellBack: true };
+        }
+        return { ok: false, engine: 'xray', echUnsupported: true, coreVersion: v, plaintextRejected: false,
+          error: `xray ${v} does not know ECH (${ECH_SINCE} and newer do) — it would connect without it` };
+      }
+    }
     const r = await this.validate(config, first.id);
     if (r.ok) return { ok: true, engine: first.id };
     const plaintextRejected = PLAINTEXT_REJECT.test(r.error || '');
@@ -265,9 +549,9 @@ class XrayManager {
         this.onLog(`Official core rejects this plaintext config — running it on ${engineLabel('xray-pattn')}`, 'warn');
         return { ok: true, engine: 'xray-pattn', fellBack: true };
       }
-      return { ok: false, engine: 'xray-pattn', error: again.error, plaintextRejected: false };
+      return { ok: false, engine: 'xray-pattn', error: again.error, plaintextRejected: false, ...killedOf(again) };
     }
-    return { ok: false, engine: first.id, error: r.error, plaintextRejected };
+    return { ok: false, engine: first.id, error: r.error, plaintextRejected, ...killedOf(r) };
   }
 
   /** Start the core with the given config object, on the given engine. */
@@ -280,7 +564,9 @@ class XrayManager {
       throw new Error('xray binary not found');
     }
 
-    const cfgPath = this.writeConfig(config);
+    // (awaited only when there is something to adapt: start() spawns in the
+    // same tick it was called in otherwise, which the callers' ordering relies on)
+    const cfgPath = this.writeConfig(needsCoreVersion(config) ? await this.forCore(config, id) : config);
     this.onLog(`Starting ${path.basename(bin)} with ${path.basename(cfgPath)}`, 'info');
 
     this.proc = spawn(bin, engineRunArgs(id, cfgPath), {
@@ -292,20 +578,30 @@ class XrayManager {
 
     this.running = true;
     // keep the most recent lines so a crash-on-start can report the real reason
+    // — and, through recentLines(), a crash after the grace (the router's wait
+    // for the SOCKS port). Only this start's output: a late line from the core
+    // it replaced is not mixed in.
     let recent = '';
     let earlyExit = null;
+    this.recent = '';
+    this._recentOf = proc;
 
+    // A storm of one line reaches the log five times per 10 s, then as a count
+    // (floodGate); `recent` — what a crash is reported with — keeps every line.
+    const gate = floodGate((line, level) => this.onLog(line, level));
     const handleData = (buf, level) => {
       const text = buf.toString('utf8');
       recent = (recent + text).slice(-4000);
+      if (this._recentOf === proc) this.recent = recent;
       for (const line of text.split(/\r?\n/)) {
-        if (line.trim()) this.onLog(line.trim(), level);
+        if (line.trim()) gate.line(line.trim(), level);
       }
     };
     this.proc.stdout.on('data', (d) => handleData(d, 'log'));
     this.proc.stderr.on('data', (d) => handleData(d, 'warn'));
 
     this.proc.on('exit', (code, signal) => {
+      gate.flush();   // what was held back is said before the exit is
       if (earlyExit) earlyExit({ code, signal });
       // stop() has a bounded wait. A late exit from the previous child must
       // never clear the replacement child or trigger its recovery callback.
@@ -342,6 +638,11 @@ class XrayManager {
     return this.running && this.proc === proc;
   }
 
+  /** The last `n` non-empty lines the core started last printed (kept after it exited). */
+  recentLines(n = 5) {
+    return String(this.recent || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean).slice(-n);
+  }
+
   async stop() {
     if (!this.proc) { this.running = false; return; }
     const p = this.proc;
@@ -371,8 +672,10 @@ class XrayManager {
   async startTest(testConfig, engineId) {
     const { id, bin } = this.resolveEngine(engineId, { quiet: true });
     if (!bin) throw new Error('xray binary not found');
-    const cfgPath = path.join(this.dataDir, `test-${Date.now()}.json`);
-    fs.writeFileSync(cfgPath, JSON.stringify(testConfig, null, 2), 'utf8');
+    // numbered as well: the mux probes start up to three at once, and two in
+    // the same millisecond shared one file — and one's cleanup deleted both's
+    const cfgPath = path.join(this.dataDir, `test-${Date.now()}-${++this._testSeq}.json`);
+    fs.writeFileSync(cfgPath, JSON.stringify(needsCoreVersion(testConfig) ? await this.forCore(testConfig, id) : testConfig, null, 2), 'utf8');
 
     const proc = spawn(bin, engineRunArgs(id, cfgPath), { cwd: path.dirname(bin), windowsHide: true, env: this.spawnEnv() });
 
@@ -408,6 +711,9 @@ class XrayManager {
 }
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/** A validation's `killed` (validate: its -test never gave a verdict), carried into validateWithFallback's answer. */
+function killedOf(r) { return r && r.killed ? { killed: true } : {}; }
 
 /**
  * Pull the meaningful line out of xray's (verbose) startup output.
@@ -461,4 +767,7 @@ function getFreePorts(n) {
   });
 }
 
-module.exports = { XrayManager, getFreePort, getFreePorts, PLAINTEXT_REJECT };
+module.exports = {
+  XrayManager, getFreePort, getFreePorts, PLAINTEXT_REJECT, FINALMASK_SINCE, ECH_SINCE, usesEch,
+  MASQUE_SINCE, MASQUE_WARP_SINCE, usesMasque, usesMasqueWarp, versionBelow, floodGate, floodKey
+};

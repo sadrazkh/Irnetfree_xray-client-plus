@@ -26,9 +26,13 @@
   <!-- custom titlebar -->
   <header class="titlebar conn-off" id="titlebar">
     <div class="tb-left">
-      <span class="tb-logo-wrap">
-        <img class="tb-logo" src="../../assets/icon.png" alt="IRNetFree" />
-        <span class="tb-logo-badge"></span>
+      <!-- the logo with the app's version under it (app:init → #tbVersion) -->
+      <span class="tb-brand">
+        <span class="tb-logo-wrap">
+          <img class="tb-logo" src="../../assets/icon.png" alt="IRNetFree" />
+          <span class="tb-logo-badge"></span>
+        </span>
+        <span class="tb-ver" id="tbVersion" dir="ltr" data-i18n-title="about.version"></span>
       </span>
       <span class="tb-title">IR<b>NETFREE</b> <span class="tb-plus">PLUS</span></span> <!-- plus -->
     </div>
@@ -115,11 +119,16 @@
 
           <div class="connect-row">
             <div class="connect-panel">
+              <!-- while a connect is in flight this is its Cancel (app.js connect()):
+                   the word shows under the icon, the tooltip and aria-label say it too -->
               <button class="power-btn" id="powerBtn" aria-label="connect">
                 <svg viewBox="0 0 24 24" class="power-ico"><path d="M12 3v9" /><path d="M7 6.5a8 8 0 1 0 10 0" /></svg>
+                <span class="power-cancel" data-i18n="power.cancel">لغو</span>
               </button>
               <div class="connect-state" id="connState" data-i18n="state.disconnected">قطع شده</div>
               <div class="connect-meta" id="connMeta"></div>
+              <!-- what the live connection did not do (proxy only, the leak guard): app.js renderConnIssues -->
+              <div class="conn-issues" id="connIssues" role="status" hidden></div>
               <div class="connect-server" id="connServer" data-i18n="conn.noServer">سروری انتخاب نشده</div>
               <div class="connect-geo" id="connGeo" hidden>
                 <span class="geo-flag" id="geoFlag"></span>
@@ -203,7 +212,9 @@
             <button class="btn ghost" id="btnClearUsage" data-i18n="btn.clearUsage">پاک‌کردن مصرف</button>
             <button class="btn ghost" id="btnClearServers" data-i18n="btn.clearAll">حذف همه</button>
             <button class="btn ghost" id="btnWgOpen" data-i18n="btn.addWg">+ WireGuard</button>
+            <button class="btn ghost" id="btnWarpOpen" data-i18n="btn.addWarp">+ WARP</button>
             <button class="btn ghost" id="btnProxyOpen" data-i18n="btn.addProxy">+ SOCKS/HTTP</button>
+            <button class="btn ghost" id="btnManualOpen" data-i18n="btn.addManual">+ دستی</button>
             <button class="btn primary" id="btnAddOpen" data-i18n="btn.add">+ افزودن</button>
           </div>
         </div>
@@ -400,6 +411,33 @@
           </div>
 
           <div id="advBody">
+            <!-- Routing profiles: several advanced routings, the list and then the one being
+                 edited. Hidden on a back end without them (today's single advanced routing). -->
+            <div class="rp-bar" id="rpBar" hidden>
+              <div class="rp-list" id="rpList" role="tablist"></div>
+              <button type="button" class="btn ghost rp-add" id="btnRpAdd" data-i18n="rp.add">+ روتینگ جدید</button>
+            </div>
+            <div class="empty small" id="rpEmpty" data-i18n="rp.none" hidden>هنوز روتینگی نیست. «روتینگ جدید» را بزن.</div>
+            <div class="rp-head" id="rpHead" hidden>
+              <input class="input rp-name" id="rpName" dir="auto" maxlength="60" data-i18n-ph="rp.rename" data-i18n-title="rp.rename" />
+              <span class="rp-def-badge" id="rpDefBadge" data-i18n="rp.isDefault" data-i18n-title="rp.defaultHint" hidden>★ پیش‌فرض</span>
+              <button type="button" class="btn ghost rp-make-def" id="btnRpDefault" data-i18n="rp.setDefault" data-i18n-title="rp.defaultHint">★ پیش‌فرض شود</button>
+              <div class="rp-actions">
+                <button type="button" class="icon-btn" id="btnRpDup" data-i18n-title="rp.duplicate">⧉</button>
+                <button type="button" class="icon-btn" id="btnRpShare" data-i18n-title="rp.copyLink">🔗</button>
+                <button type="button" class="icon-btn" id="btnRpDel" data-i18n-title="rp.delete">🗑</button>
+              </div>
+            </div>
+            <!-- the flow tree of the profile being edited: rules → targets → bases -->
+            <div class="rp-flow-wrap" id="rpFlowWrap" hidden>
+              <div class="rp-flow-head">
+                <span class="rp-flow-title" data-i18n="rp.flowTitle">مسیر ترافیک در این روتینگ</span>
+                <span class="rp-flow-live" id="rpFlowLive" data-i18n="rp.flowLive" hidden>● زنده</span>
+              </div>
+              <div class="rp-flow" id="rpFlow"></div>
+            </div>
+
+            <div id="advEditor">
             <p class="hint" data-i18n="adv.hint">قانون‌ها از بالا به پایین بررسی می‌شوند؛ هر درخواست با اولین قانونِ منطبق هدایت می‌شود.</p>
 
             <div class="adv-rules" id="advRules"></div>
@@ -408,6 +446,17 @@
             <div class="adv-default">
               <span class="adv-def-label" data-i18n="adv.default">بقیهٔ ترافیک از:</span>
               <span id="advDefaultMount" class="adv-target-mount"></span>
+              <span class="adv-via" id="advDefVia" hidden>
+                <span class="adv-via-label" data-i18n="rp.via">از طریق</span>
+                <span id="advDefViaMount" class="adv-via-mount"></span>
+              </span>
+            </div>
+            <!-- the profile's base: every proxy target dials through it unless its rule says otherwise -->
+            <div class="adv-base" id="advBaseRow" hidden>
+              <span class="adv-base-label" data-i18n="rp.base">پایه</span>
+              <span id="advBaseMount" class="adv-target-mount"></span>
+              <span class="adv-base-hint" data-i18n="rp.baseHint">هر مقصد پروکسی این روتینگ از طریق پایه وصل می‌شود، مگر قانونش چیز دیگری بگوید.</span>
+              <span class="adv-warn" id="advBaseWhy" hidden></span>
             </div>
 
             <!-- also apply the simple routing mode (bypass Iran/China) under the rules -->
@@ -436,6 +485,7 @@
 
             <button class="btn primary" id="btnSaveAdv" data-i18n="adv.save">ذخیره روتینگ پیشرفته</button>
             <span class="saved-hint" id="advSavedHint"></span>
+            </div><!-- /advEditor -->
           </div>
         </div>
 
@@ -704,20 +754,14 @@
                 <label class="field-label" for="xsEngineSelect" data-i18n="xs.engine">هسته</label>
                 <select id="xsEngineSelect" class="select"></select>
               </div>
-              <div>
-                <label class="field-label" for="xsCoreChannel" data-i18n="xs.coreChannel">کانال هسته</label>
-                <select id="xsCoreChannel" class="select">
-                  <option value="stable" data-i18n="xs.channel.stable">پایدار</option>
-                  <option value="latest" data-i18n="xs.channel.latest">آخرین</option>
-                </select>
-              </div>
             </div>
-            <p class="hint" data-i18n="xs.coreChannelHint"></p>
+            <p class="hint" data-i18n="xs.coreHint"></p>
             <div class="xs-core-row">
               <span class="xs-run-meta" id="xsCoreVersion2"></span>
               <span class="xs-run-meta xs-core-check" id="xsCoreCheckOut"></span>
               <div class="head-actions xs-run-actions">
                 <button class="btn ghost small" id="btnXsCoreCheck" data-i18n="xs.coreCheck">بررسی نسخه‌ها</button>
+                <button class="btn ghost small" id="btnXsCorePick" data-i18n="xs.corePick">انتخاب نسخه</button>
                 <button class="btn primary small" id="btnXsCoreLatest" data-i18n="xs.coreLatest">دریافت آخرین هسته</button>
               </div>
             </div>
@@ -1100,6 +1144,8 @@
               <div class="switch-sub" data-i18n="tun.sub">همه‌ی ترافیک سیستم از تانل رد می‌شه (نیازمند sing-box (یا tun2socks) و دسترسی ادمین)</div></div>
             <label class="switch"><input type="checkbox" id="optTun" /><span class="slider"></span></label>
           </div>
+          <!-- OpenWrt only: there is no TUN switch there — the tunnel is the whole network's -->
+          <p class="hint" id="tunRouterNote" data-i18n="mode.routerNote" hidden></p>
           <div class="tun-status" id="tunStatus"></div>
           <button class="btn ghost admin-btn" id="btnRunAdmin" data-i18n="tun.runAdmin" hidden>اجرای مجدد با دسترسی ادمین</button>
           <!-- which program builds the tunnel; changing it needs a reconnect -->
@@ -1166,6 +1212,17 @@
             <p class="hint warn" id="guardStrictRouting" data-i18n="guard.strictRouting" hidden></p>
             <p class="hint warn" id="guardNeedsTun" data-i18n="guard.needsTun" hidden></p>
           </div>
+          <!-- sing-box 1.14+ answers the tunnel's DNS itself unless told not to (tunSingbox.tunDnsModeFor) -->
+          <div class="setting-row" id="singboxDnsRow">
+            <label class="field-label" for="optSingboxDns" data-i18n="set.singboxDns">DNS در TUN (sing-box)</label>
+            <select id="optSingboxDns" class="select vis-hidden">
+              <option value="app" data-i18n="sbdns.app">برنامه</option>
+              <option value="core" data-i18n="sbdns.core">خودِ sing-box</option>
+            </select>
+            <div class="opt-cards" id="singboxDnsCards"></div>
+            <p class="hint" data-i18n="sbdns.hint"></p>
+            <p class="hint warn" id="sbdnsStrictNote" data-i18n="sbdns.strictNote" hidden></p>
+          </div>
           <!-- the proxy-mode counterpart: TUN already carries UDP, so it is the other way round -->
           <div class="switch-row" id="udpBlockRow">
             <div><div class="switch-title" data-i18n="udpblock.title">بستن UDP در حالت پروکسی</div>
@@ -1184,6 +1241,8 @@
                renderLanDevices(); a tick saves lanBypassMacs and applies live. -->
           <div class="setting-row" id="gwRow" hidden>
             <div class="field-label" data-i18n="gw.title">دستگاه‌های شبکه</div>
+            <!-- the first line under the title: what the inspector's gateway row (which opens this) means -->
+            <p class="hint" data-i18n="gw.insHint"></p>
             <p class="hint" data-i18n="gw.sub"></p>
             <div class="row-gap">
               <button class="btn ghost" type="button" id="btnGwRefresh" data-i18n="gw.refresh">تازه‌سازی</button>
@@ -1193,9 +1252,26 @@
           </div>
           <!-- OpenWrt only: QUIC from the LAN refused, so browsers use TCP (which every proxy carries) -->
           <div class="switch-row" id="gwQuicRow" hidden>
-            <div><div class="switch-title" data-i18n="gw.quic">QUIC (UDP 443) از شبکه رد نشود</div>
+            <div><div class="switch-title" data-i18n="gw.quic">رد کردن QUIC (UDP 443) از شبکه</div>
               <div class="switch-sub" data-i18n="gw.quicSub"></div></div>
             <label class="switch"><input type="checkbox" id="optLanBlockQuic" /><span class="slider"></span></label>
+          </div>
+          <!-- OpenWrt only: remote access lives in LuCI, not on this page — the
+               LuCI page and the guide are links (renderRemotePointer) -->
+          <div class="setting-row" id="gwRemoteRow" hidden>
+            <p class="hint" id="gwRemote" data-i18n="gw.remote"></p>
+          </div>
+          <!-- mux on the servers' own outbounds (src/main/mux.js): auto tests each
+               WebSocket / HTTPUpgrade server once. Written into the config, so a
+               change waits for a reconnect, like the settings around it. -->
+          <div class="setting-row" id="muxRow">
+            <label class="field-label" for="optMux" data-i18n="set.mux">Mux (مالتی‌پلکس)</label>
+            <select id="optMux" class="select">
+              <option value="auto" data-i18n="mux.auto">خودکار</option>
+              <option value="on" data-i18n="mux.on">روشن</option>
+              <option value="off" data-i18n="mux.off" selected>خاموش</option>
+            </select>
+            <p class="hint" data-i18n="mux.hint"></p>
           </div>
           <div class="switch-row">
             <div><div class="switch-title" data-i18n="kill.title">کیل سوییچ (Kill switch)</div>
@@ -1281,11 +1357,13 @@
 
       <div class="ins-group">
         <div class="ins-head" data-i18n="ins.protection">محافظت</div>
-        <div class="ins-row"><span class="ins-label" data-i18n="ins.tun">TUN</span><span class="ins-val" id="insTun">—</span></div>
+        <!-- #insTunRow / #insGuardRow: the router has no TUN switch and no guard cards to mirror (applyFlavor) -->
+        <div class="ins-row" id="insTunRow"><span class="ins-label" data-i18n="ins.tun">TUN</span><span class="ins-val" id="insTun">—</span></div>
         <div class="ins-row"><span class="ins-label" data-i18n="ins.kill">Kill switch</span><span class="ins-val" id="insKill">—</span></div>
-        <div class="ins-row"><span class="ins-label" data-i18n="ins.guard">Leak guard</span><span class="ins-val" id="insGuard">—</span></div>
+        <div class="ins-row" id="insGuardRow"><span class="ins-label" data-i18n="ins.guard">Leak guard</span><span class="ins-val" id="insGuard">—</span></div>
         <div class="ins-row"><span class="ins-label" data-i18n="ins.ipv6">IPv6</span><span class="ins-val" id="insIpv6">—</span></div>
-        <div class="ins-row" id="insGatewayRow" hidden><span class="ins-label" data-i18n="ins.gateway">گیت‌وی</span><span class="ins-val" id="insGateway">—</span></div>
+        <!-- OpenWrt only: a status, not a switch — the button says what it means and opens the device list -->
+        <button type="button" class="ins-row" id="insGatewayRow" hidden data-i18n-title="gw.insHint"><span class="ins-label" data-i18n="ins.gateway">تونل کل شبکه</span><span class="ins-val ins-text" id="insGateway">—</span></button>
       </div>
 
       <div class="ins-div"></div>
@@ -1309,24 +1387,65 @@
 
   <!-- edit server modal -->
   <div class="modal-overlay" id="editModal" hidden>
-    <div class="modal">
+    <div class="modal ed-modal">
       <div class="modal-head">
-        <span class="modal-title" data-i18n="edit.title">ویرایش سرور</span>
+        <span class="modal-title" id="edTitle" data-i18n="edit.title">ویرایش سرور</span>
+        <span class="ed-head-proto" id="edHeadProto" dir="ltr"></span>
+        <!-- one draft, two views (app.js setEditView): today's form, or every field in five tabs -->
+        <div class="seg ed-view" id="edView" role="radiogroup" data-i18n-title="edit.view.label">
+          <button type="button" class="seg-btn active" role="radio" aria-checked="true" data-edit-view="simple" data-i18n="edit.view.simple">ساده</button>
+          <button type="button" class="seg-btn" role="radio" aria-checked="false" data-edit-view="pro" data-i18n="edit.view.pro">حرفه‌ای</button>
+        </div>
         <button class="tb-btn" id="editClose">&#x2715;</button>
       </div>
       <div class="modal-body" id="editBody">
-        <div class="grid2">
+        <div class="ed-simple" id="edSimple">
+        <div class="grid2" id="edNameRow">
           <div><label class="field-label" data-i18n="edit.name">نام</label>
             <input type="text" id="edName" class="input" /></div>
-          <div><label class="field-label" id="edAddrLabel" data-i18n="edit.address">آدرس</label>
+          <div id="edAddrWrap"><label class="field-label" id="edAddrLabel" data-i18n="edit.address">آدرس</label>
             <input type="text" id="edAddress" class="input" dir="ltr" /></div>
         </div>
+        <!-- A JSON server (source 'json'): the config itself is the one source, so the link fields
+             below are hidden for it and this block stands in. Always LTR and monospace. -->
+        <div class="ed-json" id="edJsonWrap" hidden>
+          <div>
+            <label class="field-label" id="edJsonModeLabel" data-i18n="ed.jsonMode">نحوهٔ اجرا</label>
+            <div class="seg" id="edJsonMode" role="radiogroup" aria-labelledby="edJsonModeLabel">
+              <button type="button" class="seg-btn active" role="radio" aria-checked="true" data-json-mode="full" data-i18n="ed.jsonFull">کامل</button>
+              <button type="button" class="seg-btn" role="radio" aria-checked="false" data-json-mode="raw" data-i18n="ed.jsonRaw">خام</button>
+            </div>
+            <p class="hint" id="edJsonHelp"></p>
+            <!-- the router's web UI only (flavor openwrt), with Raw selected -->
+            <p class="hint warn" id="edJsonRouterNote" hidden></p>
+          </div>
+          <div class="ed-json-info" id="edJsonInfo" hidden></div>
+          <div>
+            <label class="field-label" for="edJson" data-i18n="ed.jsonEditor">کانفیگ (JSON)</label>
+            <textarea id="edJson" class="textarea ed-json-text" dir="ltr" rows="14" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+            <p class="hint warn" id="edJsonError" dir="auto" role="alert" hidden></p>
+          </div>
+          <div class="ed-json-actions">
+            <button type="button" class="btn ghost small" id="edJsonCopy" data-i18n="ed.jsonCopy">کپی JSON</button>
+          </div>
+        </div>
+        <div class="ed-fields" id="edLinkFields">
         <div class="grid2">
           <div><label class="field-label" id="edPortLabel" data-i18n="edit.port">پورت</label>
             <input type="number" id="edPort" class="input" dir="ltr" /></div>
           <div id="edCredWrap"><label class="field-label" id="edCredLabel" data-i18n="edit.uuid">شناسه</label>
             <input type="text" id="edCred" class="input" dir="ltr" /></div>
         </div>
+        <!-- MASQUE: its HTTP version, as two cards (app.js setMasqueHttpForm) -->
+        <div class="ed-masque" id="edMasqueRow" hidden>
+          <div class="field-label"><span data-i18n="sf.masqueHttp">نسخهٔ HTTP</span> <span class="ed-key" dir="ltr">alpn</span></div>
+          <div class="ed-http" id="edMasqueHttp" role="radiogroup">
+            <button type="button" class="ed-http-opt" role="radio" aria-checked="false" data-masque-http="h3"><span><bdi dir="ltr">HTTP/3</bdi></span><small data-i18n="masque.h3Desc">روی QUIC (UDP 443)</small></button>
+            <button type="button" class="ed-http-opt" role="radio" aria-checked="false" data-masque-http="h2"><span><bdi dir="ltr">HTTP/2</bdi></span><small data-i18n="masque.h2Desc">روی TCP 443</small></button>
+          </div>
+        </div>
+        <!-- what the Simple view lacked (VLESS flow and Encryption, the VMess cipher, the SS method): drawn from serverFields.js -->
+        <div class="ed-simple-extra" id="edSimpleExtra" hidden></div>
         <!-- transport row (hidden for ss/wireguard) -->
         <div class="grid2" id="edTransportRow">
           <div><label class="field-label" data-i18n="edit.network">ترنسپورت</label>
@@ -1349,11 +1468,29 @@
           <div id="edHostWrap"><label class="field-label" id="edHostLabel">Host</label>
             <input type="text" id="edHost" class="input" dir="ltr" /></div>
         </div>
+        <!-- MASQUE: a WARP account's summary (app.js renderMasqueSimple), or a Basic user and password -->
+        <div class="ed-masque" id="edMasqueAuth" hidden>
+          <div class="ed-card" id="edWarpCard" hidden>
+            <div class="ed-card-head">
+              <span class="warp-ico sm" aria-hidden="true">☁</span>
+              <span><span class="ttl" data-i18n="masque.warpTitle">WARP کلادفلر</span><br><span class="sub" data-i18n="masque.warpFromSignup">کلیدها از ثبت‌نام آمده‌اند.</span></span>
+            </div>
+            <div class="ed-chips-read" id="edWarpChips"></div>
+          </div>
+          <div class="grid2" id="edMasqueCred">
+            <div><label class="field-label" data-i18n="sf.masqueUser">نام کاربری</label>
+              <input type="text" id="edMasqueUser" class="input" dir="ltr" spellcheck="false" data-i18n-ph="masque.optional" /></div>
+            <div><label class="field-label" data-i18n="sf.masquePass">رمز عبور</label>
+              <input type="text" id="edMasquePass" class="input" dir="ltr" spellcheck="false" data-i18n-ph="masque.optional" /></div>
+          </div>
+        </div>
         <p class="hint" id="edSpoofHint">The SNI is the domain sent in the TLS handshake.</p>
         <label class="switch-row inline-switch" id="edHideSniRow">
-          <span class="switch-title" id="edHideSniLabel">🕵 Hide SNI from DPI (fragment)</span>
+          <span class="switch-title" id="edHideSniLabel">🕵 Hide SNI from DPI (TLS fragment)</span>
           <span class="switch"><input type="checkbox" id="edHideSni" /><span class="slider"></span></span>
         </label>
+        <!-- the server's finalmask already fragments the ClientHello: this switch would add a second fragmenter -->
+        <p class="hint warn" id="edHideSniFmNote" data-i18n="spoof.hideSniFinalmask" hidden></p>
         <div class="grid2" id="edPathRow">
           <div><label class="field-label" data-i18n="edit.path">Path / ServiceName</label>
             <input type="text" id="edPath" class="input" dir="ltr" /></div>
@@ -1375,6 +1512,31 @@
             <input type="text" id="edPbk" class="input" dir="ltr" /></div>
           <div><label class="field-label" data-i18n="edit.sid">Short ID (sid)</label>
             <input type="text" id="edSid" class="input" dir="ltr" /></div>
+        </div>
+        <!-- REALITY's post-quantum check (pqv): the server's ML-DSA-65 public key -->
+        <div id="edPqvRow" hidden>
+          <label class="field-label" data-i18n="edit.pqv">ML-DSA-65 verify key (pqv)</label>
+          <input type="text" id="edPqv" class="input" dir="ltr" spellcheck="false" />
+        </div>
+        <!-- Hysteria2: the salamander obfuscation and port hopping -->
+        <div class="grid2" id="edHy2Row" hidden>
+          <div><label class="field-label" data-i18n="edit.hy2Obfs">Obfs password (salamander)</label>
+            <input type="text" id="edHy2Obfs" class="input" dir="ltr" spellcheck="false" /></div>
+          <div><label class="field-label" data-i18n="edit.hy2Ports">Port hopping</label>
+            <input type="text" id="edHy2Ports" class="input" dir="ltr" placeholder="20000-50000" spellcheck="false" /></div>
+        </div>
+        <!-- newer TLS knobs: Encrypted Client Hello, a certificate pin, the name to verify against -->
+        <div id="edTlsExtra" hidden>
+          <label class="field-label" data-i18n="edit.ech">ECH — Encrypted Client Hello</label>
+          <input type="text" id="edEch" class="input" dir="ltr" spellcheck="false" placeholder="cloudflare-ech.com+udp://1.1.1.1" />
+          <p class="hint" data-i18n="edit.echHint">Hides the real SNI inside an encrypted ClientHello. Either the ECH config itself (base64) or where to fetch it: name+udp://resolver or name+https://resolver/dns-query. Empty = off.</p>
+          <div class="grid2">
+            <div><label class="field-label" data-i18n="edit.pcs">Certificate SHA-256 (pcs)</label>
+              <input type="text" id="edPcs" class="input" dir="ltr" spellcheck="false" placeholder="e3b0c442…, …" /></div>
+            <div><label class="field-label" data-i18n="edit.vcn">Verify certificate as (vcn)</label>
+              <input type="text" id="edVcn" class="input" dir="ltr" spellcheck="false" placeholder="real.example.com" /></div>
+          </div>
+          <p class="hint" data-i18n="edit.pcsHint">pcs: accept exactly this certificate (a self-signed one too) — what replaced Allow Insecure. vcn: check the certificate against this name instead of the SNI.</p>
         </div>
         <label class="switch-row inline-switch" id="edInsecureRow">
           <span class="switch-title" data-i18n="edit.allowInsecure">Allow Insecure</span>
@@ -1428,13 +1590,15 @@
               <option value="xray-pattn" data-i18n="engine.pattn">Xray-PattN (patterniha)</option>
               <option value="sing-box" data-i18n="engine.singbox">sing-box (fake ClientHello / uTLS)</option>
             </select></div>
-          <div class="engine-hint"><p class="hint" data-i18n="edit.engineHint">Only this config runs on the chosen core. sing-box needs its binary in bin/; falls back to Xray if missing.</p></div>
+          <div class="engine-hint"><p class="hint" id="edEngineHint" data-i18n="edit.engineHint">Only this config runs on the chosen core. sing-box needs its binary in bin/; falls back to Xray if missing.</p>
+            <!-- MASQUE runs on Xray or Xray-PattN only (app.js hides the sing-box option for it) -->
+            <p class="hint" id="edEngineHintMasque" data-i18n="sf.engine.hint.masque" hidden>sing-box MASQUE ندارد.</p></div>
         </div>
-        <!-- TLS fragmentation (all protocols) -->
+        <!-- TLS fragmentation (all protocols); MASQUE shows one of the two: a fragment over HTTP/2, noise over HTTP/3 -->
         <div class="grid2" id="edFragmentRow">
-          <div><label class="field-label" data-i18n="edit.fragment">Fragment (packets,length,interval — خالی = خاموش)</label>
+          <div id="edFragmentWrap"><label class="field-label" data-i18n="edit.fragment">Fragment (packets,length,interval — خالی = خاموش)</label>
             <input type="text" id="edFragment" class="input" dir="ltr" placeholder="tlshello,100-200,10-20" /></div>
-          <div><label class="field-label" data-i18n="edit.noise">Noise (anti-DPI / fake ClientHello)</label>
+          <div id="edNoiseWrap"><label class="field-label" data-i18n="edit.noise">Noise (anti-DPI / fake ClientHello)</label>
             <select id="edNoise" class="select">
               <option value="off" data-i18n="noise.off">Off</option>
               <option value="random" data-i18n="noise.random">Random</option>
@@ -1456,11 +1620,34 @@
           <textarea id="edFinalMask" class="input" dir="ltr" rows="3" spellcheck="false" placeholder='{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["3-5","6-8"],"delays":["10-20"],"maxSplit":"3-6"}}]}'></textarea>
           <p class="hint" data-i18n="edit.pattHint">دقیقاً همان JSON را بچسبان؛ برنامه دست‌کاری‌اش نمی‌کند. برای روش پترنیها: Address یک IP تمیز کلودفلر، fingerprint = unsafe، بعد cipherSuites و finalmask.</p>
         </div>
+        <!-- the Simple view's last line: everything else is in the Pro view (filled by app.js) -->
+        <p class="hint ed-more" id="edMoreInPro"></p>
+        </div>
+        </div>
+        <!-- the Pro view: every field of serverFields.js, in five tabs (app.js renderEditPro) -->
+        <div class="ed-pro" id="edPro" hidden>
+          <nav class="ed-tabs" id="edTabs" role="tablist"></nav>
+          <div class="ed-pane" id="edProPane" role="tabpanel"></div>
+        </div>
       </div>
-      <div class="modal-foot">
+      <div class="modal-foot ed-foot">
         <button class="btn primary" id="editSave" data-i18n="btn.save">ذخیره</button>
         <button class="btn ghost" id="editCancel" data-i18n="btn.cancel">انصراف</button>
+        <span class="ed-foot-note" id="edFootNote"></span>
       </div>
+    </div>
+  </div>
+
+  <!-- + WARP: a WARP account, made here or imported, as MASQUE servers (app.js renderWarp draws the body and foot) -->
+  <div class="modal-overlay" id="warpModal" hidden>
+    <div class="modal warp-modal" role="dialog" aria-modal="true" aria-labelledby="warpTitle">
+      <div class="modal-head">
+        <span class="warp-ico" aria-hidden="true">☁</span>
+        <span class="modal-title" id="warpTitle" data-i18n="warp.title">WARP روی MASQUE</span>
+        <button class="tb-btn" id="warpClose" data-i18n-title="tb.close">&#x2715;</button>
+      </div>
+      <div class="modal-body" id="warpBody"></div>
+      <div class="modal-foot ed-foot" id="warpFoot"></div>
     </div>
   </div>
 
@@ -1566,32 +1753,47 @@
     </div>
   </div>
 
-  <!-- kill-switch banner (shown when internet is blocked after an unexpected drop) -->
-  <div class="kill-banner" id="killBanner" hidden>
-    <span class="kill-banner-text" data-i18n="kill.blocked">⛔ کیل سوییچ فعال شد — اینترنت بسته است</span>
-    <div class="kill-banner-actions">
-      <button class="btn" id="killReconnect" data-i18n="kill.reconnect">اتصال مجدد</button>
-      <button class="btn ghost" id="killDisarm" data-i18n="kill.disarm">باز کردن اینترنت</button>
+  <!-- The banners, in one stack fixed over the window's foot (styles.css .banner-stack).
+       The window never scrolls, so a banner in the flow after .layout is below the
+       screen: that is where all four sat from the redesign to v1.16.3. -->
+  <div class="banner-stack" id="bannerStack">
+    <!-- kill-switch banner (shown when internet is blocked after an unexpected drop) -->
+    <div class="kill-banner" id="killBanner" hidden>
+      <span class="kill-banner-text" data-i18n="kill.blocked">⛔ کیل سوییچ فعال شد — اینترنت بسته است</span>
+      <div class="kill-banner-actions">
+        <button class="btn" id="killReconnect" data-i18n="kill.reconnect">اتصال مجدد</button>
+        <button class="btn ghost" id="killDisarm" data-i18n="kill.disarm">باز کردن اینترنت</button>
+      </div>
     </div>
-  </div>
 
-  <!-- Shown when the reconnect attempts were given up on and the leak guard is
-       STILL holding: nothing is leaking, but nothing resolves either, and the
-       user is owed a way out. -->
-  <div class="kill-banner" id="guardBanner" hidden>
-    <span class="kill-banner-text" data-i18n="guard.held">🔒 اتصال مجدد ناموفق بود. برای این‌که چیزی نشت نکند، دی‌ان‌اس روی تونل نگه داشته شده — تا وصل نشوی نام‌ها باز نمی‌شوند.</span>
-    <div class="kill-banner-actions">
-      <button class="btn" id="guardRetry" data-i18n="guard.retry">تلاش دوباره</button>
-      <button class="btn ghost" id="guardRelease" data-i18n="guard.release">اینترنتم را برگردان</button>
+    <!-- Shown when the reconnect attempts were given up on and the leak guard is
+         STILL holding: nothing is leaking, but nothing resolves either, and the
+         user is owed a way out. -->
+    <div class="kill-banner" id="guardBanner" hidden>
+      <span class="kill-banner-text" data-i18n="guard.held">🔒 اتصال مجدد ناموفق بود. برای این‌که چیزی نشت نکند، دی‌ان‌اس روی تونل نگه داشته شده — تا وصل نشوی نام‌ها باز نمی‌شوند.</span>
+      <div class="kill-banner-actions">
+        <button class="btn" id="guardRetry" data-i18n="guard.retry">تلاش دوباره</button>
+        <button class="btn ghost" id="guardRelease" data-i18n="guard.release">اینترنتم را برگردان</button>
+      </div>
     </div>
-  </div>
 
-  <!-- persistent reminder while saved-but-not-applied settings exist -->
-  <div class="pending-banner" id="pendingBanner" hidden>
-    <span class="pending-banner-text" id="pendingBannerText"></span>
-    <div class="pending-banner-actions">
-      <button class="btn" id="pendingApply" data-i18n="apply.now">اعمال و اتصال مجدد</button>
-      <button class="btn ghost" id="pendingDismiss" data-i18n="apply.dismiss">بستن</button>
+    <!-- persistent reminder while saved-but-not-applied settings exist -->
+    <div class="pending-banner" id="pendingBanner" hidden>
+      <span class="pending-banner-text" id="pendingBannerText"></span>
+      <div class="pending-banner-actions">
+        <button class="btn" id="pendingApply" data-i18n="apply.now">اعمال و اتصال مجدد</button>
+        <button class="btn ghost" id="pendingDismiss" data-i18n="apply.dismiss">بستن</button>
+      </div>
+    </div>
+
+    <!-- Windows: the logon task starts ANOTHER copy of the app (an older build keeps its
+         own DNS code) — main only reads the task; the button re-registers it for this one -->
+    <div class="pending-banner" id="autostartBanner" hidden>
+      <span class="pending-banner-text" id="autostartBannerText"></span>
+      <div class="pending-banner-actions">
+        <button class="btn" id="autostartFix" data-i18n="notice.autostartFix">هنگام ورود همین نسخه اجرا شود</button>
+        <button class="btn ghost" id="autostartDismiss" data-i18n="apply.dismiss">بستن</button>
+      </div>
     </div>
   </div>
 
@@ -1609,6 +1811,40 @@
         <p class="hint" data-i18n="qr.hint">این لینک همهٔ تنظیمات (شامل patterniha) را دارد. اسکن کن یا کپی و در کلاینت دیگر وارد کن.</p>
         <textarea id="qrLink" class="input" readonly rows="3" dir="ltr"></textarea>
         <button class="btn primary" id="qrCopy" data-i18n="qr.copy">کپی لینک</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- a routing profile's or a chain's share link: the warning first, then the QR and the text -->
+  <div class="modal-overlay" id="rpShareModal" hidden>
+    <div class="modal modal-sm">
+      <div class="modal-head">
+        <span class="modal-title" id="rpShareTitle" data-i18n="rp.shareTitle">اشتراک روتینگ</span>
+        <button class="tb-btn" id="rpShareClose">&#x2715;</button>
+      </div>
+      <div class="modal-body qr-body">
+        <p class="hint rp-share-warn" id="rpShareWarn"></p>
+        <div id="rpShareQr" class="qr-image"></div>
+        <textarea id="rpShareLink" class="input" readonly rows="3" dir="ltr"></textarea>
+        <button class="btn primary" id="rpShareCopy" data-i18n="qr.copy">کپی لینک</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- an irnetfree://routing/ link pasted or added: what it holds, before anything is written -->
+  <div class="modal-overlay" id="rpImportModal" hidden>
+    <div class="modal modal-sm">
+      <div class="modal-head">
+        <span class="modal-title" data-i18n="rp.importTitle">وارد کردن روتینگ</span>
+        <button class="tb-btn" id="rpImportClose">&#x2715;</button>
+      </div>
+      <div class="modal-body">
+        <div class="rp-im-sum" id="rpImportSum"></div>
+        <p class="hint" data-i18n="rp.importNote">سرورهایی که از قبل داری دوباره استفاده می‌شوند؛ سرورهای تازه به‌صورت دستی (بدون اشتراک) اضافه می‌شوند. روتینگ به‌عنوان یک روتینگ تازه اضافه می‌شود.</p>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" id="rpImportGo" data-i18n="btn.import">وارد کردن</button>
+        <button class="btn ghost" id="rpImportCancel" data-i18n="btn.cancel">انصراف</button>
       </div>
     </div>
   </div>
@@ -1978,6 +2214,8 @@
   <script src="i18n.js"></script>
   <script src="diagnostics.js"></script>
   <script src="settingsExperience.js"></script>
+  <script src="corePicker.js"></script>
+  <script src="serverFields.js"></script>
   <script src="plus/xserver.i18n.js"></script><!-- plus -->
   <script src="plus/scan.i18n.js"></script><!-- plus -->
   <script src="app.js"></script>

@@ -47,6 +47,8 @@
     addServer: (link) => invoke('servers:add', link),
     addWireguard: (fields) => invoke('servers:addWireguard', fields),
     addProxy: (fields) => invoke('servers:addProxy', fields),
+    createServer: (fields) => invoke('servers:create', fields),
+    addWarp: (args) => invoke('servers:addWarp', args),
     pickWireguardConf: () => invoke('wg:pickConf'),
     parseWireguardConf: (text) => invoke('wg:parseConf', text),
     updateServer: (id, fields) => invoke('servers:update', { id, fields }),
@@ -54,6 +56,7 @@
     clearServers: () => invoke('servers:clear'),
     listServers: () => invoke('servers:list'),
     serverLink: (id) => invoke('servers:link', id),
+    setSelection: (id) => invoke('selection:set', id),
 
     // chains
     getChain: () => invoke('chain:get'),
@@ -64,6 +67,14 @@
     // proxy pool
     listPool: () => invoke('pool:list'),
     setPool: (entries) => invoke('pool:set', entries),
+
+    // routing profiles (several advanced routings, a base per target) and their share links
+    routingProfiles: () => invoke('routing:profiles'),
+    setRoutingProfiles: (profiles) => invoke('routing:setProfiles', profiles),
+    shareRoutingProfile: (id) => invoke('routing:shareProfile', id),
+    shareChain: (id) => invoke('routing:shareChain', id),
+    routingImportPreview: (text) => invoke('routing:importPreview', text),
+    routingImport: (text) => invoke('routing:import', text),
 
     // subscriptions
     listSubs: () => invoke('subs:list'),
@@ -103,6 +114,9 @@
     assetsStatus: () => invoke('assets:status'),
     downloadAsset: (component) => invoke('assets:download', component),
     removeAssets: () => invoke('assets:remove'),
+    // the version picker: a core's releases ({ prerelease, force }), and one installed by its tag
+    coreVersions: (component, opts) => invoke('cores:versions', Object.assign({}, opts, { component })),
+    installCoreVersion: (component, tag) => invoke('cores:install', { component, tag }),
 
     // process routing
     listProcesses: () => invoke('proc:list'),
@@ -172,6 +186,8 @@
     onAssetProgress: (cb) => on('asset-progress', cb),
     onKillSwitch: (cb) => on('killswitch', cb),
     onSystemTheme: (cb) => on('system-theme', cb),
-    onStoreError: (cb) => on('store-error', cb)
+    onStoreError: (cb) => on('store-error', cb),
+    // the connection as one fact — the first event of every events (re)connect
+    onConnSnapshot: (cb) => on('conn:snapshot', cb)
   };
 })();

@@ -67,6 +67,8 @@
   --danger: #ff6b6b;
   --okSoft: rgba(74, 222, 155, .13);
   --dangerSoft: rgba(255, 107, 107, .13);
+  --warnSoft: rgba(224, 176, 96, .13);
+  --infoSoft: rgba(156, 200, 255, .12);
   --shadow: 0 24px 60px rgba(0, 0, 0, .5);
   /* what dims the page behind anything modal — .modal-overlay and a <dialog>'s
      ::backdrop, which cannot share a class but must look like one thing */
@@ -110,6 +112,8 @@
   --danger: #c0392b;
   --okSoft: rgba(15, 125, 82, .12);
   --dangerSoft: rgba(192, 57, 43, .10);
+  --warnSoft: rgba(138, 94, 15, .10);
+  --infoSoft: rgba(37, 95, 174, .10);
   --shadow: 0 20px 46px rgba(20, 30, 40, .13);
 }
 
@@ -173,6 +177,18 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
   user-select: none;
 }
 .tb-left { display: flex; align-items: center; gap: 10px; }
+/* the logo with the version under it: one column, centred on the logo, and
+   no taller than the bar (18 + 2 + 9 in every skin's 46px) */
+.tb-brand { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; }
+.tb-ver {
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: .02em;
+  color: var(--ink3);
+  white-space: nowrap;
+}
+.tb-ver:empty { display: none; }
 .tb-logo-wrap { position: relative; display: inline-flex; }
 .tb-logo { width: 18px; height: 18px; border-radius: var(--r2); display: block; }
 .tb-logo-badge {
@@ -506,6 +522,10 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
   margin-bottom: 7px;
 }
 .hint { font-size: 12px; line-height: 1.7; color: var(--ink3); margin: 6px 0 0; }
+/* a link inside a hint (the router's remote-access pointer): the theme's accent,
+   not the browser's dark blue on a dark panel */
+.hint a { color: var(--accentInk); text-decoration: underline; text-underline-offset: 2px; }
+.hint a:hover { text-decoration-thickness: 2px; }
 .small { font-size: 11px; }
 .empty {
   color: var(--dim);
@@ -618,6 +638,8 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
 .proto-shadowsocks { color: var(--ok); }
 .proto-socks, .proto-http { color: var(--ink3); }
 .proto-wireguard { color: var(--ok); border-color: var(--okSoft); background: var(--okSoft); }
+.proto-hysteria2 { color: var(--info); border-color: var(--infoSoft); background: var(--infoSoft); }
+.proto-masque { color: var(--accentInk); border-color: var(--accentLine); background: var(--accentSoft); }
 .proto-chain, .proto-pool, .proto-advanced { color: var(--info); }
 .proto-auto { color: var(--ok); }   /* the picker's "fastest server" action */
 
@@ -658,6 +680,14 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
 .ins-val.on { color: var(--ok); }
 .ins-val.off { color: var(--dim); }
 .ins-val.accent { color: var(--accentInk); }
+/* A value that is words, not a number or a port: it reads in the page's own
+   direction and font (the router's gateway row is Persian on a Persian page). */
+.ins-val.ins-text { direction: inherit; font-family: var(--ui); text-align: end; }
+/* A row that is a button (the router's gateway row opens the device list): it
+   lays out exactly like the rows around it, and its label shows it can be asked. */
+button.ins-row { width: 100%; padding: 0; text-align: start; }
+button.ins-row .ins-label { text-decoration: underline dotted; text-underline-offset: 3px; white-space: nowrap; }
+button.ins-row:hover .ins-label { color: var(--accentInk); }
 .ins-div { height: 1px; background: var(--line); }
 .ins-actions { display: flex; flex-direction: column; gap: 8px; }
 .ins-actions .btn { width: 100%; justify-content: center; text-align: center; }
@@ -752,10 +782,16 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
 .mode-option.disabled { opacity: .55; }
 .mode-option.disabled:hover { border-color: var(--softline); }
 
+/* Centred on the physical left edge, like the banner stack: translateX is
+   always physical, and a logical inset-inline-start: 50% is the RIGHT edge in
+   Persian — a long toast then started half its width off the window's left
+   side (measured: left -270 px at 1080x720, -225 px at 900x600;
+   tests/bannerLayout.test.js renders it). */
 .toast {
   position: fixed;
   inset-block-end: 22px;
-  inset-inline-start: 50%;
+  left: 50%;
+  right: auto;
   transform: translateX(-50%) translateY(12px);
   z-index: 200;
   padding: 11px 18px;
@@ -775,20 +811,61 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
 .toast.ok { border-color: var(--ok); color: var(--ok); }
 .toast.err { border-color: var(--danger); color: var(--danger); }
 .toast.warn { border-color: var(--warn); color: var(--warn); }
-
-.kill-banner, .pending-banner {
+/* A toast with a button (toastAction): clickable only while it shows, and the
+   message and its action sit on one line. Centred like every toast (above). */
+.toast.has-action.show { pointer-events: auto; }
+.toast.has-action {
   display: flex;
   align-items: center;
   gap: 12px;
+  text-align: start;
+}
+.toast-action { flex: 0 0 auto; }
+
+/* The banners (kill switch, held DNS, unapplied settings, the logon task) float
+   in one stack over the window's foot, centred, above the toast's resting
+   place. They must be fixed: html/body never scroll and .layout fills the
+   window, so a banner in the flow after it lies just below the screen — where
+   all four sat, unseen, from the 52ac922 redesign to v1.16.3
+   (tests/bannerLayout.test.js renders it). Shown together they stack in markup
+   order; the stack itself takes no clicks, so the empty stack is not a dead
+   zone over the page. Over the pages and their menus, under the modals and the
+   toast. */
+.banner-stack {
+  position: fixed;
+  left: 50%;
+  bottom: 70px;
+  transform: translateX(-50%);
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: max-content;
+  max-width: min(640px, calc(100vw - 24px));
+  max-height: calc(100vh - var(--tbh) - 86px);
+  overflow-y: auto;
+  pointer-events: none;
+}
+.banner-stack > * { pointer-events: auto; }
+.kill-banner, .pending-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px 12px;
   padding: 12px 15px;
   border-radius: var(--r5);
-  margin-bottom: 14px;
   font-size: 12px;
+  box-shadow: var(--shadow);
 }
-.kill-banner { background: var(--dangerSoft); border: 1px solid var(--danger); color: var(--danger); }
-.pending-banner { background: var(--accentSoft); border: 1px solid var(--accentLine); color: var(--accentInk); }
-.kill-banner-text, .pending-banner-text { flex: 1; line-height: 1.7; }
-.kill-banner-actions, .pending-banner-actions { display: flex; gap: 8px; }
+/* the soft tints are translucent: over the page they sit on the opaque panel */
+.kill-banner { background: linear-gradient(var(--dangerSoft), var(--dangerSoft)), var(--panel); border: 1px solid var(--danger); color: var(--danger); }
+.pending-banner { background: linear-gradient(var(--accentSoft), var(--accentSoft)), var(--panel); border: 1px solid var(--accentLine); color: var(--accentInk); }
+/* a long path (the logon-task banner names two) wraps instead of running off the side */
+.kill-banner-text, .pending-banner-text { flex: 1 1 auto; min-width: 0; line-height: 1.7; overflow-wrap: anywhere; }
+.kill-banner-actions, .pending-banner-actions { display: flex; gap: 8px; flex: 0 0 auto; margin-inline-start: auto; }
+/* a phone (the router's page): the buttons go under the text rather than squeeze it */
+@media (max-width: 560px) {
+  .kill-banner, .pending-banner { flex-wrap: wrap; }
+}
 
 /* ----------------------------- simple / advanced ----------------------------- */
 

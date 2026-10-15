@@ -38,15 +38,24 @@ object ConfigBuilder {
      *
      * `inboundAuth`: the session's username/password for socks-in and http-in
      * (the pool's own ps-/ph- ports stay open — exposing them is that feature).
+     *
+     * `lan`: LAN sharing (LanShare) — when enabled, two more inbounds on every
+     * interface, routed by the very rules the tunnel's traffic takes; the only
+     * rule of their own keeps them off the phone's loopback (lanGuardRules).
+     *
+     * `muxIds`: the servers whose outbounds carry Xray's mux (Mux.kt — Settings
+     * → Mux, and in auto each server's own test, decided by the connect path).
+     * Only a non-chain target's outbound, and only one that can carry it
+     * (Mux.eligible); a chain's hops never. Empty: the config of before, byte
+     * for byte.
      */
-    fun build(plan: ConnectionPlan, s: AppSettings, geoAssets: Boolean = false, wgEndpointIps: Map<String, String> = emptyMap(), inboundAuth: LocalAuth? = null): JSONObject {
+    fun build(plan: ConnectionPlan, s: AppSettings, geoAssets: Boolean = false, wgEndpointIps: Map<String, String> = emptyMap(), inboundAuth: LocalAuth? = null, lan: LanShare? = null, muxIds: Set<String> = emptySet()): JSONObject {
         val listen = "127.0.0.1"
-        val sniffing = if (s.enableSniffing)
-            JSONObject().put("enabled", true).put("destOverride", JSONArray().put("http").put("tls").put("quic")).put("routeOnly", false)
-        else JSONObject().put("enabled", false)
+        val sniffing = sniffingFor(s)
+        val share = lan?.takeIf { it.enabled }
 
-        if (plan is ConnectionPlan.Pool) return buildPool(plan, s, listen, sniffing, geoAssets, wgEndpointIps, inboundAuth)
-        if (plan is ConnectionPlan.Advanced) return buildAdvanced(plan, s, listen, sniffing, geoAssets, wgEndpointIps, inboundAuth)
+        if (plan is ConnectionPlan.Pool) return buildPool(plan, s, listen, sniffing, geoAssets, wgEndpointIps, inboundAuth, share, muxIds)
+        if (plan is ConnectionPlan.Advanced) return buildAdvanced(plan, s, listen, sniffing, geoAssets, wgEndpointIps, inboundAuth, share, muxIds)
 
         val outbounds = JSONArray()
         // Every target the plan routes to, with its outbound tag — the resolver a
@@ -54,7 +63,10 @@ object ConfigBuilder {
         val targets = ArrayList<Pair<Any?, String>>()
         when (plan) {
             is ConnectionPlan.Chain -> { buildChainOutbounds(plan.members, "proxy").forEach { outbounds.put(it) }; targets.add(plan.members to "proxy") }
-            is ConnectionPlan.Single -> { outbounds.put(cloneOut(plan.server.outbound, "proxy", plan.server)); targets.add(plan.server to "proxy") }
+            is ConnectionPlan.Single -> {
+                withHelpers(withMux(cloneOut(plan.server.outbound, "proxy", plan.server), plan.server, muxIds), plan.server, "proxy").forEach { o: JSONObject -> outbounds.put(o) }
+                targets.add(plan.server to "proxy")
+            }
             else -> {}
         }
         outbounds.put(freedom(s)).put(blackhole())
@@ -83,8 +95,10 @@ object ConfigBuilder {
         // The resolver's exit follows the catch-all; a chain / single plan never
         // applies advanced rules, so the DNS plan sees `advancedRouting: false`.
         val dnsSettings = s.copy(advancedRouting = false)
-        return assemble(s, standardInbounds(s, listen, sniffing, inboundAuth), outbounds, rules,
-            geoAssets, catchAllTag, dnsSettings, targetResolversFor(targets), wgEndpointIps)
+        val inbounds = standardInbounds(s, listen, sniffing, inboundAuth)
+        val lanTags = addLanInbounds(inbounds, share, sniffing, setOf(s.socksPort, s.httpPort))
+        return assemble(s, inbounds, outbounds, rules,
+            geoAssets, catchAllTag, dnsSettings, targetResolversFor(targets), wgEndpointIps, lanTags)
     }
 
     /**
@@ -104,8 +118,33 @@ object ConfigBuilder {
 
     /* ----------------------------- advanced ----------------------------- */
 
-    private fun buildAdvanced(plan: ConnectionPlan.Advanced, s: AppSettings, listen: String, sniffing: JSONObject, geo: Boolean, wgEndpointIps: Map<String, String>, auth: LocalAuth?): JSONObject {
-        val reg = Registry(plan.serversById, plan.chainsById)
+    /** The default carries everything no rule claims: gone, there is nothing honest to send it to (configBuilder.js). */
+    const val MISSING_DEFAULT = "Advanced routing: the default target no longer exists (it was removed, or replaced by a subscription update) — choose a new default under Routing."
+    /** A base a target rides on is gone: connecting through nothing would leave in the clear. */
+    const val MISSING_BASE = "Advanced routing: a base this profile goes through no longer exists (a server removed or replaced by a subscription update, or a chain left empty) — choose another base under Routing."
+
+    /**
+     * A routing profile's config ("via a base", RoutingProfiles.kt). A target
+     * with a via gets an outbound of its own, `out-<id>@<baseKey>` (a chain:
+     * `out-chain-<cid>@<baseKey>` and its hops), whose self-dialing outbound
+     * dials the base's exit; each base is one outbound group (`base-<id>`, or
+     * `base-chain-<cid>` with hops `base-chain-<cid>-h<i>`), shared by every
+     * target through it. Mux stays on direct server targets only. Without a
+     * via anywhere, the config of before, byte for byte.
+     *
+     * Refuses (IllegalStateException, said to the user as it is) a default
+     * that no longer exists and a base that no longer exists. A rule whose
+     * target is gone is left out — its traffic follows the default, as on the
+     * desktop; Android used to send it `direct` without a word.
+     */
+    private fun buildAdvanced(plan: ConnectionPlan.Advanced, s0: AppSettings, listen: String, sniffing: JSONObject, geo: Boolean, wgEndpointIps: Map<String, String>, auth: LocalAuth?, lan: LanShare?, muxIds: Set<String>): JSONObject {
+        // the profile's own "routing mode under these rules"; a plan without one uses the settings'
+        val um = plan.useMode
+        val s = if (um != null && um != s0.advancedUseMode) s0.copy(advancedUseMode = um) else s0
+        val reg = Registry(plan.serversById, plan.chainsById, muxIds, RoutingProfiles.basesOf(plan).toSet())
+        if (!reg.exists(plan.def)) throw IllegalStateException(MISSING_DEFAULT)
+        val defVia = RoutingProfiles.effectiveVia(plan.def, plan.defVia, plan.base)
+        if (defVia != null && !reg.exists(defVia)) throw IllegalStateException(ConfigBuilder.MISSING_BASE)
         val advRules = JSONArray()
         val targets = ArrayList<Pair<Any?, String>>()
         for (r in plan.rules) {
@@ -130,16 +169,24 @@ object ConfigBuilder {
                 else -> continue
             }
 
+            // A rule to a target that no longer exists is left out: its traffic
+            // then follows the default like everything else no rule claims.
+            if (!reg.exists(r.target)) continue
+            // ...but a base that is gone refuses the connect: the target would
+            // otherwise be dialled from here, which is what the base was for.
+            val via = RoutingProfiles.effectiveVia(r.target, r.via, plan.base)
+            if (via != null && !reg.exists(via)) throw IllegalStateException(ConfigBuilder.MISSING_BASE)
+
             // Resolve the target only once the rule is known to survive: tagFor()
             // REGISTERS the outbound(s), so doing it earlier leaves a dead outbound
             // behind for every dropped rule — writing an unused server's address and
             // credentials into the config (and materializing a whole chain for a
             // "chain:" target). Mirrors configBuilder.js.
-            val tag = reg.tagFor(r.target)
+            val tag = if (via == null) reg.tagFor(r.target) else reg.tagVia(r.target, via)
             advRules.put(fieldRule().put("outboundTag", tag).put(ruleField, ruleValue))
             targets.add(targetServer(r.target, plan) to tag)
         }
-        val defTag = reg.tagFor(plan.def)
+        val defTag = if (defVia == null) reg.tagFor(plan.def) else reg.tagVia(plan.def, defVia)
         targets.add(targetServer(plan.def, plan) to defTag)
         // The resolver's exit. A `block` default is a legitimate allow-list, but
         // the blackhole can never answer a DoH query: use the first proxy the
@@ -164,14 +211,16 @@ object ConfigBuilder {
         rules.put(fieldRule().put("port", "0-65535").put("outboundTag", defTag))
 
         val dnsSettings = s.copy(advancedRouting = true, routeRules = plan.rules)
-        return assemble(s, standardInbounds(s, listen, sniffing, auth), JSONArray(reg.outs), rules,
-            geo, exitTag, dnsSettings, targetResolversFor(targets), wgEndpointIps)
+        val inbounds = standardInbounds(s, listen, sniffing, auth)
+        val lanTags = addLanInbounds(inbounds, lan, sniffing, setOf(s.socksPort, s.httpPort))
+        return assemble(s, inbounds, JSONArray(reg.outs), rules,
+            geo, exitTag, dnsSettings, targetResolversFor(targets), wgEndpointIps, lanTags)
     }
 
     /* ----------------------------- pool ----------------------------- */
 
-    private fun buildPool(plan: ConnectionPlan.Pool, s: AppSettings, listen: String, sniffing: JSONObject, geo: Boolean, wgEndpointIps: Map<String, String>, auth: LocalAuth?): JSONObject {
-        val reg = Registry(plan.serversById, plan.chainsById)
+    private fun buildPool(plan: ConnectionPlan.Pool, s: AppSettings, listen: String, sniffing: JSONObject, geo: Boolean, wgEndpointIps: Map<String, String>, auth: LocalAuth?, lan: LanShare?, muxIds: Set<String>): JSONObject {
+        val reg = Registry(plan.serversById, plan.chainsById, muxIds)
         val inbounds = JSONArray()
         // apiPort stays reserved although this config no longer opens the
         // metrics listener on it: the settings screen still counts it as taken,
@@ -192,6 +241,12 @@ object ConfigBuilder {
         val stdTags = ArrayList<String>()
         if (addInbound("socks-in", s.socksPort, false, auth)) stdTags.add("socks-in")
         if (addInbound("http-in", s.httpPort, true, auth)) stdTags.add("http-in")
+        // LAN sharing goes where the tunnel's own traffic goes: the primary exit.
+        // Its ports are claimed after the tunnel's and before the entries', so a
+        // pool entry sitting on one loses it (LanShare.problem keeps them apart).
+        val lanTags = addLanInbounds(inbounds, lan, sniffing, used)
+        used.addAll(lanPorts(lan, lanTags))
+        stdTags.addAll(lanTags)
         if (stdTags.isNotEmpty()) perInbound.put(rule(stdTags, primaryTag))
 
         for (e in plan.entries) {
@@ -214,37 +269,92 @@ object ConfigBuilder {
         // Pool emits no bypass rules, so an in-country resolver would only hand
         // the primary exit an Iranian IP to dial from abroad — routingMode is not its.
         val dnsSettings = s.copy(advancedRouting = false, routingMode = "global")
-        return assemble(s, inbounds, JSONArray(reg.outs), rules, geo, primaryTag, dnsSettings, targetResolversFor(targets), wgEndpointIps)
+        return assemble(s, inbounds, JSONArray(reg.outs), rules, geo, primaryTag, dnsSettings, targetResolversFor(targets), wgEndpointIps, lanTags)
     }
 
     /* ----------------------------- chain / registry ----------------------------- */
 
-    private fun buildChainOutbounds(members: List<ServerConfig>, exitTag: String): List<JSONObject> {
+    /**
+     * [firstVia]: the tag the first hop dials through (a chain riding on a
+     * base) — it then loses its own dialer and helpers like any later hop.
+     * null: the first hop dials by itself, as always.
+     */
+    private fun buildChainOutbounds(members: List<ServerConfig>, exitTag: String, firstVia: String? = null): List<JSONObject> {
         val list = members.filter { it.outbound.length() > 0 }
         val last = list.size - 1
         val outs = ArrayList<JSONObject>()
         for (i in 0..last) {
             val tag = if (i == last) exitTag else "$exitTag-h$i"
             val ob = cloneOut(list[i].outbound, tag, list[i])
-            if (i > 0) dialThrough(ob, "$exitTag-h${i - 1}")
-            outs.add(ob)
+            val dialVia = if (i > 0) "$exitTag-h${i - 1}" else firstVia
+            if (dialVia != null) {
+                // A JSON server behind another hop dials through that hop: its
+                // own way to its helpers (proxySettings, its dialerProxy) goes,
+                // and so do the helpers — nothing else uses them.
+                if (list[i].isJson) ob.remove("proxySettings")
+                dialThrough(ob, dialVia)
+                outs.add(ob)
+            } else {
+                outs.addAll(withHelpers(ob, list[i], tag))
+            }
         }
         return outs
     }
 
+    /**
+     * [server]'s outbound tagged [tag], dialling through [via] (a base's exit):
+     * a JSON server's own helper dialer is replaced and its helpers left out,
+     * as for a chain's later hop. Never mux.
+     */
+    private fun throughBase(server: ServerConfig, tag: String, via: String): JSONObject {
+        val ob = cloneOut(server.outbound, tag, server)
+        if (server.isJson) ob.remove("proxySettings")
+        dialThrough(ob, via)
+        return ob
+    }
+
+    /**
+     * The outbounds a pool / advanced plan routes to, each once; [muxIds] as in
+     * build(). [bases]: what the plan rides on (RoutingProfiles.basesOf) — a
+     * target among them that carries a WireGuard is a freedom through the
+     * base's exit ([exitAtBase]): two outbounds would be two sessions on one
+     * key, and the peer keeps only the newest. (configBuilder.js makeRegistry)
+     */
     private class Registry(
         val serversById: Map<String, ServerConfig>,
-        val chainsById: Map<String, List<ServerConfig>>
+        val chainsById: Map<String, List<ServerConfig>>,
+        val muxIds: Set<String> = emptySet(),
+        val bases: Set<String> = emptySet()
     ) {
         val outs = ArrayList<JSONObject>()
         private val seen = HashSet<String>()
         fun add(o: JSONObject) { val t = o.optString("tag"); if (t.isNotEmpty() && seen.add(t)) outs.add(o) }
 
+        /** The servers [target] dials: a server, a chain's members. */
+        private fun members(target: String): List<ServerConfig> {
+            if (target.startsWith("chain:")) return chainsById[target.substring(6)] ?: emptyList()
+            val s = serversById[target]
+            return if (s == null) emptyList() else listOf(s)
+        }
+
+        private fun sharesBase(target: String): Boolean =
+            bases.contains(target) && members(target).any { m: ServerConfig -> m.outbound.length() > 0 && ConfigBuilder.isWgServer(m) }
+
+        /** [target] is its own base's WireGuard: a freedom out through the base's exit, its own [tag] kept. */
+        private fun exitAtBase(target: String, tag: String): String {
+            val exit = baseTag(target)
+            if (!seen.contains(tag)) {
+                add(JSONObject().put("tag", tag).put("protocol", "freedom").put("settings", JSONObject())
+                    .put("streamSettings", JSONObject().put("sockopt", JSONObject().put("dialerProxy", exit))))
+            }
+            return tag
+        }
+
         private fun chainTag(list: List<ServerConfig>?, tag: String): String {
             val arr = list?.filter { it.outbound.length() > 0 } ?: emptyList()
             return when {
                 arr.size >= 2 -> { ConfigBuilder.buildChainOutbounds(arr, tag).forEach { add(it) }; tag }
-                arr.size == 1 -> { add(ConfigBuilder.cloneOut(arr[0].outbound, tag, arr[0])); tag }
+                arr.size == 1 -> { ConfigBuilder.withHelpers(ConfigBuilder.cloneOut(arr[0].outbound, tag, arr[0]), arr[0], tag).forEach { o: JSONObject -> add(o) }; tag }
                 else -> "direct"
             }
         }
@@ -253,9 +363,17 @@ object ConfigBuilder {
             if (target.isNullOrEmpty() || target == "direct") return "direct"
             if (target == "proxy") return proxyFallback()
             if (target == "block") return "block"
-            if (target.startsWith("chain:")) return chainTag(chainsById[target.substring(6)], "out-chain-" + target.substring(6))
+            if (target.startsWith("chain:")) {
+                val tag = "out-chain-" + target.substring(6)
+                return if (sharesBase(target)) exitAtBase(target, tag) else chainTag(chainsById[target.substring(6)], tag)
+            }
             val s = serversById[target]
-            if (s != null && s.outbound.length() > 0) { val tag = "out-$target"; add(ConfigBuilder.cloneOut(s.outbound, tag, s)); return tag }
+            if (s != null && s.outbound.length() > 0 && sharesBase(target)) return exitAtBase(target, "out-$target")
+            if (s != null && s.outbound.length() > 0) {
+                val tag = "out-$target"
+                ConfigBuilder.withHelpers(ConfigBuilder.withMux(ConfigBuilder.cloneOut(s.outbound, tag, s), s, muxIds), s, tag).forEach { o: JSONObject -> add(o) }
+                return tag
+            }
             return "direct"
         }
 
@@ -263,7 +381,72 @@ object ConfigBuilder {
         private fun proxyFallback(): String {
             val first = serversById.values.firstOrNull { it.outbound.length() > 0 } ?: return "direct"
             val tag = "out-proxy"
-            if (!seen.contains(tag)) add(ConfigBuilder.cloneOut(first.outbound, tag, first))
+            if (!seen.contains(tag)) {
+                ConfigBuilder.withHelpers(ConfigBuilder.withMux(ConfigBuilder.cloneOut(first.outbound, tag, first), first, muxIds), first, tag).forEach { o: JSONObject -> add(o) }
+            }
+            return tag
+        }
+
+        /**
+         * Does the target still name something? A server deleted (or replaced
+         * by a subscription refresh), a chain removed or left with no members:
+         * tagFor() would send that `direct`. An empty target is the user's own
+         * "not routed anywhere"; a literal 'proxy' is whichever server is first
+         * (direct with none at all, as it always was). (configBuilder.js exists)
+         */
+        fun exists(target: String?): Boolean {
+            if (target.isNullOrEmpty() || target == "direct" || target == "block" || target == "proxy") return true
+            if (target.startsWith("chain:")) return (chainsById[target.substring(6)]?.count { it.outbound.length() > 0 } ?: 0) > 0
+            val s = serversById[target]
+            return s != null && s.outbound.length() > 0
+        }
+
+        /** `<baseKey>`: the base's server id, or `chain-<cid>`. */
+        private fun baseKey(via: String): String = if (via.startsWith("chain:")) "chain-" + via.substring(6) else via
+
+        /**
+         * The base [via]'s outbound group, registered once and shared by every
+         * target through it; its exit tag. A server: `base-<id>` (a JSON
+         * server with its helpers). A chain: hops `base-chain-<cid>-h<i>`, exit
+         * `base-chain-<cid>`. Never mux. A base that is gone refuses.
+         */
+        fun baseTag(via: String): String {
+            if (via.startsWith("chain:")) {
+                val cid = via.substring(6)
+                val tag = "base-chain-$cid"
+                val arr = chainsById[cid]?.filter { it.outbound.length() > 0 } ?: emptyList()
+                if (arr.isEmpty()) throw IllegalStateException(ConfigBuilder.MISSING_BASE)
+                if (!seen.contains(tag)) ConfigBuilder.buildChainOutbounds(arr, tag).forEach { o: JSONObject -> add(o) }
+                return tag
+            }
+            val s = serversById[via]
+            if (s == null || s.outbound.length() == 0) throw IllegalStateException(ConfigBuilder.MISSING_BASE)
+            val tag = "base-$via"
+            if (!seen.contains(tag)) ConfigBuilder.withHelpers(ConfigBuilder.cloneOut(s.outbound, tag, s), s, tag).forEach { o: JSONObject -> add(o) }
+            return tag
+        }
+
+        /**
+         * [target] riding on the base [via]: `out-<id>@<baseKey>` (a chain:
+         * `out-chain-<cid>@<baseKey>` with hops `…-h<i>`), its self-dialing
+         * outbound — the server's own, the chain's first hop — dialling the
+         * base's exit. The same target without a via keeps its own `out-<id>`.
+         */
+        fun tagVia(target: String, via: String): String {
+            val exit = baseTag(via)
+            val key = baseKey(via)
+            if (target.startsWith("chain:")) {
+                val cid = target.substring(6)
+                val arr = chainsById[cid]?.filter { it.outbound.length() > 0 } ?: emptyList()
+                if (arr.isEmpty()) return "direct"   // exists() has said otherwise already
+                val tag = "out-chain-$cid@$key"
+                if (!seen.contains(tag)) ConfigBuilder.buildChainOutbounds(arr, tag, exit).forEach { o: JSONObject -> add(o) }
+                return tag
+            }
+            val s = if (target == "proxy") serversById.values.firstOrNull { it.outbound.length() > 0 } else serversById[target]
+            if (s == null || s.outbound.length() == 0) return "direct"
+            val tag = "out-$target@$key"
+            if (!seen.contains(tag)) add(ConfigBuilder.throughBase(s, tag, exit))
             return tag
         }
     }
@@ -353,13 +536,19 @@ object ConfigBuilder {
      */
     fun wgEndpointHosts(plan: ConnectionPlan): List<String> {
         val out = ArrayList<String>()
-        fun visit(s: ServerConfig?) {
-            if (s == null || s.outbound.optString("protocol") != "wireguard") return
-            val peers = s.outbound.optJSONObject("settings")?.optJSONArray("peers") ?: return
+        fun visitOut(o: JSONObject) {
+            if (o.optString("protocol") != "wireguard") return
+            val peers = o.optJSONObject("settings")?.optJSONArray("peers") ?: return
             for (i in 0 until peers.length()) {
                 val ep = splitEndpoint(peers.optJSONObject(i)?.optString("endpoint")) ?: continue
                 if (!DnsPlan.isIp(ep.first) && ep.first !in out) out.add(ep.first)
             }
+        }
+        // a JSON server's helpers dial too (a WireGuard hop of its own)
+        fun visit(s: ServerConfig?) {
+            if (s == null) return
+            visitOut(s.outbound)
+            if (s.isJson) s.extraOutbounds.forEach { h: JSONObject -> visitOut(h) }
         }
         when (plan) {
             is ConnectionPlan.Single -> visit(plan.server)
@@ -443,6 +632,40 @@ object ConfigBuilder {
             .put("protocol", "http").put("settings", settings).put("sniffing", sniffing)
     }
 
+    /**
+     * LAN sharing's two inbounds (LanShare): on every interface, with the
+     * share's own credentials when it asks for them, sniffing like the tunnel's.
+     * A port already [taken] by this config is skipped rather than written
+     * twice — a config the core would refuse whole. The tags that went in.
+     */
+    private fun addLanInbounds(inbounds: JSONArray, lan: LanShare?, sniffing: JSONObject, taken: Set<Int>): List<String> {
+        if (lan == null || !lan.enabled) return emptyList()
+        val a = if (lan.auth) LocalAuth(lan.user, lan.pass) else null
+        val tags = ArrayList<String>()
+        if (lan.socksPort !in taken) { inbounds.put(socksInbound(LanShare.SOCKS_TAG, lan.socksPort, LanShare.LISTEN, sniffing, a)); tags.add(LanShare.SOCKS_TAG) }
+        if (lan.httpPort !in taken && lan.httpPort != lan.socksPort) { inbounds.put(httpInbound(LanShare.HTTP_TAG, lan.httpPort, LanShare.LISTEN, sniffing, a)); tags.add(LanShare.HTTP_TAG) }
+        return tags
+    }
+
+    private fun lanPorts(lan: LanShare?, tags: List<String>): List<Int> = if (lan == null) emptyList() else buildList {
+        if (LanShare.SOCKS_TAG in tags) add(lan.socksPort)
+        if (LanShare.HTTP_TAG in tags) add(lan.httpPort)
+    }
+
+    /** The phone's own loopback, as a destination. */
+    val LOOPBACK = listOf("127.0.0.0/8", "0.0.0.0/8", "::1/128")
+
+    /**
+     * The one routing difference LAN sharing has from the tunnel: nothing that
+     * comes in from the network reaches the PHONE's own loopback — the tunnel's
+     * inbounds, the pool's open ports, other apps' local servers. The tunnel's
+     * traffic cannot get there either (loopback never enters the TUN); through
+     * the proxy it would, since private ranges go direct. First of all rules.
+     */
+    private fun lanGuardRules(tags: List<String>): List<JSONObject> = if (tags.isEmpty()) emptyList() else listOf(
+        fieldRule().put("inboundTag", JSONArray(tags)).put("ip", JSONArray(LOOPBACK)).put("outboundTag", "block"),
+        fieldRule().put("inboundTag", JSONArray(tags)).put("domain", JSONArray().put("domain:localhost")).put("outboundTag", "block"))
+
     // No metrics listener (the desktop's GET /debug/vars on apiPort): nothing on
     // Android reads it — the traffic figures come from hev — and it answered any
     // app on 127.0.0.1 with this tunnel's outbound tags and byte counts.
@@ -487,21 +710,27 @@ object ConfigBuilder {
     private fun applyCertPin(o: JSONObject, server: ServerConfig?) {
         val tls = o.optJSONObject("streamSettings")?.optJSONObject("tlsSettings") ?: return
         tls.remove("allowInsecure")
-        val pin = CertPin.normalizePin(server?.certPin)
-        if (pin.isNotEmpty()) tls.put("pinnedPeerCertSha256", pin)
+        // The link's own pins (`pcs`) and the one learnt on first use, together:
+        // the core accepts a certificate that matches any of them.
+        val pins = (tls.optString("pinnedPeerCertSha256").split(",") + listOf(server?.certPin ?: ""))
+            .map { CertPin.normalizePin(it) }.filter { it.isNotEmpty() }.distinct()
+        if (pins.isNotEmpty()) tls.put("pinnedPeerCertSha256", pins.joinToString(",")) else tls.remove("pinnedPeerCertSha256")
     }
 
     private fun assemble(
         s: AppSettings, inbounds: JSONArray, outboundsIn: JSONArray, rules: JSONArray,
         geoAssets: Boolean, exitTag: String, dnsSettings: AppSettings,
-        targetResolvers: List<DnsPlan.TargetResolver>, wgEndpointIps: Map<String, String>
+        targetResolvers: List<DnsPlan.TargetResolver>, wgEndpointIps: Map<String, String>,
+        lanTags: List<String> = emptyList()
     ): JSONObject {
         // Name resolution (see DnsPlan.kt). Its rules go FIRST: the port-53 hijack
         // must beat the private-IP bypass, or a query to the tunnel resolver would
-        // be sent "direct" into nowhere instead of being answered.
+        // be sent "direct" into nowhere instead of being answered. Only LAN
+        // sharing's loopback guard comes before them (it matches nothing else).
         val plan = DnsPlan.build(dnsSettings, geoAssets, exitTag, targetResolvers)
         plan.hijackOutbound?.let { outboundsIn.put(it) }
         val allRules = JSONArray()
+        lanGuardRules(lanTags).forEach { allRules.put(it) }
         plan.rules.forEach { allRules.put(it) }
         for (i in 0 until rules.length()) allRules.put(rules.getJSONObject(i))
 
@@ -542,11 +771,20 @@ object ConfigBuilder {
      * address the tester resolved (`wgEndpointIps`, XrayTester.testEndpoints):
      * the throwaway core shares the live tunnel's process, and one that has to
      * resolve the name itself and fails can panic it (`close of closed channel`).
+     *
+     * `mux`: the proxy outbound carries Mux.MUX (when it can) — only the mux
+     * test asks for it (XrayTester.probeMux); latency tests stay without.
      */
-    fun buildTestConfig(server: ServerConfig, socksPort: Int, wgEndpointIps: Map<String, String> = emptyMap()): JSONObject {
+    fun buildTestConfig(server: ServerConfig, socksPort: Int, wgEndpointIps: Map<String, String> = emptyMap(), mux: Boolean = false): JSONObject {
         val proxy = cloneOut(server.outbound, "proxy", server)
-        widenWgAllowedIps(proxy); sanitizeWgAddress(proxy); applyWgEndpointIps(proxy, wgEndpointIps)
-        val outs = applyFragments(JSONArray().put(proxy))
+        if (mux && Mux.eligible(proxy)) proxy.put("mux", Mux.MUX)
+        // a JSON server is measured in its full form: its helpers come along
+        val all = JSONArray()
+        for (o in withHelpers(proxy, server, "proxy")) {
+            widenWgAllowedIps(o); sanitizeWgAddress(o); applyWgEndpointIps(o, wgEndpointIps)
+            all.put(o)
+        }
+        val outs = applyFragments(all)
         outs.put(JSONObject().put("tag", "direct").put("protocol", "freedom"))
         return JSONObject()
             .put("log", JSONObject().put("loglevel", "none"))
@@ -558,16 +796,25 @@ object ConfigBuilder {
     /** DPI-evasion dialer: outbounds marked with `_fragment` (TLS fragmentation)
      *  and/or `_noise` (fake ClientHello / decoy packet injection) dial through a
      *  freedom outbound carrying the matching settings (skipping chain inner hops
-     *  that already dial-through). */
+     *  that already dial-through).
+     *
+     *  MASQUE dials TCP for HTTP/2 and QUIC (UDP) for HTTP/3: a fragment cuts
+     *  only the first, noise goes only before the second, so the one that would
+     *  do nothing is dropped (the editor drops it from the record too) — a record
+     *  left with neither dials directly (configBuilder.js applyFragments). */
     private fun applyFragments(outbounds: JSONArray): JSONArray {
         val byKey = HashMap<String, String>()
         val extra = JSONArray()
         for (i in 0 until outbounds.length()) {
             val o = outbounds.getJSONObject(i)
-            val frag = o.optString("_fragment", "")
-            val noise = o.optString("_noise", "")
+            var frag = o.optString("_fragment", "")
+            var noise = o.optString("_noise", "")
             if (frag.isEmpty() && noise.isEmpty()) continue
             o.remove("_fragment"); o.remove("_noise")
+            if (o.optString("protocol") == Masque.PROTOCOL) {
+                if (Masque.httpOf(o.optJSONObject("streamSettings")?.optJSONObject("tlsSettings")) == "h2") noise = "" else frag = ""
+                if (frag.isEmpty() && noise.isEmpty()) continue
+            }
             val ss = o.optJSONObject("streamSettings") ?: JSONObject().also { o.put("streamSettings", it) }
             val sockopt = ss.optJSONObject("sockopt") ?: JSONObject().also { ss.put("sockopt", it) }
             if (sockopt.has("dialerProxy")) continue
@@ -626,11 +873,86 @@ object ConfigBuilder {
         return "$min-$max"
     }
 
+    /* ----------------------------- JSON servers ----------------------------- */
+
+    /**
+     * [main] — a server's outbound, already tagged [tag] — with a JSON server's
+     * helper outbounds beside it (full mode): each helper's tag becomes
+     * `<tag>~<helper>`, and every dialerProxy / proxySettings.tag that named a
+     * helper is rewritten to match, so two JSON servers in one config never
+     * collide — a proxySettings as the dialerProxy the cores now take
+     * (proxySettingsToDialer). Like any outbound, a helper loses
+     * `allowInsecure`, which the cores refuse. Any other server: [main] alone,
+     * untouched. (configBuilder.js helpersFor)
+     */
+    private fun withHelpers(main: JSONObject, server: ServerConfig, tag: String): List<JSONObject> {
+        if (!server.isJson) return listOf(main)
+        proxySettingsToDialer(main)
+        if (server.extraOutbounds.isEmpty()) return listOf(main)
+        val names = server.extraOutbounds.map { h: JSONObject -> h.optString("tag") }.filter { t: String -> t.isNotEmpty() }.toSet()
+        val out = arrayListOf(main)
+        for (h0 in server.extraOutbounds) {
+            val own = h0.optString("tag")
+            if (own.isEmpty()) continue
+            val h = JSONObject(h0.toString()).put("tag", "$tag~$own")
+            applyCertPin(h, null)
+            proxySettingsToDialer(h)
+            out.add(h)
+        }
+        for (o in out) {
+            val so = o.optJSONObject("streamSettings")?.optJSONObject("sockopt")
+            val dialer = so?.optString("dialerProxy") ?: ""
+            if (so != null && dialer in names) so.put("dialerProxy", "$tag~$dialer")
+        }
+        return out
+    }
+
+    /**
+     * `proxySettings.tag` → `streamSettings.sockopt.dialerProxy`, in place. The
+     * 2026 cores (and PattN) refuse proxySettings at config load — "has been
+     * removed and migrated to streamSettings.sockopt.dialerProxy" — and a JSON
+     * config written for an older one still carries it (a chain's hop). A
+     * dialerProxy the outbound has already wins. Only a JSON server's outbounds
+     * ever carry it; the stored record keeps its config as written.
+     * (configBuilder.js proxySettingsToDialer)
+     */
+    private fun proxySettingsToDialer(o: JSONObject): JSONObject {
+        val ps = o.optJSONObject("proxySettings") ?: return o
+        val via = ps.optString("tag")
+        o.remove("proxySettings")
+        if (via.isNotEmpty()) {
+            val ss = o.optJSONObject("streamSettings") ?: JSONObject().also { o.put("streamSettings", it) }
+            val so = ss.optJSONObject("sockopt") ?: JSONObject().also { ss.put("sockopt", it) }
+            if (so.optString("dialerProxy").isEmpty()) so.put("dialerProxy", via)
+        }
+        return o
+    }
+
+    /** The local inbounds' sniffing, as Settings asks for it. */
+    private fun sniffingFor(s: AppSettings): JSONObject = if (s.enableSniffing)
+        JSONObject().put("enabled", true).put("destOverride", JSONArray().put("http").put("tls").put("quic")).put("routeOnly", false)
+    else JSONObject().put("enabled", false)
+
     private fun jarr(a: JSONArray?): List<String> = if (a == null) emptyList() else (0 until a.length()).map { a.optString(it) }
     /** A server's outbound as the config will carry it: a deep copy, tagged, its certificate pin applied. */
     private fun cloneOut(outbound: JSONObject, tag: String, server: ServerConfig?): JSONObject {
         val o = JSONObject(outbound.toString()).put("tag", tag)
         applyCertPin(o, server)
+        return o
+    }
+    /**
+     * Xray's mux on [o], the outbound of [server] as a NON-CHAIN target, when the
+     * connect chose it for that server and the outbound can carry it (Mux.kt).
+     * No ids, no change. A chain's hops never come through here.
+     */
+    private fun withMux(o: JSONObject, server: ServerConfig, muxIds: Set<String>): JSONObject {
+        if (server.id in muxIds && Mux.eligible(o)) {
+            // the server's own numbers (the editor's Mux fields), where it has them
+            val m = JSONObject(Mux.MUX.toString())
+            server.muxConcurrency?.let { n: Int -> m.put("concurrency", n) }
+            server.xudpConcurrency?.let { n: Int -> m.put("xudpConcurrency", n) }
+            o.put("mux", m)
+        }
         return o
     }
     private fun dialThrough(outbound: JSONObject, viaTag: String) {

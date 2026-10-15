@@ -500,6 +500,9 @@ function dropHarness({ settings = {}, xrayRunning = false, killEngaged = false, 
     recoverFromNetworkChange: async (reason) => { calls.push('recover:' + reason); },
     stopAllTuns: async () => {},
     setSystemProxy: async () => {},
+    // the mux verdicts of the dropped connection (v1.18): counted apart, `calls` is the kill switch's story
+    marked: 0,
+    recheckLiveMux: () => { env.marked++; },
     killEngaged
   };
   const make = new Function('env', `
@@ -507,7 +510,7 @@ function dropHarness({ settings = {}, xrayRunning = false, killEngaged = false, 
         recoverTimer = null, recoverQueued = null, connGen = 0;
     let killEngaged = env.killEngaged;
     const { store, xray, tun, send, notify, isEn, updateOverlay, getSettings, connectsInFlight, drops,
-            doDisconnect, reportReconnectFailed, recoverFromNetworkChange, stopAllTuns, setSystemProxy } = env;
+            doDisconnect, reportReconnectFailed, recoverFromNetworkChange, stopAllTuns, setSystemProxy, recheckLiveMux } = env;
     // the real one: { ok, added } — added is whether THIS call put the rule in
     // (the belief killEngaged is re-checked against the rule: ruleMissing)
     async function armKillSwitch() {
@@ -569,6 +572,19 @@ test('killSwitch ON: a drop that found the block already in place leaves it to w
   await h.onConnectionDrop('core-exited');
   assert.equal(h.killEngaged(), true);
   assert.deepEqual(h.calls, ['arm']);
+});
+
+test('a drop marks the mux verdicts of the connection it ended for a re-test — whether anything rebuilds it or not (v1.18)', async () => {
+  // rebuilt: the recovery's connect muxes them as before (it never tests)
+  const rebuilt = dropHarness({ settings: { killSwitch: false } });
+  await rebuilt.onConnectionDrop('core-exited');
+  assert.equal(rebuilt.env.marked, 1);
+  assert.deepEqual(rebuilt.calls, ['recover:core-exited']);
+  // automatic reconnect off: nothing rebuilds it — the next connect, by hand, tests them again
+  const byHand = dropHarness({ settings: { killSwitch: false, autoReconnectOnNetworkChange: false } });
+  await byHand.onConnectionDrop('core-exited');
+  assert.equal(byHand.env.marked, 1);
+  assert.deepEqual(byHand.calls, ['doDisconnect']);
 });
 
 /* ------------------------------- final wave F4 ------------------------------- */
@@ -636,7 +652,8 @@ test('killSwitch ON: a server switch under TUN seals its own stop→start gap, a
   // lifted once the connect stands: after the new tunnel, over a running core, before the last gate
   const lift = body.indexOf('if (switchArmed && !stale() && xray.running) {\n');
   const start = body.indexOf('await myTun.start(');
-  const lastGate = body.lastIndexOf('if (stale()) return abandoned;');
+  // the last gate gives way (an overtaken connect undoes what it started — see cancelConnect.test.js)
+  const lastGate = body.lastIndexOf('if (stale()) {\n');
   assert.ok(lift !== -1 && start < lift && lift < lastGate, 'lifted after the new tunnel, and nothing awaits past the last gate');
   assert.match(body.slice(lift), /^if \(switchArmed && !stale\(\) && xray\.running\) \{\n\s*await disarmKillSwitch\(\);\n\s*send\('killswitch', \{ engaged: false \}\);/);
   assert.ok(lastGate < body.indexOf('if (!xray.running) throw new Error('), 'a core that died keeps the block: its drop rebuilds under it');
@@ -686,7 +703,7 @@ function reapplyHarness({ settings = {}, connect = async () => ({ ok: true }), o
     doConnect: async (...a) => { calls.push('doConnect'); const r = await connect(...a); env.xray.running = true; return r; }
   }, over);
   const make = new Function('env', `
-    let xrayReloading = false, connGen = 0, appliedSettings = {}, killEngaged = false;
+    let xrayReloading = false, connGen = 0, disconnectGen = 0, appliedSettings = {}, killEngaged = false;
     const { store, xray, getSettings, send, stats, usage, usageStore, leakGuard, tun, tunPlatform,
             buildPlan, lastEntryHostIps, stopAllTuns, setSystemProxy, removeLanFirewall, doConnect } = env;
     const stopProcWatcher = () => {};
