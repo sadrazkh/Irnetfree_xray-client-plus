@@ -129,7 +129,8 @@ object CertPin {
             is ConnectionPlan.Single -> add(plan.server)
             is ConnectionPlan.Chain -> add(firstHop(plan.members))
             is ConnectionPlan.Pool -> for (e in plan.entries) target(e.target, plan.serversById, plan.chainsById)
-            is ConnectionPlan.Advanced -> { for (r in plan.rules) target(r.target, plan.serversById, plan.chainsById); target(plan.def, plan.serversById, plan.chainsById) }
+            // a target through a base is reached through it; the base is what the phone dials
+            is ConnectionPlan.Advanced -> { for (t in RoutingProfiles.dialTargets(plan)) target(t, plan.serversById, plan.chainsById) }
         }
         return out
     }
@@ -147,15 +148,32 @@ object CertPin {
             is ConnectionPlan.Single -> add(plan.server)
             is ConnectionPlan.Chain -> plan.members.forEach { add(it) }
             is ConnectionPlan.Pool -> for (e in plan.entries) target(e.target, plan.serversById, plan.chainsById)
-            is ConnectionPlan.Advanced -> { for (r in plan.rules) target(r.target, plan.serversById, plan.chainsById); target(plan.def, plan.serversById, plan.chainsById) }
+            is ConnectionPlan.Advanced -> {
+                for (r in plan.rules) target(r.target, plan.serversById, plan.chainsById)
+                target(plan.def, plan.serversById, plan.chainsById)
+                for (b in RoutingProfiles.basesOf(plan)) target(b, plan.serversById, plan.chainsById)
+            }
         }
         return out
     }
 
-    /** The record asked for "allow insecure" (allowInsecure=1 in its link) over plain TLS. REALITY verifies its own way. */
+    /**
+     * The record asked for "allow insecure" (allowInsecure=1 in its link) over TLS
+     * on TCP, and its link says nothing better (certPin.js wantsPin). REALITY
+     * verifies its own way; a link that names the certificate (`pcs`) or the name
+     * to check it against (`vcn`) has said what allowInsecure only gestured at.
+     * Hysteria is QUIC: a TCP handshake to its port reaches some other service,
+     * or nothing (EngineChoice runs it on sing-box). MASQUE never asks: the core
+     * refuses allowInsecure there outright (a JSON config that carries it anyway
+     * is refused by the core, not pinned).
+     */
     fun wantsPin(server: ServerConfig?): Boolean {
         val st = server?.outbound?.optJSONObject("streamSettings") ?: return false
-        return st.optString("security") == "tls" && (st.optJSONObject("tlsSettings")?.optBoolean("allowInsecure") == true)
+        val tls = st.optJSONObject("tlsSettings") ?: return false
+        if (st.optString("security") != "tls" || !tls.optBoolean("allowInsecure")) return false
+        val net = st.optString("network")
+        if (net == "hysteria" || net == "masque") return false
+        return tls.optString("pinnedPeerCertSha256").isBlank() && tls.optString("verifyPeerCertByName").isBlank()
     }
 
     class Targets(val probe: List<ServerConfig>, val behind: List<ServerConfig>)
@@ -173,9 +191,14 @@ object CertPin {
         return Targets(probe, behind)
     }
 
-    /** Should this record's pin be checked against the server now? No pin, nothing to re-check. */
+    /**
+     * Should this record's pin be checked against the server now? No pin,
+     * nothing to re-check. A MASQUE server over HTTP/3 listens on QUIC: the
+     * probe's TCP handshake reaches some other service on that port, or
+     * nothing — never the certificate it pinned (certPin.js staleCertPins).
+     */
     fun recheckDue(server: ServerConfig, now: Long = System.currentTimeMillis(), maxAgeMs: Long = RECHECK_AFTER_MS): Boolean {
-        if (normalizePin(server.certPin).isEmpty()) return false
+        if (normalizePin(server.certPin).isEmpty() || Masque.isQuic(server)) return false
         return now - server.certPinCheckedAt >= maxAgeMs
     }
 

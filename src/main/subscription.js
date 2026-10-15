@@ -14,14 +14,26 @@ const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
 const { parseMany, parseLink, applyServerEdits, editFields } = require('./parser');
+const { JSON_DERIVED } = require('./jsonImport');
+const SF = require('../renderer/serverFields');
 
 function uid() { return crypto.randomBytes(8).toString('hex'); }
 
 /* ------------------------- a refresh keeps who a server is ------------------------- */
 
-/** The share link without its `#remark` — panels rewrite the remark (traffic left, days left) on every fetch. */
+/**
+ * The share link without its `#remark` — panels rewrite the remark (traffic
+ * left, days left) on every fetch. A JSON server's `raw` is its config: the
+ * same config without its `remarks` (and `ps`), the rest of it untouched.
+ */
 function withoutRemark(raw) {
   const s = String(raw || '');
+  if (s[0] === '{') {
+    try {
+      const c = JSON.parse(s);
+      if (c && typeof c === 'object' && !Array.isArray(c)) { delete c.remarks; delete c.ps; return JSON.stringify(c); }
+    } catch { /* not a config after all: read as a link */ }
+  }
   const i = s.indexOf('#');
   return i === -1 ? s : s.slice(0, i);
 }
@@ -54,10 +66,17 @@ function serverIdentity(s, strict) {
     cred = u ? [u.user || '', u.pass || ''].join(':') : '';
   } else if (ob.protocol === 'wireguard') {
     cred = set.secretKey || '';
+  } else if (ob.protocol === 'hysteria') {
+    cred = (st.hysteriaSettings && st.hysteriaSettings.auth) || '';
+  } else if (ob.protocol === 'masque') {
+    // a WARP account is its device key; a server of one's own, its user and password
+    const ms = st.masqueSettings || {};
+    cred = ms.warp && typeof ms.warp === 'object' ? String(ms.warp.privateKey || '') : [ms.user || '', ms.pass || ''].join(':');
   }
   const net = st.network || 'tcp';
   let path = '', host = '';
-  if (st.wsSettings) { path = st.wsSettings.path; host = st.wsSettings.headers && (st.wsSettings.headers.Host || st.wsSettings.headers.host); }
+  if (st.masqueSettings) { path = st.masqueSettings.path; host = st.masqueSettings.host; }
+  else if (st.wsSettings) { path = st.wsSettings.path; host = st.wsSettings.headers && (st.wsSettings.headers.Host || st.wsSettings.headers.host); }
   else if (st.grpcSettings) path = st.grpcSettings.serviceName;
   else if (st.httpSettings) { path = st.httpSettings.path; host = [].concat(st.httpSettings.host || []).join(','); }
   else if (st.xhttpSettings) { path = st.xhttpSettings.path; host = st.xhttpSettings.host; }
@@ -101,7 +120,11 @@ const USER_FIELDS = [
     set: (s, v) => { const st = streamOf(s); if (st && st.tlsSettings) put(st.tlsSettings, 'cipherSuites', v); }
   },
   { key: 'dns', get: (s) => s.dns, set: (s, v) => put(s, 'dns', v) },
-  { key: 'dns', get: (s) => s.dnsDomains, set: (s, v) => put(s, 'dnsDomains', v) }
+  { key: 'dns', get: (s) => s.dnsDomains, set: (s, v) => put(s, 'dnsDomains', v) },
+  // the record's own settings from the editor's table (Mux for this server …)
+  ...SF.PATH_FIELDS.filter((f) => f.path[0] === '@').map((f) => ({
+    key: f.id, get: (s) => s[f.path.slice(1)], set: (s, v) => put(s, f.path.slice(1), v)
+  }))
 ];
 
 /** Values compared the way the edit form writes them: blank is absent, text is trimmed. */
@@ -127,12 +150,21 @@ function linkOf(old) {
   return said;
 }
 
-/** The connection fields of the edit form (parser.editFields names). */
+/**
+ * The connection fields of the edit form (parser.editFields names): its own,
+ * and every field of the editor's table that lives in the outbound
+ * (serverFields.js — VLESS flow and Encryption, the transports' and TLS's finer
+ * knobs, sockopt). The record's own ones (`@mux` …) are USER_FIELDS below.
+ */
 const CONNECTION_KEYS = ['address', 'port', 'uuid', 'password', 'username',
   'privateKey', 'publicKey', 'presharedKey', 'localAddress', 'mtu', 'reserved', 'allowedIPs',
-  'network', 'security', 'sni', 'host', 'path', 'fp', 'pbk', 'sid', 'allowInsecure'];
+  'network', 'security', 'sni', 'host', 'path', 'fp', 'pbk', 'sid', 'allowInsecure',
+  'ech', 'pcs', 'vcn', 'pqv', 'obfsPassword', 'mport', 'hopInterval', 'up', 'down', 'plugin',
+  'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx',
+  ...SF.PATH_FIELDS.filter((f) => f.path[0] !== '@').map((f) => f.id)];
 /** The ones the stream is rebuilt from, as the form sends them all on a save. */
-const STREAM_KEYS = ['network', 'security', 'sni', 'host', 'path', 'serviceName', 'fp', 'pbk', 'sid', 'allowInsecure', 'alpn'];
+const STREAM_KEYS = ['network', 'security', 'sni', 'host', 'path', 'serviceName', 'fp', 'pbk', 'sid', 'allowInsecure', 'alpn',
+  'ech', 'pcs', 'vcn', 'pqv', 'obfsPassword', 'mport', 'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx'];
 
 /** The field names applyServerEdits recorded as the user's edits. */
 function recordedEdits(s) {
@@ -217,6 +249,20 @@ function carryOver(old, fresh, said) {
     if (norm(f.get(out)) === norm(mine)) kept.push(f.key); else missed.add(f.key);
   }
   for (const k of missed) while (kept.includes(k)) kept.splice(kept.indexOf(k), 1);
+  // A JSON server's own, recorded like everything else: the mode the user
+  // chose, and a config they edited — with all it derives (jsonImport.js),
+  // so the record stays one config's. `raw` is not among them: it stays the
+  // provider's current text, so the next refresh finds the server by it.
+  if (fresh.source === 'json' && old.source === 'json') {
+    if (recorded.includes('json') && old.json && typeof old.json === 'object') {
+      for (const k of JSON_DERIVED) out[k] = clone(old[k]);
+      kept.push('json');
+    }
+    if (recorded.includes('jsonMode') && (old.jsonMode === 'raw' || old.jsonMode === 'full')) {
+      out.jsonMode = old.jsonMode;
+      kept.push('jsonMode');
+    }
+  }
   // A rename when recorded, or when the old link proves one: otherwise the
   // provider's name (which often carries the traffic left) is the current one.
   // A rename proven against the old link (made by a version that recorded
@@ -516,4 +562,4 @@ function hostnameOf(url) {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
-module.exports = { SubscriptionManager, fetchSubscription, reconcileServers, fetchUrl, redirectTarget, MAX_BODY_BYTES };
+module.exports = { SubscriptionManager, fetchSubscription, reconcileServers, fetchUrl, redirectTarget, MAX_BODY_BYTES, serverIdentity };

@@ -10,14 +10,20 @@
  *  - 'sing-box' is a single-config engine only (it has no chain/pool translator).
  */
 
-/** Every server object a plan can dial (duplicates allowed). */
+const { advancedTargets } = require('./routingProfiles');
+
+/**
+ * Every server object a plan can dial (duplicates allowed). An advanced plan:
+ * every rule target and the default, then every base they go through
+ * (a routing profile's via).
+ */
 function planServers(plan) {
   if (!plan) return [];
   switch (plan.mode) {
     case 'single': return plan.server ? [plan.server] : [];
     case 'chain': return plan.chain || [];
     case 'pool': return targetsServers((plan.entries || []).map(e => e && e.target), plan);
-    case 'advanced': return targetsServers([...(plan.rules || []).map(r => r && r.target), plan.def], plan);
+    case 'advanced': return targetsServers([...(plan.rules || []).map(r => r && r.target), plan.def, ...advancedTargets(plan).vias], plan);
     default: return [];
   }
 }
@@ -33,9 +39,36 @@ function targetsServers(targets, plan) {
   return out;
 }
 
+/**
+ * A Hysteria2 server that asked for "allow insecure" and names no certificate:
+ * the Xray cores have no way left to accept an unverified certificate
+ * (allowInsecure is gone; certPin's trust-on-first-use is a TCP handshake,
+ * and Hysteria is QUIC), sing-box still has one. Such links are common — a
+ * self-signed certificate is how most Hysteria2 servers are set up.
+ */
+function needsInsecureCore(server) {
+  const st = server && server.outbound && server.outbound.streamSettings;
+  const tls = st && st.tlsSettings;
+  return !!(st && st.network === 'hysteria' && tls && tls.allowInsecure &&
+    !String(tls.pinnedPeerCertSha256 || '').trim() && !String(tls.verifyPeerCertByName || '').trim() &&
+    !String(server.certPin || '').trim());
+}
+
+/**
+ * A MASQUE server (a JSON one too): only the Xray cores run it — sing-box has
+ * no MASQUE (1.15 alphas only) and no WARP at all — whatever the record says.
+ */
+function isMasque(server) {
+  return !!server && (server.protocol === 'masque' || !!(server.outbound && server.outbound.protocol === 'masque'));
+}
+
 function chooseEngine(plan, defaultEngine = 'xray') {
   const def = defaultEngine === 'xray-pattn' ? 'xray-pattn' : 'xray';
-  if (plan && plan.mode === 'single') return (plan.server && plan.server.engine) || def;
+  if (plan && plan.mode === 'single') {
+    const s = plan.server;
+    if (isMasque(s)) return s.engine === 'xray-pattn' ? 'xray-pattn' : def;
+    return (s && s.engine) || (needsInsecureCore(s) ? 'sing-box' : def);
+  }
   const wantsPattn = planServers(plan).some(s => s && s.engine === 'xray-pattn');
   return wantsPattn ? 'xray-pattn' : def;
 }
@@ -66,4 +99,4 @@ function testEngineFor(engineId) {
  * a DoH answer when the network's own is a fake-IP address. A name that cannot
  * be resolved at all is still left to the core.
  */
-module.exports = { chooseEngine, planServers, testEngineFor };
+module.exports = { chooseEngine, planServers, testEngineFor, needsInsecureCore, isMasque };

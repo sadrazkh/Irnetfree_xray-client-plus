@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld('api', {
   addServer: (link) => ipcRenderer.invoke('servers:add', link),
   addWireguard: (fields) => ipcRenderer.invoke('servers:addWireguard', fields),
   addProxy: (fields) => ipcRenderer.invoke('servers:addProxy', fields),
+  createServer: (fields) => ipcRenderer.invoke('servers:create', fields),
+  // + WARP: { mode, license, via, importText, http, endpoint, address, cover, antiDpi } → { ok, servers, added, account, warnings } | { ok: false, code, error }
+  addWarp: (args) => ipcRenderer.invoke('servers:addWarp', args),
   pickWireguardConf: () => ipcRenderer.invoke('wg:pickConf'),
   parseWireguardConf: (text) => ipcRenderer.invoke('wg:parseConf', text),
   updateServer: (id, fields) => ipcRenderer.invoke('servers:update', { id, fields }),
@@ -17,6 +20,8 @@ contextBridge.exposeInMainWorld('api', {
   clearServers: () => ipcRenderer.invoke('servers:clear'),
   listServers: () => ipcRenderer.invoke('servers:list'),
   serverLink: (id) => ipcRenderer.invoke('servers:link', id),
+  // the picker's choice, kept across restarts (see main.js setSelection)
+  setSelection: (id) => ipcRenderer.invoke('selection:set', id),
 
   // proxy chain (legacy single chain)
   getChain: () => ipcRenderer.invoke('chain:get'),
@@ -29,6 +34,14 @@ contextBridge.exposeInMainWorld('api', {
   // proxy pool (multi-config: several exits on several local ports at once)
   listPool: () => ipcRenderer.invoke('pool:list'),
   setPool: (entries) => ipcRenderer.invoke('pool:set', entries),
+
+  // routing profiles (several advanced routings, a base per target) and their share links
+  routingProfiles: () => ipcRenderer.invoke('routing:profiles'),
+  setRoutingProfiles: (profiles) => ipcRenderer.invoke('routing:setProfiles', profiles),
+  shareRoutingProfile: (id) => ipcRenderer.invoke('routing:shareProfile', id),
+  shareChain: (id) => ipcRenderer.invoke('routing:shareChain', id),
+  routingImportPreview: (text) => ipcRenderer.invoke('routing:importPreview', text),
+  routingImport: (text) => ipcRenderer.invoke('routing:import', text),
 
   // subscriptions
   listSubs: () => ipcRenderer.invoke('subs:list'),
@@ -75,11 +88,17 @@ contextBridge.exposeInMainWorld('api', {
 
   // relaunch elevated (Windows) for TUN mode
   relaunchAdmin: () => ipcRenderer.invoke('app:relaunchAdmin'),
+  // Windows: does the logon task start another copy? (a read) / point it at this one (the banner's button)
+  autostartCheck: () => ipcRenderer.invoke('autostart:check'),
+  autostartRepoint: () => ipcRenderer.invoke('autostart:repoint'),
 
   // runtime components (download / integrate / update / remove)
   assetsStatus: () => ipcRenderer.invoke('assets:status'),
   downloadAsset: (component) => ipcRenderer.invoke('assets:download', component),
   removeAssets: () => ipcRenderer.invoke('assets:remove'),
+  // the version picker: a core's releases ({ prerelease, force }), and one installed by its tag
+  coreVersions: (component, opts) => ipcRenderer.invoke('cores:versions', Object.assign({}, opts, { component })),
+  installCoreVersion: (component, tag) => ipcRenderer.invoke('cores:install', { component, tag }),
 
   // LAN sharing info + kill switch
   lanInfo: () => ipcRenderer.invoke('net:lanInfo'),

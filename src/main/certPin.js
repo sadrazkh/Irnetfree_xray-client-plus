@@ -15,6 +15,8 @@ const tls = require('tls');
 const net = require('net');
 const crypto = require('crypto');
 const { planServers } = require('./engineChoice');
+const { advancedTargets } = require('./routingProfiles');
+const { masqueHttpOf } = require('../renderer/serverFields');
 
 /** SHA-256 (hex, lowercase) of a certificate's DER. */
 function pinOf(der) {
@@ -76,7 +78,8 @@ function firstHop(list) {
 
 /**
  * The servers the machine dials directly: a single server, a chain's first hop,
- * and for advanced / pool plans each target's server or chain first hop. Same
+ * and for advanced / pool plans each target's server or chain first hop — for
+ * a target through a base (a routing profile's via), the base's instead. Same
  * member filter and target grammar as configBuilder's registry. Only these can
  * be probed from here — a later hop is reached through the previous one.
  */
@@ -94,16 +97,28 @@ function directServers(plan) {
     case 'single': add(plan.server); break;
     case 'chain': add(firstHop(plan.chain)); break;
     case 'pool': for (const e of plan.entries || []) if (e) target(e.target); break;
-    case 'advanced': for (const r of plan.rules || []) if (r) target(r.target); target(plan.def); break;
+    case 'advanced': for (const tg of advancedTargets(plan).entries) target(tg); break;
     default: break;
   }
   return out;
 }
 
-/** The record asked for "allow insecure" (allowInsecure=1 in its link) over plain TLS. REALITY verifies its own way. */
+/**
+ * The record asked for "allow insecure" (allowInsecure=1 in its link) over TLS
+ * on TCP, and its link says nothing better. REALITY verifies its own way; a
+ * link that names the certificate (`pcs`) or the name to check it against
+ * (`vcn`) has already said what allowInsecure only gestured at. Hysteria is
+ * QUIC: a TCP handshake to its port reaches some other service, or nothing,
+ * and would pin the wrong certificate (engineChoice runs it on sing-box).
+ * MASQUE never asks: the core refuses allowInsecure there outright (a JSON
+ * config that carries it anyway is refused by the core, not pinned).
+ */
 function wantsPin(server) {
   const st = server && server.outbound && server.outbound.streamSettings;
-  return !!(st && st.security === 'tls' && st.tlsSettings && st.tlsSettings.allowInsecure);
+  if (!st || st.security !== 'tls' || !st.tlsSettings || !st.tlsSettings.allowInsecure) return false;
+  if (st.network === 'hysteria' || st.network === 'masque') return false;
+  const tls = st.tlsSettings;
+  return !String(tls.pinnedPeerCertSha256 || '').trim() && !String(tls.verifyPeerCertByName || '').trim();
 }
 
 /**
@@ -212,8 +227,18 @@ function recheckDue(server, now, maxAgeMs) {
   return t - at >= max;
 }
 
+/**
+ * A MASQUE server over HTTP/3 listens on QUIC: the TLS dial of the probe is
+ * TCP, which reaches some other service on that port, or nothing — never the
+ * certificate it pinned. Left out of the re-check, like an unreachable one.
+ */
+function quicMasque(s) {
+  const ob = s && s.outbound;
+  return !!ob && ob.protocol === 'masque' && masqueHttpOf(ob.streamSettings && ob.streamSettings.tlsSettings) === 'h3';
+}
+
 async function staleCertPins(servers, probe = fetchLeafPin) {
-  const pinned = (servers || []).filter(s => s && s.certPin && s.address && s.port);
+  const pinned = (servers || []).filter(s => s && s.certPin && s.address && s.port && !quicMasque(s));
   const out = [];
   await Promise.all(pinned.map(async (s) => {
     const st = (s.outbound && s.outbound.streamSettings) || {};

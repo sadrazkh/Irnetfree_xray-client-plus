@@ -10,6 +10,8 @@
  * it returns.
  */
 
+const { DEFAULT_PROFILE_ID, normalizeProfile, mirrorToSettings, mirrorFromSettings } = require('./routingProfiles');
+
 const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 
 /*
@@ -23,7 +25,7 @@ const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
  * and is not re-checked.
  */
 const ID = /^[\w-]+$/;
-const PROTOCOLS = new Set(['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'wireguard']);
+const PROTOCOLS = new Set(['vless', 'vmess', 'trojan', 'shadowsocks', 'socks', 'http', 'wireguard', 'hysteria2', 'masque']);
 const validId = (v) => typeof v === 'string' && ID.test(v);
 
 /** A TCP port 1–65535 as a number, or null. */
@@ -36,7 +38,8 @@ function portOf(v) {
 function cleanServer(s) {
   if (!isObj(s.outbound)) return null;
   // the outbound is the truth when the record lost its copy (configBuilder.isWgServer)
-  const protocol = s.protocol == null || s.protocol === '' ? s.outbound.protocol : s.protocol;
+  let protocol = s.protocol == null || s.protocol === '' ? s.outbound.protocol : s.protocol;
+  if (protocol === 'hysteria') protocol = 'hysteria2';   // the core's name for it
   if (!PROTOCOLS.has(protocol)) return null;
   const out = Object.assign({}, s, { protocol });
   if ('port' in s) {
@@ -70,6 +73,27 @@ function cleanPoolEntry(e, refused) {
   return out;
 }
 
+/**
+ * A routing profile (routingProfiles.js) as it may come in: normalized, and
+ * every target, via and base in a shape the app writes — '' / direct / block /
+ * chain / chain:<id> / <id> (a via also inherit / none). A rule naming
+ * anything else is dropped, a via goes back to inherit, a default to none, a
+ * base to none. A reference to a server this machine does not have stays: the
+ * connect refuses a gone base, and a rule to a gone target follows the default.
+ */
+function cleanProfile(p) {
+  const n = normalizeProfile(p);
+  if (!n) return null;
+  const target = (t) => t === '' || t === 'direct' || t === 'block' || t === 'chain' || validId(t.indexOf('chain:') === 0 ? t.slice('chain:'.length) : t);
+  const via = (v) => v === 'inherit' || v === 'none' || target(v);
+  n.rules = n.rules.filter((r) => target(r.target) && (r.id === undefined || validId(r.id)));
+  for (const r of n.rules) if (r.via !== undefined && !via(r.via)) delete r.via;
+  if (!target(n.def)) n.def = '';
+  if (!via(n.defVia)) n.defVia = 'inherit';
+  if (n.base !== null && !target(n.base)) n.base = null;
+  return n;
+}
+
 /** The settings overlay, with its ports as integers; a bad one leaves the current value. */
 function cleanSettings(s) {
   const out = Object.assign({}, s);
@@ -81,28 +105,47 @@ function cleanSettings(s) {
   return out;
 }
 
-function exportBundle({ version, store, usage }) {
+/**
+ * `flavor`: where the backup was made, when that matters on restore — the
+ * router writes 'openwrt', so its own backup restored after a reset brings
+ * back its router-only settings, which a desktop's must not touch (`keep`
+ * in importBundle). Absent on a desktop backup, as it always was.
+ */
+function exportBundle({ version, store, usage, flavor }) {
   const s = store || {};
   return {
     app: 'IRNetFree',
     plus: true,   // plus: made by Plus — its ports may be restored into Plus
     format: 1,
     version: version || '',
+    ...(flavor ? { flavor: String(flavor) } : {}),
     exportedAt: new Date().toISOString(),
     servers: Array.isArray(s.servers) ? s.servers : [],
     subscriptions: Array.isArray(s.subscriptions) ? s.subscriptions : [],
     chains: Array.isArray(s.chains) ? s.chains : [],
     pool: Array.isArray(s.pool) ? s.pool : [],
+    // the routing profiles, when the store has them (routingProfiles.js)
+    ...(Array.isArray(s.routingProfiles) ? { routingProfiles: s.routingProfiles } : {}),
     settings: isObj(s.settings) ? s.settings : {},
     usage: isObj(usage) ? usage : {}
   };
 }
 
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
 /**
- * @returns {{ next: object, added: { servers, subscriptions, chains, pool } }}
+ * `opts.keep`: settings keys this machine keeps as they are, whatever the
+ * backup says — a router restoring a desktop backup must not take the
+ * desktop's TUN, system proxy, per-app routing, leak guard, connect-at-start,
+ * QUIC refusal or kill switch (field report fix 9). A kept key the machine
+ * never had stays absent. `kept` names the ones the backup carried with
+ * another value, so the caller can say so.
+ *
+ * @returns {{ next: object, added: { servers, subscriptions, chains, pool, routingProfiles }, kept: string[] }}
+ *   `next.routingProfiles` only when the machine or the backup has them.
  * @throws when the bundle is not an IRNetFree backup
  */
-function importBundle(bundle, current) {
+function importBundle(bundle, current, opts = {}) {
   if (!isObj(bundle) || bundle.app !== 'IRNetFree' || bundle.format !== 1) throw new Error('not an IRNetFree backup');
   const c = current || {};
   // `clean` returns the record as it may come in, or null to leave it out.
@@ -124,16 +167,42 @@ function importBundle(bundle, current) {
   // a server left out for its protocol, port or outbound is not referenced either
   const chains = merge(c.chains, bundle.chains, (x) => cleanChain(x, servers.refused));
   const pool = merge(c.pool, bundle.pool, (x) => cleanPoolEntry(x, servers.refused));
+  const have = isObj(c.settings) ? c.settings : {};
+  const incoming = isObj(bundle.settings) ? cleanSettings(bundle.settings) : {};
+  const kept = [];
+  for (const k of Array.isArray(opts && opts.keep) ? opts.keep : []) {
+    if (!(k in incoming)) continue;
+    if (!sameJson(incoming[k], have[k])) kept.push(k);
+    delete incoming[k];
+  }
+  let settings = Object.assign({}, have, incoming);
+  // Routing profiles, merged by id like the rest — except rp-default, which IS
+  // the settings' advanced routing (routingProfiles.js mirrors it into
+  // routeRules / routeDefault / advancedUseMode), and those have always come
+  // back with a restore: the backup's rp-default replaces the one here (on a
+  // fresh install only the empty one made at start), and the settings mirror
+  // it. A backup made before profiles carries its advanced routing in the
+  // settings alone — rp-default follows them.
+  const profiles = merge(c.routingProfiles, bundle.routingProfiles, cleanProfile);
+  let routingProfiles = profiles.list;
+  if (Array.isArray(bundle.routingProfiles)) {
+    const theirs = bundle.routingProfiles.find((p) => isObj(p) && p.id === DEFAULT_PROFILE_ID);
+    const restored = theirs ? cleanProfile(theirs) : null;
+    if (restored) routingProfiles = routingProfiles.map((p) => (p && p.id === DEFAULT_PROFILE_ID ? restored : p));
+    settings = mirrorToSettings(routingProfiles, settings);
+  } else routingProfiles = mirrorFromSettings(routingProfiles, settings);
   return {
     next: {
       servers: servers.list,
       subscriptions: subscriptions.list,
       chains: chains.list,
       pool: pool.list,
-      settings: keepPlusPorts(Object.assign({}, isObj(c.settings) ? c.settings : {}, isObj(bundle.settings) ? cleanSettings(bundle.settings) : {}), c.settings, bundle),   // plus
+      settings: keepPlusPorts(settings, c.settings, bundle),   // plus
+      ...(Array.isArray(c.routingProfiles) || Array.isArray(bundle.routingProfiles) ? { routingProfiles } : {}),
       usage: Object.assign({}, isObj(c.usage) ? c.usage : {}, isObj(bundle.usage) ? bundle.usage : {})
     },
-    added: { servers: servers.n, subscriptions: subscriptions.n, chains: chains.n, pool: pool.n }
+    added: { servers: servers.n, subscriptions: subscriptions.n, chains: chains.n, pool: pool.n, routingProfiles: profiles.n },
+    kept
   };
 }
 

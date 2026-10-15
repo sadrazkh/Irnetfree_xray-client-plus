@@ -10,6 +10,10 @@
 
 const crypto = require('crypto');
 const { isIP } = require('net');
+// JSON configs (an Xray config, an array of them, sing-box): read before any link
+const { importJson, applyJsonEdits, jsonEditFields } = require('./jsonImport');
+// the editor's field table — the window draws it, this reads and writes through it
+const SF = require('../renderer/serverFields');
 
 function uid() {
   return crypto.randomBytes(8).toString('hex');
@@ -44,6 +48,63 @@ function parseQuery(qs) {
   return out;
 }
 
+/** A link's boolean flag: `1` / `true`, any case. */
+function isTrue(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return s === '1' || s === 'true';
+}
+
+/**
+ * `pcs` — the certificate hash(es) to accept, comma separated: the SHA-256 of
+ * the certificate's DER as hex, colons allowed (OpenSSL's form). The core
+ * refuses the WHOLE config over one malformed entry, so only well-formed ones
+ * are kept, in one canonical form; none left is ''. A pin dropped here leaves
+ * the core verifying the chain as usual — stricter, never looser.
+ */
+function pinList(v) {
+  const out = [];
+  for (const part of String(v == null ? '' : v).split(',')) {
+    const hex = part.replace(/[\s:]/g, '').toLowerCase();
+    if (/^[0-9a-f]{64}$/.test(hex) && !out.includes(hex)) out.push(hex);
+  }
+  return out.join(',');
+}
+
+/**
+ * `pqv` — an ML-DSA-65 public key: 1952 bytes as unpadded base64url, the only
+ * form the core reads; a malformed one makes it refuse the WHOLE config. The
+ * standard alphabet and padding are mapped to that form; anything that is not
+ * such a key is ''. Left out, REALITY still authenticates the server by its
+ * x25519 key (`pbk`) — the post-quantum check is the one that is lost.
+ */
+function mldsaKey(v) {
+  const s = String(v == null ? '' : v).trim().replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  if (s.length !== 2603 || !/^[A-Za-z0-9_-]+$/.test(s)) return '';
+  return Buffer.from(s, 'base64url').length === 1952 ? s : '';
+}
+
+/**
+ * What newer links carry for TLS beyond SNI, ALPN and the fingerprint
+ * (v2rayN's names; the core's in brackets):
+ *  - `ech` (echConfigList): Encrypted Client Hello — a base64 ECHConfigList, or
+ *    where to fetch one from DNS: `cloudflare-ech.com+udp://1.1.1.1` asks
+ *    1.1.1.1 for the HTTPS record of cloudflare-ech.com, `https://…` asks a
+ *    DoH server. Kept verbatim: a `+` in it is part of the value, never a space.
+ *  - `pcs` (pinnedPeerCertSha256): the certificate to accept — what replaced
+ *    allowInsecure in the core; see pinList.
+ *  - `vcn` (verifyPeerCertByName): the name(s) to verify the certificate
+ *    against instead of the SNI (a fronted server's own name).
+ */
+function tlsExtras(tls, q) {
+  const ech = String(q.ech || q.echConfigList || '').trim();
+  if (ech) tls.echConfigList = ech;
+  const pcs = pinList(q.pcs || q.pinnedPeerCertSha256 || q.pinSHA256 || '');
+  if (pcs) tls.pinnedPeerCertSha256 = pcs;
+  const vcn = String(q.vcn || q.verifyPeerCertByName || '').split(',').map(x => x.trim()).filter(Boolean).join(',');
+  if (vcn) tls.verifyPeerCertByName = vcn;
+  return tls;
+}
+
 /** The xhttp `extra` query value as an object; null when absent or not one. */
 function parseXhttpExtra(raw) {
   if (raw == null || raw === '') return null;
@@ -74,6 +135,9 @@ function buildStreamSettings(q) {
       serviceName: q.serviceName || q.path || '',
       multiMode: (q.mode || '') === 'multi'
     };
+    // The :authority the gRPC stream announces — what a CDN in front of the
+    // server routes by. Without it the core sends the SNI (or the address).
+    if (q.authority) stream.grpcSettings.authority = String(q.authority).trim();
   } else if (net === 'h2' || net === 'http') {
     stream.network = 'h2';
     stream.httpSettings = {
@@ -111,23 +175,32 @@ function buildStreamSettings(q) {
     if (extra) stream.xhttpSettings.extra = extra;
   } else if (net === 'kcp' || net === 'mkcp') {
     stream.network = 'kcp';
+    // Stored in the link's own terms. The cores of 2026 refuse `header` and
+    // `seed` here and take them as finalmask masks instead — in a form that
+    // changed between releases — so coreCompat.js writes them for the core
+    // that runs the config, never this record.
     stream.kcpSettings = {
       header: { type: q.headerType || 'none' },
       seed: q.seed || ''
     };
+    const mtu = parseInt(q.mtu, 10);
+    if (mtu > 0) stream.kcpSettings.mtu = mtu;
   }
 
   // --- security specific ---
   if (security === 'tls') {
     stream.tlsSettings = {
       serverName: q.sni || q.host || '',
-      allowInsecure: q.allowInsecure === '1' || q.allowInsecure === 'true',
+      // `insecure` / `allow_insecure`: the spelling of hysteria2, anytls and tuic
+      // links, which some panels put on every link they make
+      allowInsecure: isTrue(q.allowInsecure) || isTrue(q.insecure) || isTrue(q.allow_insecure),
       fingerprint: q.fp || 'chrome'
     };
     if (q.alpn) stream.tlsSettings.alpn = q.alpn.split(',');
     // patterniha-style custom TLS: `unsafe` fingerprint lets you pin cipherSuites.
     const cs = q.cs || q.cipherSuites;
     if (cs && String(cs).trim()) stream.tlsSettings.cipherSuites = String(cs).trim();
+    tlsExtras(stream.tlsSettings, q);
   } else if (security === 'reality') {
     stream.realitySettings = {
       serverName: q.sni || '',
@@ -136,6 +209,10 @@ function buildStreamSettings(q) {
       shortId: q.sid || '',
       spiderX: q.spx || ''
     };
+    // `pqv`: the server's ML-DSA-65 public key — REALITY's post-quantum
+    // signature check on the certificate it forges.
+    const pqv = mldsaKey(q.pqv || q.mldsa65Verify);
+    if (pqv) stream.realitySettings.mldsa65Verify = pqv;
   }
 
   // finalMask (transport-level masking: fragment, noise, header-custom, …).
@@ -220,6 +297,12 @@ function parseVmess(link) {
   const net = (v.net || 'tcp').toLowerCase();
   const security = (v.tls || 'none').toLowerCase() === 'tls' ? 'tls' : (v.tls || 'none');
 
+  // VMess JSON puts a transport's second value in `type` and `host`, as v2rayN
+  // writes them: the mode of grpc and xhttp, the :authority of grpc; mKCP
+  // carries its seed in `path`.
+  const isKcp = net === 'kcp' || net === 'mkcp';
+  const isXhttp = net === 'xhttp' || net === 'splithttp';
+  const type = String(v.type || '').trim();
   const q = {
     type: net,
     security: security === 'tls' ? 'tls' : 'none',
@@ -229,7 +312,15 @@ function parseVmess(link) {
     fp: v.fp || 'chrome',
     alpn: v.alpn || '',
     serviceName: v.path || '',
-    headerType: v.type || 'none',
+    headerType: (net === 'grpc' || isXhttp) ? 'none' : (type || 'none'),
+    mode: v.mode || ((net === 'grpc' || isXhttp) && type && type !== 'none' ? type : ''),
+    authority: net === 'grpc' ? (v.authority || v.host || '') : '',
+    seed: isKcp ? (v.seed || (v.path && v.path !== '/' ? v.path : '')) : '',
+    extra: isXhttp ? v.extra : undefined,
+    allowInsecure: v.allowInsecure || v.insecure || '',
+    ech: v.ech || '',
+    pcs: v.pcs || '',
+    vcn: v.vcn || '',
     cipherSuites: v.cs || v.cipherSuites || '',
     finalMask: v.fm || v.finalMask || v.finalmask || ''
   };
@@ -304,9 +395,11 @@ function parseShadowsocks(link) {
   const name = hashIdx === -1 ? '' : safeDecodeURIComponent(body.slice(hashIdx + 1));
   let main = hashIdx === -1 ? body : body.slice(0, hashIdx);
 
-  // strip plugin query if present
+  // SIP002 puts a plugin in the query (`/?plugin=…`)
   const qIdx = main.indexOf('?');
+  const q = parseQuery(qIdx === -1 ? '' : main.slice(qIdx + 1));
   if (qIdx !== -1) main = main.slice(0, qIdx);
+  main = main.replace(/\/+$/, '');
 
   let method, password, address, port;
 
@@ -344,10 +437,163 @@ function parseShadowsocks(link) {
     settings: {
       servers: [{ address, port, method, password, uot: true }]
     },
-    streamSettings: { network: 'tcp' }
+    streamSettings: ssStream(q, address)
   };
 
   return mkServer(name || address, 'shadowsocks', address, port, link, outbound);
+}
+
+/**
+ * The transport a Shadowsocks link asks for. A SIP002 `plugin` the core can
+ * stand in for becomes its transport, as v2rayN does it: obfs-local's
+ * `obfs=http` is RAW with an HTTP header, v2ray-plugin's websocket (with or
+ * without `tls`) is WebSocket. Any other plugin is refused BY NAME — the
+ * server would be imported and never connect, the plugin silently missing.
+ * Without a plugin: what an Xray panel's `type`/`security` say, else plain TCP.
+ */
+function ssStream(q, address) {
+  const plugin = String(q.plugin || '').trim();
+  if (plugin) {
+    // `;` separates options; `\;`, `\=`, `\,` and `\\` are escapes inside a value
+    const parts = plugin.split(/(?<!\\);/).map(p => p.trim()).filter(Boolean);
+    const unesc = (s) => s.replace(/\\([;=,\\])/g, '$1');
+    const opt = {};
+    const flags = new Set();
+    for (const p of parts.slice(1)) {
+      const eq = p.search(/(?<!\\)=/);
+      if (eq === -1) flags.add(unesc(p).toLowerCase());
+      else opt[unesc(p.slice(0, eq)).toLowerCase()] = unesc(p.slice(eq + 1));
+    }
+    const name = parts[0].toLowerCase();
+    if (name === 'obfs-local' || name === 'simple-obfs') {
+      const mode = String(opt.obfs || 'http').toLowerCase();
+      if (mode !== 'http') throw new Error(`Shadowsocks: the ${name} plugin with obfs=${mode} is not supported (obfs=http is)`);
+      return buildStreamSettings({ type: 'tcp', headerType: 'http', host: opt['obfs-host'] || address, path: opt['obfs-uri'] || '/' });
+    }
+    if (name === 'v2ray-plugin') {
+      const mode = String(opt.mode || 'websocket').toLowerCase();
+      if (mode !== 'websocket') throw new Error(`Shadowsocks: v2ray-plugin mode=${mode} is not supported (websocket is)`);
+      if ((parseInt(opt.mux, 10) || 0) > 0) throw new Error('Shadowsocks: v2ray-plugin with mux is not supported — ask for a link with mux=0');
+      const host = opt.host || '';
+      const tls = flags.has('tls') || isTrue(opt.tls);
+      return buildStreamSettings({ type: 'ws', host, path: opt.path || '/', security: tls ? 'tls' : 'none', sni: host });
+    }
+    throw new Error(`Shadowsocks: plugin ${parts[0]} is not supported`);
+  }
+  const net = String(q.type || q.network || '').toLowerCase();
+  const sec = String(q.security || '').toLowerCase();
+  if ((net && net !== 'tcp' && net !== 'raw') || (sec && sec !== 'none') || q.headerType === 'http') return buildStreamSettings(q);
+  return { network: 'tcp' };
+}
+
+/* ----------------------------- Hysteria2 ----------------------------- */
+/**
+ * hysteria2://auth@host:port/?sni=…&insecure=1&obfs=salamander&obfs-password=…&pinSHA256=…&mport=…#name
+ * (or hy2://). Both cores speak it natively since 26.1: outbound `hysteria`
+ * (version 2) over the `hysteria` transport — QUIC, so UDP only — with the
+ * obfuscation and the port hopping as finalmask, stored here in the newest
+ * core's form (coreCompat.js writes an older core's).
+ *
+ * The port may be a list or a range (the official scheme's port hopping,
+ * "443,8443-8500"): the first port is the one dialled, the whole list is what
+ * the client hops over; v2rayN's `mport` says the same. `pinSHA256` is the
+ * certificate pin (the core's pinnedPeerCertSha256, as `pcs`).
+ */
+const HOP_INTERVAL = '30';
+
+function parseHysteria2(link) {
+  const scheme = link.startsWith('hy2://') ? 'hy2://' : 'hysteria2://';
+  const body = link.slice(scheme.length);
+  const hashIdx = body.indexOf('#');
+  const name = hashIdx === -1 ? '' : safeDecodeURIComponent(body.slice(hashIdx + 1));
+  const main = hashIdx === -1 ? body : body.slice(0, hashIdx);
+
+  const qIdx = main.indexOf('?');
+  const beforeQ = (qIdx === -1 ? main : main.slice(0, qIdx)).replace(/\/+$/, '');
+  const q = parseQuery(qIdx === -1 ? '' : main.slice(qIdx + 1));
+
+  const atIdx = beforeQ.lastIndexOf('@');
+  const auth = atIdx === -1 ? String(q.auth || '') : safeDecodeURIComponent(beforeQ.slice(0, atIdx));
+  const [address, portSpec] = splitHostPort(atIdx === -1 ? beforeQ : beforeQ.slice(atIdx + 1));
+  const spec = String(portSpec || '').trim();
+  const port = parseInt(spec, 10) || 443;
+  const hop = hopPorts(q.mport || q.ports || (/[,-]/.test(spec) ? spec : ''));
+  const srv = mkServer(name || address, 'hysteria2', address, port, link,
+    buildHysteria2Outbound(Object.assign({}, q, { address, port, auth, mport: hop })));
+  if (q.engine && q.engine !== 'xray') srv.engine = q.engine;
+  return srv;
+}
+
+/** A port-hopping list as the core takes it ("20000-30000,443"); '' when it names no port. */
+function hopPorts(v) {
+  const s = String(v == null ? '' : v).replace(/\s+/g, '').replace(/:/g, '-');
+  if (!s || !/^\d+(-\d+)?(,\d+(-\d+)?)*$/.test(s)) return '';
+  return s;
+}
+
+/**
+ * A bandwidth for the core ("100 mbps"); a bare number is Mbps, as hysteria's
+ * links mean it. The core's units are bits per second in powers of 1024, and
+ * it refuses the whole config below 65536 bytes a second (0.5 mbps) — so a
+ * value under that, or one in a unit it does not know, is ''.
+ */
+function bandwidth(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  const m = /^(\d+(?:\.\d+)?)\s*(|b|bps|k|kb|kbps|m|mb|mbps|g|gb|gbps|t|tb|tbps)$/.exec(s);
+  if (!m) return '';
+  const unit = m[2] || 'mbps';
+  const mul = Math.pow(1024, ' kmgt'.indexOf(unit[0] === 'b' ? ' ' : unit[0]));
+  if (Number(m[1]) * mul < 524288) return '';
+  return m[2] ? s : s + ' mbps';
+}
+
+/**
+ * The hysteria outbound from a link's (or the edit form's) values: `address`,
+ * `port`, `auth`, `sni`, `insecure`, `alpn`, `ech`, `pcs`/`pinSHA256`, `vcn`,
+ * `obfs` + `obfs-password`, `mport` (+ `hopInterval`), `up`/`down`.
+ */
+function buildHysteria2Outbound(f) {
+  const address = String(f.address || '').trim();
+  const tlsSettings = {
+    serverName: String(f.sni || f.peer || '').trim() || (isIP(address) ? '' : address),
+    allowInsecure: isTrue(f.insecure) || isTrue(f.allowInsecure) || isTrue(f.allow_insecure)
+  };
+  if (f.alpn) tlsSettings.alpn = String(f.alpn).split(',').map(x => x.trim()).filter(Boolean);
+  tlsExtras(tlsSettings, f);
+  const stream = {
+    network: 'hysteria',
+    security: 'tls',
+    tlsSettings,
+    hysteriaSettings: { version: 2, auth: String(f.auth == null ? '' : f.auth) }
+  };
+  const udp = [];
+  const obfs = String(f.obfs || '').trim().toLowerCase();
+  const obfsPassword = String(f['obfs-password'] || f.obfsPassword || '');
+  if ((obfs === 'salamander' || (!obfs && obfsPassword)) && obfsPassword) {
+    udp.push({ type: 'salamander', settings: { password: obfsPassword } });
+  }
+  const hop = hopPorts(f.mport);
+  if (hop) {
+    const iv = String(f.hopInterval || f.hop_interval || '').replace(/s$/i, '').trim();
+    udp.push({
+      type: 'udphop',
+      settings: { mode: 'intervalLocal,intervalRemote', interval: /^\d+(-\d+)?$/.test(iv) ? iv : HOP_INTERVAL, remotePorts: hop }
+    });
+  }
+  const fm = {};
+  if (udp.length) fm.udp = udp;
+  const up = bandwidth(f.up || f.upmbps), down = bandwidth(f.down || f.downmbps);
+  if (up || down) {
+    fm.quicParams = {};
+    if (up) fm.quicParams.brutalUp = up;
+    if (down) fm.quicParams.brutalDown = down;
+  }
+  if (Object.keys(fm).length) stream.finalmask = fm;
+  return {
+    protocol: 'hysteria',
+    settings: { version: 2, address, port: parseInt(f.port, 10) || 443 },
+    streamSettings: stream
+  };
 }
 
 /* --------------------------- SOCKS / HTTP proxy --------------------------- */
@@ -650,6 +896,200 @@ function makeWireguardServer(fields) {
   );
 }
 
+/* ------------------------------- MASQUE ------------------------------- */
+/**
+ * MASQUE (Xray 26.9.30+, XTLS/Xray-core #6807 #6810): IP over HTTP/3, or over
+ * HTTP/2 when the ALPN says h2 (serverFields.masqueHttpOf). The record is the
+ * core's own outbound — `settings` { address, port, remoteDNS }, the stream
+ * `network: 'masque'` over TLS with `masqueSettings` { host, path, user, pass,
+ * headers, warp } — so the editor writes it field by field. A WARP account
+ * (26.10.10+) is `warp` { privateKey, publicKey, address }: the device's
+ * P-256 key, the endpoint's public key, the tunnel's addresses.
+ *
+ * There is no share link for it anywhere (four clients, four invented
+ * `masque://`): a MASQUE server is shared as the Xray JSON it is
+ * (buildShareLink), which jsonImport.js reads back as this very server.
+ */
+
+/**
+ * A WARP key as the core takes it and a one-line text box keeps it: the
+ * base64 of its DER. A PEM block — its BEGIN / END lines, perhaps flattened
+ * onto one line by an input — and base64 broken over lines both become that.
+ * null when it is neither.
+ */
+function warpKeyBase64(v) {
+  const body = String(v == null ? '' : v).replace(/-----(BEGIN|END)[^-]*-----/g, '').replace(/\s+/g, '');
+  if (!body || !/^[A-Za-z0-9+/]+={0,2}$/.test(body)) return null;
+  return Buffer.from(body, 'base64').toString('base64');
+}
+
+/** The device key: a P-256 private key, PKCS#8 or SEC1 — the only ones the core reads. */
+function isWarpPrivateKey(b64) {
+  const der = Buffer.from(b64, 'base64');
+  for (const type of ['pkcs8', 'sec1']) {
+    try {
+      const k = crypto.createPrivateKey({ key: der, format: 'der', type });
+      return k.asymmetricKeyType === 'ec' && !!k.asymmetricKeyDetails && k.asymmetricKeyDetails.namedCurve === 'prime256v1';
+    } catch { /* the other encoding */ }
+  }
+  return false;
+}
+
+/** The endpoint's key: any public key in PKIX (SPKI) form, as the core checks it. */
+function isWarpPublicKey(b64) {
+  try { crypto.createPublicKey({ key: Buffer.from(b64, 'base64'), format: 'der', type: 'spki' }); return true; } catch { return false; }
+}
+
+/**
+ * WARP's tunnel addresses as the core takes them: at most one IPv4 and one
+ * IPv6, a bare address made a /32 or /128. Throws naming what it refuses.
+ */
+function warpAddresses(list) {
+  const out = [];
+  let v4 = false, v6 = false;
+  for (const a of [].concat(list || []).map((x) => String(x).trim()).filter(Boolean)) {
+    const slash = a.indexOf('/');
+    const host = slash === -1 ? a : a.slice(0, slash);
+    const fam = isIP(host);
+    const bits = slash === -1 ? (fam === 6 ? 128 : 32) : Number(a.slice(slash + 1));
+    if (!fam || !Number.isInteger(bits) || bits < 0 || bits > (fam === 6 ? 128 : 32) || (slash !== -1 && !/^\d+$/.test(a.slice(slash + 1)))) {
+      throw new Error(`warpAddress: "${a}" is not an IP address`);
+    }
+    if ((fam === 4 && v4) || (fam === 6 && v6)) throw new Error('warpAddress: at most one IPv4 and one IPv6 address');
+    if (fam === 4) v4 = true; else v6 = true;
+    out.push(`${host}/${bits}`);
+  }
+  return out;
+}
+
+/**
+ * Bring a MASQUE record to the shape the core takes, or throw saying which
+ * field it refuses — what the core itself would refuse the whole config for,
+ * said at the save instead of at a connect (infra/conf MasqueConfig.Build):
+ * a WARP account is all three of its fields or none, and no Basic user and
+ * password beside it; a user name has no `:`; the path starts with `/`; the
+ * headers are text, never Host or Capsule-Protocol (nor Authorization beside
+ * a user and password); remoteDNS holds IPs. Never allowInsecure (a hard
+ * error with MASQUE), never Mux, never sing-box — and the anti-DPI dialer
+ * only where it does anything: a fragment cuts TCP (HTTP/2), noise goes
+ * before UDP (HTTP/3).
+ */
+function checkMasque(server) {
+  const ob = server.outbound;
+  const st = ob.streamSettings;
+  const ms = st.masqueSettings;
+  const tls = st.tlsSettings || (st.tlsSettings = {});
+  delete tls.allowInsecure;
+  if (ob.mux && ob.mux.enabled) delete ob.mux;   // the core refuses the outbound with it
+  if (server.engine === 'sing-box') delete server.engine;   // no MASQUE there (engineChoice runs it on Xray)
+  if (SF.masqueHttpOf(tls) === 'h2') delete ob._noise; else delete ob._fragment;
+
+  const warp = ms.warp;
+  if (warp != null) {
+    if (!isPlainObject(warp)) throw new Error('warp: not a WARP account');
+    const missing = [['privateKey', 'warpPrivateKey'], ['publicKey', 'warpPublicKey'], ['address', 'warpAddress']]
+      .filter(([k]) => !String(warp[k] == null ? '' : warp[k]).trim()).map(([, id]) => id);
+    if (missing.length) throw new Error(`${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} empty: a WARP account needs its private key, the public key and its addresses together`);
+    if (String(ms.user || '') || String(ms.pass || '')) throw new Error('masqueUser: a WARP account takes no user and password');
+    const priv = warpKeyBase64(warp.privateKey);
+    if (!priv || !isWarpPrivateKey(priv)) throw new Error('warpPrivateKey: not a P-256 private key (PEM or base64, PKCS#8 or SEC1)');
+    const pub = warpKeyBase64(warp.publicKey);
+    if (!pub || !isWarpPublicKey(pub)) throw new Error('warpPublicKey: not a public key (PEM or base64)');
+    warp.privateKey = priv;
+    warp.publicKey = pub;
+    warp.address = warpAddresses(warp.address);
+  }
+  if (String(ms.user || '').includes(':')) throw new Error('masqueUser: a user name cannot contain ":"');
+  if (ms.path != null && ms.path !== '' && !String(ms.path).startsWith('/')) throw new Error('masquePath: the path starts with /');
+  if (ms.host != null && /[\s/?#@]/.test(String(ms.host))) throw new Error('masqueHost: a host name only (no scheme or path)');
+  if (ms.headers != null) {
+    if (!isPlainObject(ms.headers)) throw new Error('masqueHeaders: a JSON object of headers');
+    for (const [k, v] of Object.entries(ms.headers)) {
+      if (typeof v !== 'string') throw new Error(`masqueHeaders: the value of ${k} is not text`);
+      const name = k.toLowerCase();
+      if (name === 'host' || name === 'capsule-protocol') throw new Error(`masqueHeaders: ${k} is the core's own`);
+      if (name === 'authorization' && (ms.user || ms.pass)) throw new Error('masqueHeaders: Authorization beside a user and password');
+    }
+  }
+  const dns = ob.settings.remoteDNS;
+  if (dns != null) {
+    if (!Array.isArray(dns) || dns.some((ip) => !isIP(String(ip)))) throw new Error('remoteDNS: IP addresses only');
+  }
+  return server;
+}
+
+/**
+ * A MASQUE server from an Xray outbound — a pasted share JSON (jsonImport.js):
+ * the outbound as written, its tag aside, in the record's shape and checked
+ * as an edit checks it. Throws, saying why, when the editor could not hold it.
+ */
+function masqueServer(outbound, name) {
+  const ob = JSON.parse(JSON.stringify(outbound || {}));
+  delete ob.tag;
+  if (!isPlainObject(ob.settings)) ob.settings = {};
+  if (!isPlainObject(ob.streamSettings)) ob.streamSettings = {};
+  const address = String(ob.settings.address == null ? '' : ob.settings.address).trim();
+  const port = parseInt(ob.settings.port, 10);
+  if (!address) throw new Error('MASQUE: the server address is empty');
+  if (!(port > 0 && port < 65536)) throw new Error('MASQUE: the port must be between 1 and 65535');
+  const made = applyServerEdits(mkServer(name || joinHostPort(address, port), 'masque', address, port, '', ob), {});
+  delete made._edited;
+  made.raw = buildShareLink(made);
+  return made;
+}
+
+/* --------------------------- a server from scratch --------------------------- */
+/**
+ * What a new server cannot be made without, by protocol (beside an address
+ * and a port). MASQUE: nothing — its user and password are optional, and a
+ * WARP account's three fields are all-or-none (checkMasque).
+ */
+const CREATE_NEEDS = { vless: ['uuid'], vmess: ['uuid'], trojan: ['password'], shadowsocks: ['password'], hysteria2: ['password'], wireguard: ['privateKey', 'publicKey'], masque: [] };
+
+/**
+ * A server made from the editor's fields alone (its "new server" form): the
+ * protocol's bare outbound, then applyServerEdits with everything the form
+ * holds — the very code an edit runs — and its own share link as `raw`.
+ * Throws, saying what is missing, when the form cannot make one.
+ */
+function createServer(fields) {
+  const f = Object.assign({}, fields || {});
+  const proto = String(f.protocol || '').trim().toLowerCase();
+  if (!SF.PROTOCOLS.includes(proto)) throw new Error('Unknown protocol: ' + (f.protocol || '—'));
+  const address = String(f.address || '').trim();
+  const port = parseInt(f.port, 10);
+  if (!address) throw new Error('The server address is empty');
+  if (!(port > 0 && port < 65536)) throw new Error('The port must be between 1 and 65535');
+  for (const k of CREATE_NEEDS[proto] || []) if (!String(f[k] == null ? '' : f[k]).trim()) throw new Error(k + ' is empty');
+  let server;
+  if (proto === 'wireguard') {
+    server = makeWireguardServer({
+      name: f.name, privateKey: f.privateKey, publicKey: f.publicKey, endpoint: joinHostPort(address, port),
+      address: f.localAddress, presharedKey: f.presharedKey, mtu: f.mtu, reserved: f.reserved, allowedIPs: f.allowedIPs, dns: f.dns
+    });
+  } else if (proto === 'socks' || proto === 'http') {
+    server = makeProxyServer({ type: proto, name: f.name, address, port, username: f.username, password: f.password });
+  } else if (proto === 'hysteria2') {
+    server = mkServer(f.name, 'hysteria2', address, port, '', buildHysteria2Outbound({ address, port, auth: f.password, sni: f.sni }));
+  } else if (proto === 'masque') {
+    // the bare outbound; applyServerEdits below writes every field into it and checks it (checkMasque)
+    server = mkServer(f.name, 'masque', address, port, '', {
+      protocol: 'masque', settings: { address, port },
+      streamSettings: { network: 'masque', security: 'tls', tlsSettings: {}, masqueSettings: {} }
+    });
+  } else {
+    const user = proto === 'vless' ? { id: '', encryption: 'none', flow: '' }
+      : proto === 'vmess' ? { id: '', alterId: 0, security: 'auto' } : null;
+    const settings = user ? { vnext: [{ address, port, users: [user] }] }
+      : { servers: [proto === 'shadowsocks' ? { address, port, method: f.method || SF.SS_METHODS[0], password: '', uot: true } : { address, port, password: '' }] };
+    server = mkServer(f.name, proto, address, port, '', { protocol: proto, settings, streamSettings: { network: 'tcp', security: 'none' } });
+  }
+  const made = applyServerEdits(server, f);
+  delete made._edited;   // nothing to keep apart from a provider's version: there is none
+  made.raw = buildShareLink(made);
+  return made;
+}
+
 /* ------------------------------ editing ------------------------------ */
 /**
  * Apply edited fields to an existing server (mutates a clone, returns it).
@@ -657,7 +1097,13 @@ function makeWireguardServer(fields) {
  * Credential/transport fields depend on protocol.
  */
 function applyServerEdits(server, f) {
+  // A JSON server's one source is its config: { name, jsonMode, json }, the
+  // rest re-derived from it — or an Error saying why the config is refused.
+  if (server && server.source === 'json') return applyJsonEdits(server, f);
   const before = editFields(server);
+  // the table's path fields as the record has them, before anything below
+  // rebuilds what holds them (serverFields.applyPathFields writes them back)
+  const keptPaths = SF.readPathFields(server);
   const out = JSON.parse(JSON.stringify(server));
   if (f.name != null) out.name = String(f.name).trim() || out.name;
   const addr = f.address != null ? String(f.address).trim() : out.address;
@@ -693,6 +1139,79 @@ function applyServerEdits(server, f) {
       srv.address = addr; srv.port = port;
       if (f.password) srv.password = f.password;
       if (f.method) srv.method = f.method;
+    }
+    // Its transport, only when the user changed it: a SIP003 plugin typed in
+    // becomes the stream it stands for (ssStream), else the Pro view's
+    // transport and security fields rebuild it. The Simple view sends what it
+    // showed, which changes nothing.
+    const changed = (k) => f[k] != null && formText(k, f[k]) !== formText(k, before[k]);
+    if (changed('plugin')) {
+      ob.streamSettings = ssStream({ plugin: f.plugin }, addr);
+    } else if (SS_STREAM_KEYS.some(changed)) {
+      if (!ob.streamSettings) ob.streamSettings = { network: 'tcp' };
+      rebuildStream(ob, f);
+    }
+  } else if (proto === 'hysteria2') {
+    // Rebuilt from everything it had, the form's values over them: the obfs
+    // password, the hopping ports, a pin or an ECH an empty field clears.
+    const h = hy2Values(ob);
+    const pick = (k, cur) => (f[k] != null ? String(f[k]).trim() : cur);
+    const rebuilt = buildHysteria2Outbound(Object.assign({}, h, {
+      address: addr, port,
+      auth: f.password ? f.password : h.auth,
+      sni: pick('sni', h.sni),
+      insecure: f.allowInsecure != null ? (f.allowInsecure ? '1' : '') : h.insecure,
+      ech: pick('ech', h.ech), pcs: pick('pcs', h.pcs), vcn: pick('vcn', h.vcn),
+      'obfs-password': pick('obfsPassword', h['obfs-password']),
+      obfs: '', mport: pick('mport', h.mport),
+      hopInterval: pick('hopInterval', h.hopInterval), up: pick('up', h.up), down: pick('down', h.down)
+    }));
+    // Masks and QUIC knobs the form does not model stay as they were.
+    const fmWas = (ob.streamSettings && ob.streamSettings.finalmask) || {};
+    const keep = (Array.isArray(fmWas.udp) ? fmWas.udp : []).filter(m => !m || (m.type !== 'salamander' && m.type !== 'udphop'));
+    if (keep.length || (fmWas.quicParams && Object.keys(fmWas.quicParams).length)) {
+      const fm = rebuilt.streamSettings.finalmask || (rebuilt.streamSettings.finalmask = {});
+      if (keep.length) fm.udp = [...keep, ...(fm.udp || [])];
+      if (fmWas.quicParams) {
+        // the bandwidth is the form's now (brutalUp / brutalDown): what it cleared stays cleared
+        const qpWas = Object.assign({}, fmWas.quicParams);
+        if (f.up != null) delete qpWas.brutalUp;
+        if (f.down != null) delete qpWas.brutalDown;
+        fm.quicParams = Object.assign(qpWas, fm.quicParams);
+        if (!Object.keys(fm.quicParams).length) delete fm.quicParams;
+        if (!Object.keys(fm).length) delete rebuilt.streamSettings.finalmask;
+      }
+    }
+    ob.settings = rebuilt.settings;
+    ob.streamSettings = Object.assign({}, ob.streamSettings, rebuilt.streamSettings);
+    if (!rebuilt.streamSettings.finalmask) delete ob.streamSettings.finalmask;
+  } else if (proto === 'masque') {
+    // The core's flat settings and its own stream, always MASQUE over TLS
+    // (`method` is the core's other spelling of the network, and wins over
+    // it). The form's TLS basics are written where it sent them, an empty
+    // one clearing its key; the rest are the table's path fields (below).
+    ob.settings = Object.assign({}, ob.settings, { address: addr, port });
+    const st = ob.streamSettings = Object.assign({}, ob.streamSettings, { network: 'masque', security: 'tls' });
+    delete st.method;
+    delete st.realitySettings;
+    if (!isPlainObject(st.masqueSettings)) st.masqueSettings = {};
+    const tls = st.tlsSettings = Object.assign({}, st.tlsSettings);
+    const put = (key, v) => { if (v == null) return; if (v) tls[key] = v; else delete tls[key]; };
+    const text = (k) => (f[k] == null ? null : String(f[k]).trim());
+    put('serverName', text('sni'));
+    put('fingerprint', text('fp'));
+    put('echConfigList', text('ech'));
+    put('pinnedPeerCertSha256', f.pcs == null ? null : pinList(f.pcs));
+    put('verifyPeerCertByName', f.vcn == null ? null : String(f.vcn).split(',').map(x => x.trim()).filter(Boolean).join(','));
+    // HTTP/2 is ALPN h2; HTTP/3 is the core's default, no ALPN at all — an
+    // ALPN that already says the version asked for is left as it is
+    const http = (text('masqueHttp') || '').toLowerCase();
+    if (http && http !== SF.masqueHttpOf(tls)) {
+      if (http === 'h2') tls.alpn = ['h2']; else delete tls.alpn;
+    }
+    if (f.finalMask != null) {
+      const fm = String(f.finalMask).trim() ? parseFinalMask(f.finalMask) : null;
+      if (fm && Object.keys(fm).length) st.finalmask = fm; else delete st.finalmask;
     }
   } else if (proto === 'socks' || proto === 'http') {
     const srv = ob.settings && ob.settings.servers && ob.settings.servers[0];
@@ -756,6 +1275,16 @@ function applyServerEdits(server, f) {
   // it; clearing it makes the next connect read the certificate again.
   if (f.clearCertPin) { delete out.certPin; delete out.certPinAt; }
 
+  // Everything else the editor has a field for (serverFields.js path fields:
+  // VLESS flow and Encryption, the transports' and TLS's finer knobs, sockopt,
+  // Mux for this server …): the form's value where it changed one, else the
+  // record's own from before the rebuild above; one that no longer applies to
+  // the protocol / transport / security the server has now is left out.
+  SF.applyPathFields(out, f, keptPaths);
+  // what the core would refuse a MASQUE server for, said now — or put right
+  // (a WARP key's PEM made one line, anti-DPI for the HTTP version it has)
+  if (proto === 'masque') checkMasque(out);
+
   // Which fields the user edited, kept on the record (a union over every
   // edit). The form re-sends every field on every save, so a field counts
   // only when the value SUBMITTED differs from what the form SHOWED for it
@@ -791,6 +1320,10 @@ function applyServerEdits(server, f) {
   return out;
 }
 
+/** What a Shadowsocks stream is rebuilt from, when one of them changed (applyServerEdits). */
+const SS_STREAM_KEYS = ['network', 'security', 'sni', 'host', 'path', 'fp', 'pbk', 'sid', 'alpn', 'allowInsecure',
+  'ech', 'pcs', 'vcn', 'pqv', 'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx', 'cipherSuites', 'finalMask'];
+
 /** Fields of the view that follow another one (serviceName is the path) or have no input (alpn). */
 const DERIVED_FIELDS = ['serviceName', 'alpn'];
 function fieldText(v) {
@@ -819,6 +1352,7 @@ function formText(k, v) {
  * value read here can be handed straight back to it.
  */
 function editFields(s) {
+  if (s && s.source === 'json') return jsonEditFields(s);
   const ob = (s && s.outbound) || {};
   const set = ob.settings || {};
   const srv = (set.servers && set.servers[0]) || {};
@@ -846,12 +1380,28 @@ function editFields(s) {
       dns: [...asList(s.dns), ...asList(s.dnsDomains)].join(',')
     });
   }
-  if (proto === 'vless' || proto === 'vmess' || proto === 'trojan') {
+  if (proto === 'hysteria2') {
+    const h = hy2Values(ob);
+    Object.assign(v, {
+      password: h.auth, sni: h.sni, allowInsecure: isTrue(h.insecure), ech: h.ech, pcs: h.pcs, vcn: h.vcn,
+      alpn: h.alpn, obfsPassword: h['obfs-password'], mport: h.mport
+    });
+  }
+  if (proto === 'masque') {
+    // its HTTP version (masqueHttp) is read below with the other special fields
+    const ts = st.tlsSettings || {};
+    Object.assign(v, {
+      sni: ts.serverName || '', fp: ts.fingerprint || '', ech: ts.echConfigList || '', pcs: ts.pinnedPeerCertSha256 || '',
+      vcn: ts.verifyPeerCertByName || '', finalMask: st.finalmask ? JSON.stringify(st.finalmask) : ''
+    });
+  }
+  if (proto === 'vless' || proto === 'vmess' || proto === 'trojan' || proto === 'shadowsocks') {
     const tls = st.tlsSettings || st.realitySettings || {};
     const rs = st.realitySettings || {};
+    const ts = st.tlsSettings || {};
     let path = '', host = '';
     if (st.wsSettings) { path = st.wsSettings.path; host = st.wsSettings.headers && st.wsSettings.headers.Host; }
-    else if (st.grpcSettings) path = st.grpcSettings.serviceName;
+    else if (st.grpcSettings) { path = st.grpcSettings.serviceName; host = st.grpcSettings.authority; }
     else if (st.httpSettings) { path = st.httpSettings.path; host = [].concat(st.httpSettings.host || []).join(','); }
     else if (st.xhttpSettings) { path = st.xhttpSettings.path; host = st.xhttpSettings.host; }
     else if (st.httpupgradeSettings) { path = st.httpupgradeSettings.path; host = st.httpupgradeSettings.host; }
@@ -867,10 +1417,46 @@ function editFields(s) {
       alpn: st.tlsSettings && st.tlsSettings.alpn ? [].concat(st.tlsSettings.alpn).join(',') : '',
       path: path || '', serviceName: path || '', host: host || '',
       cipherSuites: (st.tlsSettings && st.tlsSettings.cipherSuites) || '',
-      finalMask: st.finalmask ? JSON.stringify(st.finalmask) : ''
+      finalMask: st.finalmask ? JSON.stringify(st.finalmask) : '',
+      ech: ts.echConfigList || '', pcs: ts.pinnedPeerCertSha256 || '', vcn: ts.verifyPeerCertByName || '',
+      pqv: rs.mldsa65Verify || ''
     });
   }
+  // what else the stream is built from (TCP's header, the modes, mKCP, spiderX),
+  // Hysteria2's hop interval and bandwidth, a Shadowsocks plugin — read as the window reads them
+  Object.assign(v, SF.specialsOf(s));
+  // every other field the editor has (serverFields.js), where it applies
+  const ctx = SF.contextOf(s);
+  for (const fld of SF.PATH_FIELDS) {
+    if (SF.fieldApplies(fld, ctx)) v[fld.id] = SF.toForm(fld, SF.getPath(s, fld.path));
+  }
   return v;
+}
+
+/**
+ * A hysteria outbound's values in buildHysteria2Outbound's terms — so an edit
+ * rebuilds it from everything it had, with only what the form changed changed.
+ */
+function hy2Values(ob) {
+  const st = (ob && ob.streamSettings) || {};
+  const tls = st.tlsSettings || {};
+  const set = (ob && ob.settings) || {};
+  const fm = st.finalmask || {};
+  const masks = Array.isArray(fm.udp) ? fm.udp : [];
+  const sal = masks.find(m => m && m.type === 'salamander');
+  const hop = masks.find(m => m && m.type === 'udphop');
+  const qp = fm.quicParams || {};
+  return {
+    address: set.address || '', port: set.port,
+    auth: (st.hysteriaSettings && st.hysteriaSettings.auth) || '',
+    sni: tls.serverName || '', insecure: tls.allowInsecure ? '1' : '',
+    alpn: Array.isArray(tls.alpn) ? tls.alpn.join(',') : (tls.alpn || ''),
+    ech: tls.echConfigList || '', pcs: tls.pinnedPeerCertSha256 || '', vcn: tls.verifyPeerCertByName || '',
+    obfs: sal ? 'salamander' : '', 'obfs-password': (sal && sal.settings && sal.settings.password) || '',
+    mport: hop && hop.settings ? String(hop.settings.remotePorts || '') : '',
+    hopInterval: hop && hop.settings && hop.settings.interval != null ? String(hop.settings.interval) : '',
+    up: qp.brutalUp || '', down: qp.brutalDown || ''
+  };
 }
 
 /** Rebuild streamSettings (transport/security) from edit fields, when supplied. */
@@ -878,7 +1464,8 @@ function rebuildStream(ob, f) {
   if (!ob.streamSettings) return;
   const cur = ob.streamSettings;
   // Only rebuild if the user touched transport/security fields.
-  const touched = ['network', 'security', 'sni', 'path', 'host', 'allowInsecure', 'fp', 'pbk', 'sid', 'serviceName', 'alpn', 'cipherSuites', 'finalMask']
+  const touched = ['network', 'security', 'sni', 'path', 'host', 'allowInsecure', 'fp', 'pbk', 'sid', 'serviceName', 'alpn', 'cipherSuites', 'finalMask',
+    'ech', 'pcs', 'vcn', 'pqv', 'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx']
     .some(k => f[k] != null && f[k] !== '');
   if (!touched) return;
 
@@ -886,6 +1473,7 @@ function rebuildStream(ob, f) {
   // editing anything would silently break the config): reality spiderX, xhttp
   // mode, kcp seed/headerType, grpc multiMode.
   const rs = cur.realitySettings || {};
+  const ts = cur.tlsSettings || {};
   const xs = cur.xhttpSettings || {};
   const ks = cur.kcpSettings || {};
   const gs = cur.grpcSettings || {};
@@ -895,32 +1483,51 @@ function rebuildStream(ob, f) {
   // working config stopped connecting. It stays while the server stays on TCP.
   const net = String(f.network || cur.network || 'tcp').toLowerCase();
   const isTcp = (n) => n === 'tcp' || n === 'raw';
-  const th = isTcp(String(cur.network || 'tcp').toLowerCase()) && isTcp(net) &&
+  // (the Pro view can turn it off: header type `none`)
+  const th = f.headerType !== 'none' && isTcp(String(cur.network || 'tcp').toLowerCase()) && isTcp(net) &&
     cur.tcpSettings && cur.tcpSettings.header && cur.tcpSettings.header.type === 'http'
     ? cur.tcpSettings.header : null;
+  const pick = (k, was) => (f[k] != null ? String(f[k]).trim() : was);
+  // gRPC's gun / multi and XHTTP's mode: the Pro view's, else what the record had
+  const mode = net === 'grpc'
+    ? (f.grpcMode != null ? (f.grpcMode === 'multi' ? 'multi' : '') : (gs.multiMode ? 'multi' : ''))
+    : net === 'xhttp' && f.xhttpMode ? String(f.xhttpMode).trim()
+      : (xs.mode || (gs.multiMode ? 'multi' : ''));
+  const tcpHeader = f.headerType != null ? (f.headerType === 'http' ? 'http' : '') : (th ? 'http' : '');
 
   const q = {
     type: f.network || cur.network || 'tcp',
     security: f.security || cur.security || 'none',
     sni: f.sni,
     path: f.path,
-    host: f.host,
+    // gRPC's Host field is its :authority (below) — never the SNI's fallback,
+    // which an empty SNI would otherwise take it as (a fronted server renamed
+    // with its SNI rewritten to the real host)
+    host: String(f.network || cur.network || '').toLowerCase() === 'grpc' ? '' : f.host,
     serviceName: f.serviceName,
     fp: f.fp,
     pbk: f.pbk,
     sid: f.sid,
     alpn: f.alpn,
     allowInsecure: f.allowInsecure ? '1' : '0',
-    // preserved passthroughs
-    spx: rs.spiderX || '',
-    mode: xs.mode || (gs.multiMode ? 'multi' : ''),
-    seed: ks.seed || '',
+    // what the Simple view has no field for: the Pro view's value, else the record's
+    spx: pick('spx', rs.spiderX || ''),
+    mode,
+    seed: pick('kcpSeed', ks.seed || ''),
     // each transport's own header type: kcp's never lands on tcp, nor the reverse
-    headerType: (net === 'kcp' || net === 'mkcp') ? ((ks.header && ks.header.type) || '') : (th ? 'http' : ''),
+    headerType: (net === 'kcp' || net === 'mkcp') ? pick('kcpHeader', (ks.header && ks.header.type) || '') : tcpHeader,
     // patterniha: cipherSuites (tls) + finalMask (stream). Edited value wins,
     // else keep whatever the config already had.
     cipherSuites: f.cipherSuites != null ? f.cipherSuites : ((cur.tlsSettings && cur.tlsSettings.cipherSuites) || ''),
-    finalMask: f.finalMask != null ? f.finalMask : (cur.finalmask ? JSON.stringify(cur.finalmask) : '')
+    finalMask: f.finalMask != null ? f.finalMask : (cur.finalmask ? JSON.stringify(cur.finalmask) : ''),
+    // newer TLS / REALITY knobs: the form's value, else what the record had
+    ech: f.ech != null ? f.ech : (ts.echConfigList || ''),
+    pcs: f.pcs != null ? f.pcs : (ts.pinnedPeerCertSha256 || ''),
+    vcn: f.vcn != null ? f.vcn : (ts.verifyPeerCertByName || ''),
+    pqv: f.pqv != null ? f.pqv : (rs.mldsa65Verify || ''),
+    // gRPC's :authority is what the form's Host field shows for it
+    authority: net === 'grpc' ? (f.host != null ? f.host : (gs.authority || '')) : '',
+    mtu: ks.mtu
   };
   const rebuilt = buildStreamSettings(q);
 
@@ -942,6 +1549,9 @@ function rebuildStream(ob, f) {
     }
     rebuilt.tcpSettings = Object.assign({}, cur.tcpSettings, { header });
   }
+  // The socket options are no transport's and no handshake's: they stay
+  // (a rebuild used to drop them, and every edit with them)
+  if (cur.sockopt) rebuilt.sockopt = cur.sockopt;
 
   ob.streamSettings = rebuilt;
 }
@@ -985,7 +1595,7 @@ function mkServer(name, protocol, address, port, raw, outbound) {
 /** A URI scheme at the start of a line, and the ones we can import. */
 const SCHEME = /^([a-z][a-z0-9+.-]*):\/\//i;
 const SCHEME_LINE = /^[a-z][a-z0-9+.-]*:\/\//im;
-const SUPPORTED = /^(vless|vmess|trojan|ss|socks|socks5|wireguard|wg):\/\//i;
+const SUPPORTED = /^(vless|vmess|trojan|ss|socks|socks5|wireguard|wg|hysteria2|hy2):\/\//i;
 
 /**
  * Parse a single share link into a server object. Throws on failure.
@@ -1002,6 +1612,7 @@ function parseLink(link) {
   if (l.startsWith('ss://')) return parseShadowsocks(l);
   if (l.startsWith('socks://') || l.startsWith('socks5://')) return parseSocks(l);
   if (l.startsWith('wireguard://') || l.startsWith('wg://')) return parseWireguard(l);
+  if (l.startsWith('hysteria2://') || l.startsWith('hy2://')) return parseHysteria2(l);
   // case-insensitive to match HTTP_PROXY_LINK's /i (and parseMany's line filter),
   // so an uppercase scheme imports instead of being reported as an error
   if (/^http:\/\//i.test(l) && isHttpProxyLink(l)) return parseHttpProxy(l);
@@ -1016,6 +1627,12 @@ function parseLink(link) {
  */
 function parseMany(text) {
   let body = String(text || '').trim();
+
+  // JSON — one Xray config, an array of them (a JSON subscription), the same
+  // base64-encoded, or a sing-box config — is read whole (jsonImport.js);
+  // Clash YAML is refused by name. Anything else: null, and on to the links.
+  const j = importJson(body);
+  if (j) return j;
 
   // A pasted .conf is ONE config spanning many lines — handle it before the
   // per-line loop, which would otherwise see [Interface] and skip everything.
@@ -1066,7 +1683,11 @@ function streamToQuery(st) {
   q.type = net;
   q.security = st.security || 'none';
   if (net === 'ws' && st.wsSettings) { q.path = st.wsSettings.path || ''; q.host = (st.wsSettings.headers && (st.wsSettings.headers.Host || st.wsSettings.headers.host)) || ''; }
-  else if (net === 'grpc' && st.grpcSettings) { q.serviceName = st.grpcSettings.serviceName || ''; if (st.grpcSettings.multiMode) q.mode = 'multi'; }
+  else if (net === 'grpc' && st.grpcSettings) {
+    q.serviceName = st.grpcSettings.serviceName || '';
+    if (st.grpcSettings.multiMode) q.mode = 'multi';
+    if (st.grpcSettings.authority) q.authority = st.grpcSettings.authority;
+  }
   else if ((net === 'h2' || net === 'http') && st.httpSettings) { q.path = st.httpSettings.path || ''; q.host = (st.httpSettings.host || []).join(','); }
   else if (net === 'xhttp' && st.xhttpSettings) {
     q.path = st.xhttpSettings.path || ''; q.host = st.xhttpSettings.host || '';
@@ -1075,22 +1696,43 @@ function streamToQuery(st) {
     if (extra && typeof extra === 'object' && !Array.isArray(extra) && Object.keys(extra).length) q.extra = JSON.stringify(extra);
   }
   else if (net === 'httpupgrade' && st.httpupgradeSettings) { q.path = st.httpupgradeSettings.path || ''; q.host = st.httpupgradeSettings.host || ''; }
-  else if (net === 'kcp' && st.kcpSettings) { q.headerType = (st.kcpSettings.header && st.kcpSettings.header.type) || 'none'; if (st.kcpSettings.seed) q.seed = st.kcpSettings.seed; }
+  else if (net === 'kcp' && st.kcpSettings) {
+    q.headerType = (st.kcpSettings.header && st.kcpSettings.header.type) || 'none';
+    if (st.kcpSettings.seed) q.seed = st.kcpSettings.seed;
+    if (st.kcpSettings.mtu) q.mtu = String(st.kcpSettings.mtu);
+  }
   else if ((net === 'tcp' || net === 'raw') && st.tcpSettings && st.tcpSettings.header && st.tcpSettings.header.type === 'http') {
     q.headerType = 'http'; const rq = st.tcpSettings.header.request || {};
     q.path = (rq.path && rq.path[0]) || ''; q.host = (rq.headers && rq.headers.Host && rq.headers.Host[0]) || '';
   }
   const tls = st.tlsSettings, rl = st.realitySettings;
-  if (tls) { q.sni = tls.serverName || ''; q.fp = tls.fingerprint || ''; if (tls.allowInsecure) q.allowInsecure = '1'; if (tls.alpn) q.alpn = Array.isArray(tls.alpn) ? tls.alpn.join(',') : tls.alpn; if (tls.cipherSuites) q.cs = tls.cipherSuites; }
-  if (rl) { q.sni = rl.serverName || ''; q.fp = rl.fingerprint || ''; q.pbk = rl.publicKey || ''; q.sid = rl.shortId || ''; if (rl.spiderX) q.spx = rl.spiderX; }
+  if (tls) {
+    q.sni = tls.serverName || ''; q.fp = tls.fingerprint || '';
+    if (tls.allowInsecure) q.allowInsecure = '1';
+    if (tls.alpn) q.alpn = Array.isArray(tls.alpn) ? tls.alpn.join(',') : tls.alpn;
+    if (tls.cipherSuites) q.cs = tls.cipherSuites;
+    if (tls.echConfigList) q.ech = tls.echConfigList;
+    if (tls.pinnedPeerCertSha256) q.pcs = tls.pinnedPeerCertSha256;
+    if (tls.verifyPeerCertByName) q.vcn = tls.verifyPeerCertByName;
+  }
+  if (rl) {
+    q.sni = rl.serverName || ''; q.fp = rl.fingerprint || ''; q.pbk = rl.publicKey || ''; q.sid = rl.shortId || '';
+    if (rl.spiderX) q.spx = rl.spiderX;
+    if (rl.mldsa65Verify) q.pqv = rl.mldsa65Verify;
+  }
   if (st.finalmask) q.fm = JSON.stringify(st.finalmask);
   return q;
 }
+
+/** The SIP002 plugin a Shadowsocks stream stands for (ssStream's inverse); '' for plain TCP — serverFields.js's. */
+const ssPluginOf = SF.ssPluginOf;
 
 const qs = (o) => Object.keys(o).filter(k => o[k] !== undefined && o[k] !== null && o[k] !== '').map(k => `${k}=${enc(o[k])}`).join('&');
 
 /** Serialize a server (with ALL its settings) back into a shareable link. */
 function buildShareLink(server) {
+  // A JSON server is shared as its config, pretty-printed: there is no link for it.
+  if (server && server.source === 'json') return JSON.stringify(server.json, null, 2);
   const ob = server.outbound || {};
   const proto = server.protocol;
   const name = server.name ? '#' + enc(server.name) : '';
@@ -1114,6 +1756,15 @@ function buildShareLink(server) {
     const u = ob.settings.vnext[0].users[0]; const p = streamToQuery(ob.streamSettings);
     const v = { v: '2', ps: server.name || '', add: server.address, port: String(server.port), id: u.id, aid: String(u.alterId || 0), scy: u.security || 'auto',
       net: p.type || 'tcp', type: p.headerType || 'none', host: p.host || '', path: p.path || p.serviceName || '', tls: p.security === 'tls' ? 'tls' : '', sni: p.sni || '', fp: p.fp || '', alpn: p.alpn || '' };
+    // the second value of a transport, where parseVmess reads it back (v2rayN's places)
+    if (p.type === 'grpc') { v.host = p.authority || ''; if (p.mode) v.type = p.mode; }
+    else if (p.type === 'xhttp' && p.mode) v.type = p.mode;
+    else if (p.type === 'kcp' && p.seed) v.path = p.seed;
+    if (p.type === 'xhttp' && p.extra) v.extra = p.extra;
+    if (p.allowInsecure) v.insecure = '1';
+    if (p.ech) v.ech = p.ech;
+    if (p.pcs) v.pcs = p.pcs;
+    if (p.vcn) v.vcn = p.vcn;
     if (p.cs) v.cs = p.cs;
     if (p.fm) v.fm = p.fm;
     if (extras.fragment) v.fragment = extras.fragment;
@@ -1123,7 +1774,34 @@ function buildShareLink(server) {
   }
   if (proto === 'shadowsocks') {
     const srv = ob.settings.servers[0];
-    return `ss://${Buffer.from(`${srv.method}:${srv.password}`).toString('base64')}@${joinHostPort(server.address, server.port)}${name}`;
+    const plugin = ssPluginOf(ob.streamSettings);
+    const query = plugin ? `/?plugin=${enc(plugin)}` : '';
+    return `ss://${Buffer.from(`${srv.method}:${srv.password}`).toString('base64')}@${joinHostPort(server.address, server.port)}${query}${name}`;
+  }
+  if (proto === 'hysteria2') {
+    const st = ob.streamSettings || {};
+    const tls = st.tlsSettings || {};
+    const masks = (st.finalmask && Array.isArray(st.finalmask.udp)) ? st.finalmask.udp : [];
+    const salamander = masks.find(m => m && m.type === 'salamander');
+    const hop = masks.find(m => m && m.type === 'udphop');
+    const qp = (st.finalmask && st.finalmask.quicParams) || {};
+    const q = {
+      sni: tls.serverName || '',
+      insecure: tls.allowInsecure ? '1' : '',
+      alpn: Array.isArray(tls.alpn) ? tls.alpn.join(',') : (tls.alpn || ''),
+      pinSHA256: tls.pinnedPeerCertSha256 || '',
+      ech: tls.echConfigList || '',
+      vcn: tls.verifyPeerCertByName || '',
+      obfs: salamander ? 'salamander' : '',
+      'obfs-password': salamander && salamander.settings ? salamander.settings.password || '' : '',
+      mport: hop && hop.settings ? String(hop.settings.remotePorts || '') : '',
+      hopInterval: hop && hop.settings && hop.settings.interval != null && String(hop.settings.interval) !== HOP_INTERVAL ? String(hop.settings.interval) : '',
+      up: String(qp.brutalUp || '').replace(/\s*mbps$/i, ''),
+      down: String(qp.brutalDown || '').replace(/\s*mbps$/i, ''),
+      engine: extras.engine
+    };
+    const auth = (st.hysteriaSettings && st.hysteriaSettings.auth) || '';
+    return `hysteria2://${enc(auth)}@${joinHostPort(server.address, server.port)}/?${qs(q)}${name}`;
   }
   if (proto === 'socks' || proto === 'http') {
     const srv = ob.settings.servers[0]; const c = srv.users && srv.users[0];
@@ -1143,6 +1821,18 @@ function buildShareLink(server) {
       dns: [...asList(server.dns), ...asList(server.dnsDomains)].join(',')
     };
     return `wireguard://${enc(st.secretKey || '')}@${joinHostPort(server.address, server.port)}?${qs(q)}${name}`;
+  }
+  if (proto === 'masque') {
+    // No link (see the MASQUE section): the Xray config it is, on one line —
+    // its remarks and its one outbound, without what is this device's own
+    // (the table's `local` fields; anti-DPI and the core are the device's
+    // choice too) — which jsonImport.js reads back as this very server.
+    const shared = { outbound: JSON.parse(JSON.stringify(ob)) };
+    for (const fld of SF.PATH_FIELDS) if (fld.local && fld.path[0] !== '@') SF.setPath(shared, fld.path, undefined);
+    delete shared.outbound._fragment;
+    delete shared.outbound._noise;
+    delete shared.outbound.tag;
+    return JSON.stringify({ remarks: server.name || '', outbounds: [Object.assign({ tag: 'proxy' }, shared.outbound)] });
   }
   return server.raw || '';   // unknown protocol: fall back to the imported link
 }
@@ -1312,7 +2002,7 @@ function migrateStoredServer(server) {
 
 module.exports = {
   parseLink, parseMany, b64decode, isHttpProxyLink,
-  buildStreamSettings, buildWireguardOutbound, makeWireguardServer, makeProxyServer, applyServerEdits, editFields,
-  parseWireguardConf, isWireguardConf, splitDnsField,
-  buildShareLink, migrateStoredServer
+  buildStreamSettings, buildWireguardOutbound, makeWireguardServer, makeProxyServer, applyServerEdits, editFields, createServer,
+  parseWireguardConf, isWireguardConf, splitDnsField, masqueServer,
+  buildShareLink, migrateStoredServer, ssPluginOf
 };

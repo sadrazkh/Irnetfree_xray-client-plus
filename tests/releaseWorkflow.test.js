@@ -230,6 +230,77 @@ test('the release workflow builds and publishes the OpenWrt package', () => {
   assert.match(job, /fail_on_unmatched_files: true/, 'no ipk, no green release');
 });
 
+/** The openwrt job's `- name: Build ipk` step: its keys and its `run: |` script. */
+function buildIpkStep() {
+  const lines = YML.replace(/\r\n/g, '\n').split('\n');
+  const job = lines.findIndex(l => l === '  openwrt:');
+  assert.ok(job >= 0, 'release.yml has an openwrt job');
+  const start = lines.findIndex((l, i) => i > job && /^ {6}- name: Build ipk\s*$/.test(l));
+  assert.ok(start >= 0, 'the openwrt job has a "Build ipk" step');
+  const keys = {};
+  const run = [];
+  let inRun = false;
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^ {6}- /.test(l) || /^ {0,5}\S/.test(l)) break;
+    if (inRun) {
+      if (l.trim() === '' || /^ {10}/.test(l)) { run.push(l.slice(10)); continue; }
+      inRun = false;
+    }
+    const m = /^ {8}([\w-]+):\s*(.*)$/.exec(l);
+    if (!m) continue;
+    keys[m[1]] = m[2];
+    inRun = m[1] === 'run';
+  }
+  return { keys, script: run.join('\n').trim() + '\n' };
+}
+
+/*
+ * The ipk's files carry the tagged commit's time. uhttpd serves a LuCI view
+ * with its mtime as Last-Modified and no Cache-Control, and a browser keeps a
+ * response fresh for a tenth of its age — stamped 1970 (build-ipk's old
+ * default) that was years, so after an upgrade the owner kept the old views.
+ * Run for real: the step's lines up to the build, in a scratch git repo whose
+ * one commit has a known time, with `node` replaced by a function that records
+ * the SOURCE_DATE_EPOCH it was handed.
+ */
+test('the OpenWrt release package is stamped with the tagged commit\'s time (SOURCE_DATE_EPOCH), not 1970', (t) => {
+  const bash = findBash();
+  if (!bash) return t.skip('no bash on this machine');
+  const { keys, script } = buildIpkStep();
+  assert.equal(keys.shell, 'bash');
+  const lines = script.split('\n');
+  const build = lines.findIndex(l => /^node openwrt\/build-ipk\.js dist$/.test(l.trim()));
+  assert.ok(build >= 0, 'the step builds with node openwrt/build-ipk.js dist');
+  assert.ok(lines.slice(0, build).some(l => /SOURCE_DATE_EPOCH/.test(l)), 'SOURCE_DATE_EPOCH is set before the build');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-rel-'));
+  try {
+    const git = (...a) => spawnSync('git', a, {
+      cwd: root, encoding: 'utf8',
+      env: Object.assign({}, process.env, { GIT_AUTHOR_DATE: '1790000000 +0000', GIT_COMMITTER_DATE: '1790000000 +0000' })
+    });
+    if (git('init', '-q').status !== 0) return t.skip('no git on this machine');
+    const c = git('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-q', '--no-verify', '--allow-empty', '-m', 'tag');
+    assert.equal(c.status, 0, c.stderr);
+    const file = path.join(root, 'step.sh');
+    fs.writeFileSync(file, [
+      'node() { printf "%s" "${SOURCE_DATE_EPOCH-unset}" > seen.txt; }',
+      ...lines.slice(0, build + 1)
+    ].join('\n') + '\n');
+    const r = spawnSync(bash, ['--noprofile', '--norc', '-eo', 'pipefail', file], { cwd: root, encoding: 'utf8' });
+    assert.equal(r.status, 0, `step failed:\n${r.stdout}\n${r.stderr}`);
+    assert.equal(fs.readFileSync(path.join(root, 'seen.txt'), 'utf8'), '1790000000', 'build-ipk is handed the commit\'s time, exported');
+    // a step that cannot read the commit time must fail, not build a package stamped 1970 (or "now")
+    fs.rmSync(path.join(root, '.git'), { recursive: true, force: true });
+    fs.rmSync(path.join(root, 'seen.txt'), { force: true });
+    const r2 = spawnSync(bash, ['--noprofile', '--norc', '-eo', 'pipefail', file], { cwd: root, encoding: 'utf8', env: Object.assign({}, process.env, { GIT_CEILING_DIRECTORIES: path.dirname(root) }) });
+    assert.notEqual(r2.status, 0, 'no commit time, no build');
+    assert.equal(fs.existsSync(path.join(root, 'seen.txt')), false, 'build-ipk never ran');
+  } finally {
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
+  }
+});
+
 test('the test workflow boots OpenWrt in QEMU and runs the smoke', () => {
   const tests = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'test.yml'), 'utf8').replace(/\r\n/g, '\n');
   const at = tests.indexOf('\n  openwrt:\n');
@@ -246,4 +317,90 @@ test('the test workflow boots OpenWrt in QEMU and runs the smoke', () => {
   assert.match(job, /timeout-minutes: \d+/, 'TCG is slow; a hang must not run for six hours');
   // a testable package from every push, not only from a tag
   assert.match(job, /uses: actions\/upload-artifact@v4[\s\S]*name: IRNetFree-OpenWrt-dev[\s\S]*path: dist\/irnetfree_\*_all\.ipk/);
+});
+
+/** The `run: |` script and the env keys of the android job's step named `name`. */
+function androidStep(name) {
+  const lines = YML.split(/\r?\n/);
+  const at = lines.findIndex(l => l.trim() === '- name: ' + name);
+  assert.ok(at >= 0, 'release.yml has a "' + name + '" step');
+  const body = [];
+  for (let i = at + 1; i < lines.length; i++) {
+    if (/^\s{6}-\s/.test(lines[i]) || /^\s{2}\S/.test(lines[i])) break;
+    body.push(lines[i]);
+  }
+  const text = body.join('\n');
+  const runAt = body.findIndex(l => /^\s+run: \|\s*$/.test(l));
+  const run = runAt < 0 ? '' : body.slice(runAt + 1).map(l => l.replace(/^ {10}/, '')).join('\n');
+  return { text, run };
+}
+
+/*
+ * Every release before v1.16.3 was signed with the runner's throwaway debug key
+ * (no keystore secret), so each version carried a different certificate and a
+ * phone with an older copy refused the update: "App not installed as package
+ * appears to be invalid". The real key is four secrets; with one missing Gradle
+ * falls back to that debug key without a word.
+ */
+test('a release key is all four secrets or none — a partial set fails the build', (t) => {
+  const bash = findBash();
+  if (!bash) return t.skip('no bash here');
+  const { run } = androidStep('Decode release keystore (if configured)');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-ks-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'step.sh');
+  fs.writeFileSync(file, run);
+  const go = (env) => {
+    const out = path.join(dir, 'out-' + Object.keys(env).join('-'));
+    fs.writeFileSync(out, '');
+    const r = spawnSync(bash, ['--noprofile', '--norc', '-eo', 'pipefail', file], {
+      encoding: 'utf8',
+      env: Object.assign({}, process.env, { RUNNER_TEMP: dir, GITHUB_OUTPUT: out, KS_B64: '', KS_PASS: '', KS_ALIAS: '', KS_KEY_PASS: '' }, env)
+    });
+    return { status: r.status, text: r.stdout + r.stderr, output: fs.readFileSync(out, 'utf8') };
+  };
+  const b64 = Buffer.from('not really a keystore').toString('base64');
+  const none = go({});
+  assert.equal(none.status, 0, 'no key at all: a fork still builds (debug-signed)');
+  assert.match(none.text, /No keystore secret/);
+  for (const missing of ['KS_PASS', 'KS_ALIAS', 'KS_KEY_PASS']) {
+    const env = { KS_B64: b64, KS_PASS: 'p', KS_ALIAS: 'irnetfree', KS_KEY_PASS: 'p' };
+    env[missing] = '';
+    const r = go(env);
+    assert.notEqual(r.status, 0, 'the keystore with ' + missing + ' empty must fail the step');
+    assert.match(r.text, /::error::/);
+    assert.doesNotMatch(r.output, /path=/, 'and hand Gradle no keystore');
+  }
+  const all = go({ KS_B64: b64, KS_PASS: 'p', KS_ALIAS: 'irnetfree', KS_KEY_PASS: 'p' });
+  assert.equal(all.status, 0, all.text);
+  assert.match(all.output, /^path=.*release\.keystore$/m);
+});
+
+test('with the release key configured, a tag never ships the debug APK', () => {
+  const { text, run } = androidStep('Collect APK');
+  assert.match(text, /KEYSTORE_PATH: \$\{\{ steps\.keystore\.outputs\.path \}\}/, 'the step knows whether a real key was configured');
+  const refuse = run.indexOf('refusing to publish the debug build');
+  const warn = run.indexOf('this release carries the DEBUG build');
+  assert.ok(refuse > 0 && warn > refuse, 'the refusal comes before the old warn-and-ship path');
+  assert.match(run.slice(0, warn), /KEYSTORE_PATH[\s\S]*GITHUB_REF_TYPE[\s\S]*exit 1/);
+});
+
+test("the APK's certificate is pinned to IRNetFree's release key", () => {
+  const { text, run } = androidStep("Verify the APK's certificate (release key)");
+  assert.match(text, /if: steps\.keystore\.outputs\.path != ''/, 'only where the real key was used (a fork without it still builds)');
+  assert.match(text, /EXPECTED_CERT_SHA256: aabda682057fde3ea565c0d972ea103eed0d6c9ee20232bee98f0b6fc8ce3fc6/);
+  assert.match(run, /apksigner" verify --print-certs "\$GITHUB_WORKSPACE\/\$\{\{ steps\.apk\.outputs\.file \}\}"/);
+  // The runner's apksigner (build-tools 36) says "V2 Signer: certificate SHA-256 digest: …";
+  // older ones "Signer #1 certificate …" or "Signer (minSdkVersion=…) certificate …". Every
+  // signer is read, a source stamp's certificate set aside, and all must be the one key.
+  assert.ok(run.includes("grep -v -i 'source stamp' | sed -n 's/^.*certificate SHA-256 digest: *//p'"),
+    'reads every signer line, whatever apksigner calls it, except a source stamp');
+  assert.match(run, /sort -u\)"/, 'two different certificates can never pass as one');
+  assert.match(run, /^\s*echo "\$out"\s*$/m, 'apksigner\'s whole answer is in the log');
+  assert.match(run, /exit 1/);
+  const lines = YML.split(/\r?\n/);
+  const verify = lines.findIndex(l => l.includes("- name: Verify the APK's certificate"));
+  const upload = lines.findIndex(l => l.includes('- name: Upload APK artifact'));
+  const publish = lines.findIndex(l => l.includes('- name: Publish APK to GitHub Release'));
+  assert.ok(verify > 0 && verify < upload && verify < publish, 'checked before anything is uploaded or published');
 });

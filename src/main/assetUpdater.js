@@ -23,15 +23,42 @@ function versionNumber(s) {
   return m ? `${m[1]}.${m[2]}.${m[3]}` : '';
 }
 
-/** Numeric dotted compare: 1 if a > b, -1 if a < b, 0 if equal. A leading v is ignored. */
+/**
+ * Numeric dotted compare: 1 if a > b, -1 if a < b, 0 if equal. A leading v is
+ * ignored. A pre-release part (`1.13.0-beta.3`, sing-box's tags) ranks the way
+ * semver says: below its own release, identifiers dot by dot — numbers as
+ * numbers and below words, words in ASCII order (alpha < beta < rc). Versions
+ * without one compare exactly as they always did.
+ */
 function cmpVersion(a, b) {
-  const pa = String(a || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
-  const pb = String(b || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const split = (v) => {
+    const s = String(v || '').trim().replace(/^v/i, '');
+    const dash = s.indexOf('-');
+    return dash < 0 ? [s, ''] : [s.slice(0, dash), s.slice(dash + 1).toLowerCase()];
+  };
+  const [ca, prea] = split(a);
+  const [cb, preb] = split(b);
+  const pa = ca.split('.').map(n => parseInt(n, 10) || 0);
+  const pb = cb.split('.').map(n => parseInt(n, 10) || 0);
   const len = Math.max(pa.length, pb.length);
   for (let i = 0; i < len; i++) {
     const x = pa[i] || 0, y = pb[i] || 0;
     if (x > y) return 1;
     if (x < y) return -1;
+  }
+  if (prea === preb) return 0;
+  if (!prea) return 1;
+  if (!preb) return -1;
+  const ia = prea.split('.'), ib = preb.split('.');
+  for (let i = 0; i < Math.max(ia.length, ib.length); i++) {
+    if (i >= ia.length) return -1;
+    if (i >= ib.length) return 1;
+    const x = ia[i], y = ib[i];
+    if (x === y) continue;
+    const nx = /^\d+$/.test(x), ny = /^\d+$/.test(y);
+    if (nx && ny) return Number(x) > Number(y) ? 1 : -1;
+    if (nx !== ny) return nx ? -1 : 1;
+    return x > y ? 1 : -1;
   }
   return 0;
 }
@@ -55,6 +82,15 @@ class AssetUpdater {
     this.now = o.now || (() => Date.now());
     this.timer = null;
     this.firstTimer = null;
+    /**
+     * Cores whose last download put back the version they had: { installed,
+     * target } by id. The release the target names could not be fetched (a
+     * 404, or the API's 60-an-hour limit) and the downloader installed the
+     * latest stable again (downloader.defaultRelease). Not downloaded again
+     * while the installed version and the target are the same — a restart, or
+     * a newer target, tries again.
+     */
+    this.unmoved = {};
   }
 
   mode() {
@@ -81,7 +117,19 @@ class AssetUpdater {
           const cur = versionNumber(await this.o.currentVersion(id));
           const latest = versionNumber(await this.o.latestVersion(id));
           // An unreadable version on either side is not a reason to download.
-          if (cur && latest && cmpVersion(latest, cur) > 0) { await this.o.download(id); done.push(id); }
+          if (!(cur && latest && cmpVersion(latest, cur) > 0)) continue;
+          const miss = this.unmoved[id];
+          if (miss && miss.installed === cur && miss.target === latest) continue;   // the same miss as last time
+          await this.o.download(id);
+          // Updated is what the core says now — not that a download ran.
+          const after = versionNumber(await this.o.currentVersion(id));
+          if (after && after !== cur) { done.push(id); delete this.unmoved[id]; continue; }
+          if (after) {
+            this.unmoved[id] = { installed: cur, target: latest };
+            this.o.onLog(`${id}: the update put ${cur} back (${latest} could not be fetched) — not downloaded again while ${latest} is the newest`, 'warn');
+          } else {
+            this.o.onLog(`${id}: downloaded, but its version cannot be read — not counted as updated`, 'warn');
+          }
         } catch (e) { this.o.onLog(`Update check failed for ${id}: ` + e.message, 'warn'); }
       }
     }

@@ -321,10 +321,7 @@
     const ver = c && c.version ? c.version : '';
     $('#xsCoreVersion').textContent = ver;
     $('#xsCoreVersion2').textContent = t('xs.coreVersion') + ': ' + (ver || t('xs.coreNotInstalled'));
-    const out = [];
-    if (c && c.latestStable) out.push(t('xs.coreStable') + ' ' + c.latestStable);
-    if (c && c.latestAny) out.push(t('xs.coreAny') + ' ' + c.latestAny);
-    $('#xsCoreCheckOut').textContent = out.join(' · ');
+    $('#xsCoreCheckOut').textContent = c && c.latest ? t('xs.coreDefault') + ' ' + c.latest : '';
   }
 
   /* ----------------------------- inbounds ----------------------------- */
@@ -755,7 +752,6 @@
       .map(e => '<option value="' + attr(e.id) + '"' + (e.installed ? '' : ' disabled') + '>' + escapeHtml(e.label || e.id) + '</option>')
       .join('');
     sel.value = m.engine;
-    $('#xsCoreChannel').value = (state.settings && state.settings.coreChannel) || 'stable';
     $('#xsLogLevel').value = m.logLevel;
     $('#xsPublicAddr').value = m.publicAddress;
     $('#xsAutoStart').checked = !!m.autoStart;
@@ -1552,22 +1548,17 @@
     $('#xsLogLevel').onchange = setField('logLevel', (m) => { m.logLevel = $('#xsLogLevel').value; });
     $('#xsPublicAddr').onchange = setField('publicAddress', (m) => { m.publicAddress = $('#xsPublicAddr').value.trim(); });
     $('#xsAutoStart').onchange = setField('autoStart', (m) => { m.autoStart = $('#xsAutoStart').checked; });
-    $('#xsCoreChannel').onchange = async () => {
-      // an ordinary app setting, not part of the server model
-      const coreChannel = $('#xsCoreChannel').value === 'latest' ? 'latest' : 'stable';
-      let res;
-      try { res = await window.api.setSettings({ coreChannel }); }
-      catch (e) { return toast((e && e.message) || String(e), 'err'); }
-      if (res && res.settings) state.settings = res.settings;
-      else if (state.settings) state.settings.coreChannel = coreChannel;
-      refreshCore(false);
+    // any version of the core: upstream's picker (app.js), the same one Settings → Required files opens
+    $('#btnXsCorePick').onclick = () => {
+      const btn = $('#btnXsCorePick');
+      if (typeof openCorePicker === 'function') openCorePicker(xs.model.engine || 'xray', btn);
     };
     $('#btnXsCoreCheck').onclick = async () => {
       const btn = $('#btnXsCoreCheck');
       btn.disabled = true;
       const r = await refreshCore(true);
       btn.disabled = false;
-      if (!r || (!r.latestStable && !r.latestAny)) $('#xsCoreCheckOut').textContent = t('xs.coreOffline');
+      if (!r || !r.latest) $('#xsCoreCheckOut').textContent = t('xs.coreOffline');
     };
     $('#btnXsCoreLatest').onclick = async () => {
       const btn = $('#btnXsCoreLatest');

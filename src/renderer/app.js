@@ -16,6 +16,8 @@ const state = {
   activeServerId: null,   // currently connected server
   activeEngine: '',       // core the live connection runs on
   selectedServerId: null, // chosen in the picker (target for connect)
+  savedSelection: null,   // what main last stored as the selection (keepSelectionValid)
+  lastServerId: null,     // the last connection made — a selection that is gone falls back to it
   connected: false,
   connecting: false,
   tunAvailable: false,
@@ -29,6 +31,11 @@ const state = {
   chain: [],               // legacy: ordered server ids (first hop → exit)
   chains: [],              // [{ id, name, members:[serverId,...] }] — first-class chains
   pool: [],                // [{ id, name, target, socksPort, httpPort, enabled }] — multi-proxy pool
+  // [{ id, name, rules, def, defVia, useMode, base }] — routing profiles (several
+  // advanced routings); null on a back end without them, which keeps the
+  // routing page today's single advanced routing
+  profiles: null,
+  profileSel: null,        // the profile the routing page edits
   editingId: null,         // server being edited in the modal
   // Settings saved while connected that the live tunnel is NOT using yet.
   // Owned by main (it knows what the running config was built from) — the
@@ -36,6 +43,15 @@ const state = {
   pendingReconnect: [],
   pendingDismissed: false, // user chose "later"; keep the banner out of the way
   wasReconnecting: false,  // main is rebuilding after a network change (toast on success)
+  // what the live connection did not do — proxy only, the leak guard — kept on
+  // Home under the state while it is up (connIssuesFrom / renderConnIssues)
+  connIssues: [],
+  // main's notices about this PC (W1/W3/W4) already toasted for this connection
+  noticesToasted: new Set(),
+  // …and those about the store itself (a WireGuard identity stored twice), toasted once per run
+  noticesOnce: new Set(),
+  // Windows: the logon task starts another copy of the app ({ task, current }) — checkAutostart
+  autostartStale: null,
   // lifetime traffic per config id — survives disconnect and restart
   usage: {},
   pings: {} // id -> { tcp, real }
@@ -48,6 +64,31 @@ function toast(msg, kind = '', ms = 2600) {
   el.className = 'toast show ' + kind;
   clearTimeout(toast._t);
   toast._t = setTimeout(() => { el.className = 'toast'; }, ms);
+}
+
+/**
+ * A toast that carries one button — for a message whose fix is a single click
+ * ("not applied yet — Reconnect"). It stays up longer than a plain toast, the
+ * button runs `run` and takes the toast away, and the next plain toast()
+ * replaces it like any other. Hiding drops only `show`: the toast fades out
+ * where it stood (and is click-through again) instead of jumping back to the
+ * plain toast's position mid-fade.
+ */
+function toastAction(msg, label, run, kind = 'warn', ms = 12000) {
+  const el = $('#toast');
+  const hide = () => { el.className = 'toast has-action ' + kind; };
+  el.textContent = '';
+  const text = document.createElement('span');
+  text.textContent = msg;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn small toast-action';
+  btn.textContent = label;
+  btn.onclick = () => { clearTimeout(toast._t); hide(); run(); };
+  el.append(text, btn);
+  el.className = 'toast show has-action ' + kind;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(hide, ms);
 }
 
 function pingClass(ms) {
@@ -260,6 +301,8 @@ window.api.onSystemTheme((d) => {
 
 function setLang(lang) {
   window.i18n.applyI18n(lang);
+  // applyI18n left the remote-access pointer as plain text: its links again
+  if (state.flavor === 'openwrt') renderRemotePointer();
   $('#btnLang').textContent = lang === 'fa' ? 'EN' : 'فا';
   $('#langSelect').value = lang;
   // re-render dynamic content so it picks up the new language
@@ -274,12 +317,15 @@ function setLang(lang) {
   updateTunStatus();
   setModeWidget();
   refreshConnLabels();
+  renderAutostartBanner();
   renderSettingCards();   // option labels are translated strings
   // the chrome carries three strings that are not data-i18n nodes: the mode
   // badge, the path diagram's own labels and the inspector's on/off words
   applyUiMode(state.settings.uiMode || defaultUiMode());
   renderTrafficPath(state.connected ? 'connected' : state.connecting ? 'connecting' : 'disconnected');
   renderInspector();
+  refreshJsonFormLang();   // an open JSON edit form: its help line and summary are built with t()
+  if (warpShown()) renderWarp();   // the + WARP dialog is drawn with t() too
   if ($('#xrayVersion')) $('#xrayVersion').textContent = state.xrayVersion ? (t('xray.version') + ': ' + state.xrayVersion) : '';
   saveSettings({ lang });
 }
@@ -291,7 +337,7 @@ async function init() {
   state.subscriptions = data.subscriptions || [];
   state.settings = data.settings || {};
   state.activeServerId = data.activeServerId || null;
-  state.selectedServerId = data.activeServerId || (state.servers[0] && state.servers[0].id) || null;
+  state.lastServerId = data.lastServerId || null;
   state.tunAvailable = !!data.tunAvailable;
   state.elevated = !!data.elevated;
   state.assets = data.assets || {};
@@ -312,6 +358,16 @@ async function init() {
     id: e.id, name: e.name || 'Proxy', target: e.target || '',
     socksPort: e.socksPort || 0, httpPort: e.httpPort || 0, enabled: e.enabled !== false
   }));
+  // Routing profiles, before the selection is resolved: '__advanced__:<id>' is
+  // selectable only once they are in. null on a back end without them.
+  state.profiles = await loadRoutingProfiles(data);
+  state.profileSel = (profileOfSel(data.selectedServerId) || (state.profiles && state.profiles[0]) || {}).id || null;
+  // The picker's choice survives a restart: the one main stored, then the live
+  // connection (a reload of a connected window), then the last one made, then
+  // the first server. Resolved once the chains, the pool and the settings are
+  // in — they decide what can still be selected.
+  state.savedSelection = data.selectedServerId || null;
+  state.selectedServerId = resolveSelection([data.selectedServerId, data.activeServerId, data.lastServerId], selectable, state.servers);
 
   window.i18n.applyI18n(state.settings.lang || 'fa');
   $('#btnLang').textContent = (state.settings.lang || 'fa') === 'fa' ? 'EN' : 'فا';
@@ -342,9 +398,14 @@ async function init() {
   updateKillStatus();
   applyFlavor();
   renderPendingBanner();
+  // The connection as it IS (S1): a page that loads while the tunnel is up
+  // starts connected, with the real uptime — not on "disconnected" until an
+  // event that never comes on a stable tunnel.
+  if (data.conn) applyConnSnapshot(data.conn);
 
-  // app version + xray-core version
+  // app version (Settings → About, and small under the logo) + xray-core version
   $('#appVersion').textContent = 'v' + (state.version || '?');
+  $('#tbVersion').textContent = state.version ? 'v' + state.version : '';
   refreshXrayVersion();
 
   // the store failed to load before this window existed, so it is delivered here
@@ -353,6 +414,8 @@ async function init() {
   // prompt to download required files on first run / when essentials are missing
   maybePromptMissingFiles();
 
+  // Windows: does the logon task start another copy of the app? (main reads it; a banner if so)
+  checkAutostart();
   // plus: the Server and IP-scan tabs (src/renderer/plus/*) initialise here —
   // once the page has finished loading, because the scripts after app.js can
   // arrive later than app:init answers (over HTTP in the headless server they
@@ -362,12 +425,18 @@ async function init() {
 }
 
 /* ----------------------------- core versions ----------------------------- */
-const XRAY_ENGINES = ['xray', 'xray-pattn'];
+// the cores with a version beside their row (and the version picker, corePicker.js)
+const CORE_KEYS = ['xray', 'xray-pattn', 'sing-box'];
+/** A core's own `version` answer as its number ('sing-box version 1.13.14' → '1.13.14'); anything else as it was. */
+function coreVersionText(v) {
+  const m = /(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)/.exec(String(v || ''));
+  return m ? m[1] : String(v || '').trim();
+}
 async function refreshXrayVersion() {
-  for (const id of XRAY_ENGINES) {
+  for (const id of CORE_KEYS) {
     try {
       const res = await window.api.xrayVersion(id);
-      state.coreVersions[id] = (res && res.ok) ? res.version : '';
+      state.coreVersions[id] = (res && res.ok) ? coreVersionText(res.version) : '';
     } catch { state.coreVersions[id] = ''; }
   }
   state.xrayVersion = state.coreVersions.xray || state.coreVersions['xray-pattn'] || '';
@@ -399,6 +468,7 @@ function applySettingsToUI() {
   $('#optTunBackend option[value="native-macos"]').hidden = state.platform !== 'darwin';
   $('#nativeMacControls').hidden = state.platform !== 'darwin';
   $('#optLeakGuard').value = s.leakGuard || 'standard';
+  $('#optSingboxDns').value = s.singboxDns === 'core' ? 'core' : 'app';
   $('#optBlockUdpProxy').checked = !!s.blockUdpInProxyMode;
   $('#optAllowLan').checked = !!s.allowLan;
   $('#optKillSwitch').checked = !!s.killSwitch;
@@ -407,6 +477,7 @@ function applySettingsToUI() {
   $('#optLaunchAtLogin').checked = !!s.launchAtLogin;
   $('#optAutoConnect').checked = !!s.autoConnect;
   $('#optAutoUpdateAssets').value = ['off', 'geo', 'all'].includes(s.autoUpdateAssets) ? s.autoUpdateAssets : 'geo';
+  $('#optMux').value = ['auto', 'on', 'off'].includes(s.mux) ? s.mux : 'off';   // off unless the user turned it on
   $('#optBlockAds').checked = !!s.blockAds;
   $('#optSniff').checked = s.enableSniffing !== false;
   $('#optAutoUpdate').checked = s.autoUpdateSubs !== false;
@@ -480,12 +551,14 @@ function renderOptionCards(selectId, hostId, icons) {
 const GUARD_ICONS = { off: '⚪', standard: '🛡', strict: '🔒' };
 const BACKEND_ICONS = { 'native-macos': '🍎', 'sing-box': '📦', tun2socks: '🧩' };
 const TUNAPP_ICONS = { off: '⚪', exclude: '↩', only: '🎯' };
+const SBDNS_ICONS = { app: '🛡', core: '📦' };
 
 /** Every card group, from whatever the selects currently hold. */
 function renderSettingCards() {
   renderOptionCards('#optLeakGuard', '#leakGuardCards', GUARD_ICONS);
   renderOptionCards('#optTunBackend', '#tunBackendCards', BACKEND_ICONS);
   renderOptionCards('#optTunAppMode', '#tunAppModeCards', TUNAPP_ICONS);
+  renderOptionCards('#optSingboxDns', '#singboxDnsCards', SBDNS_ICONS);
 }
 
 function updateGuardRows() {
@@ -507,10 +580,21 @@ function updateGuardRows() {
     const bypasses = s.advancedRouting
       // an advanced plan can send traffic direct through its own rules, and —
       // since v0.15 — through the routing mode it applies underneath them
-      ? (s.routeRules || []).some(r => r && r.target === 'direct') || s.routeDefault === 'direct' ||
-        (!!s.advancedUseMode && modeBypasses)
+      // (any routing profile that does: each of them can be the one connected)
+      ? advPlans().some(p => (p.rules || []).some(r => r && r.target === 'direct') || p.def === 'direct' ||
+        (!!p.useMode && modeBypasses))
       : modeBypasses;
     $('#guardStrictRouting').hidden = !(tunOn && $('#optLeakGuard').value === 'strict' && bypasses);
+  }
+  // who answers DNS inside the sing-box TUN: a sing-box matter, and the strict
+  // guard always keeps it with the app (main.js passes 'app' there)
+  const sbRow = $('#singboxDnsRow');
+  if (sbRow) {
+    const strict = $('#optLeakGuard').value === 'strict';
+    const usable = tunOn && $('#optTunBackend').value === 'sing-box';
+    sbRow.classList.toggle('disabled', !usable || strict);
+    $('#optSingboxDns').disabled = !usable || strict;
+    $('#sbdnsStrictNote').hidden = !(usable && strict);
   }
   // the cards carry the row's disabled state too
   renderSettingCards();
@@ -595,12 +679,14 @@ function readSettingsForm() {
     tunAppMode: $('#optTunAppMode').value,
     tunApps: readTunApps(),
     leakGuard: $('#optLeakGuard').value,
+    singboxDns: $('#optSingboxDns').value,
     blockUdpInProxyMode: $('#optBlockUdpProxy').checked,
     allowLan: $('#optAllowLan').checked,
     killSwitch: $('#optKillSwitch').checked,
     notifications: $('#optNotify').checked,
     autoConnect: $('#optAutoConnect').checked,
     autoUpdateAssets: $('#optAutoUpdateAssets').value,
+    mux: $('#optMux').value,
     blockAds: $('#optBlockAds').checked,
     enableSniffing: $('#optSniff').checked
   };
@@ -743,6 +829,9 @@ async function applySettingsNow() {
 
 $('#pendingApply').onclick = () => applySettingsNow();
 $('#pendingDismiss').onclick = () => { state.pendingDismissed = true; renderPendingBanner(); };
+// Windows: the logon task starts another copy — point it at this one, or leave it for this run
+$('#autostartFix').onclick = () => repointAutostart();
+$('#autostartDismiss').onclick = () => { state.autostartStale = null; renderAutostartBanner(); };
 
 $('#btnSaveSettings').onclick = async () => {
   await saveSettings(readSettingsForm());
@@ -805,6 +894,7 @@ $$('[data-native-service]').forEach(button => {
   };
 });
 $('#optLeakGuard').onchange = () => { saveSettings({ leakGuard: $('#optLeakGuard').value }); updateGuardRows(); updateTunAppRows(); };
+$('#optSingboxDns').onchange = () => { saveSettings({ singboxDns: $('#optSingboxDns').value }); updateGuardRows(); };
 $('#optBlockUdpProxy').onchange = () => saveSettings({ blockUdpInProxyMode: $('#optBlockUdpProxy').checked });
 
 /* per-app routing — the mode saves itself, the list is cleaned up before it is stored */
@@ -868,6 +958,8 @@ $('#optNetAuto').onchange = () => saveSettings({ autoReconnectOnNetworkChange: $
 $('#optNotify').onchange = () => saveSettings({ notifications: $('#optNotify').checked });
 $('#optAutoConnect').onchange = () => saveSettings({ autoConnect: $('#optAutoConnect').checked });
 $('#optAutoUpdateAssets').onchange = () => saveSettings({ autoUpdateAssets: $('#optAutoUpdateAssets').value });
+// mux is written into the config: saved, then offered as a reconnect like the other config keys
+$('#optMux').onchange = () => saveSettings({ mux: $('#optMux').value });
 // Deliberately NOT in readSettingsForm(): a plain "save" must never re-run the
 // OS registration. Main refuses and reverts when the OS says no — the switch
 // then follows what was actually stored, and the reason is shown.
@@ -880,6 +972,14 @@ $('#optLaunchAtLogin').onchange = async () => {
 function updateKillStatus() {
   const el = $('#killStatus');
   if (!el) return;
+  if (state.flavor === 'openwrt') {
+    // the router's: armed — and whether it blocks right now — comes from the service (a snapshot, a killswitch event)
+    const ks = state.killSwitch;
+    if (!ks || !ks.armed) { el.textContent = ''; el.className = 'tun-status'; return; }
+    el.textContent = t(ks.blocking ? 'kill.routerBlocked' : 'kill.routerArmed');
+    el.className = 'tun-status ' + (ks.blocking ? 'warn' : 'ok');
+    return;
+  }
   if (!state.settings.killSwitch) { el.textContent = ''; el.className = 'tun-status'; return; }
   if (state.platform !== 'win32') { el.textContent = t('kill.winOnly'); el.className = 'tun-status warn'; return; }
   if (!state.elevated) { el.textContent = t('kill.needAdmin'); el.className = 'tun-status warn'; return; }
@@ -913,9 +1013,12 @@ async function updateLanInfo() {
 
 /**
  * OpenWrt: the router IS the tunnel for the LAN, so the switches that only
- * mean something on a desktop go (system proxy, login item, Windows kill
- * switch, the TUN backend choice — fixed there, per-app routing — no process
- * behind a forwarded packet) and the device list comes.
+ * mean something on a desktop go (system proxy, login item, the TUN switch
+ * and its backend choice — fixed there, per-app routing — no process behind a
+ * forwarded packet, the proxy-mode UDP block, the leak-guard cards) and the
+ * device list comes. The parts that read state as they render (the mode card,
+ * the TUN status line, Required files, the inspector) check the flavour
+ * themselves.
  */
 function applyFlavor() {
   const rt = state.flavor === 'openwrt';
@@ -923,13 +1026,67 @@ function applyFlavor() {
   $('#insGatewayRow').hidden = !rt;
   // ...and "DNS managed by the app": on a router the service forces it on (the
   // core must answer every port-53 packet from the LAN), so the switch would lie
-  for (const id of ['optSysProxy', 'optLaunchAtLogin', 'optKillSwitch', 'optDnsManaged']) {
+  for (const id of ['optSysProxy', 'optLaunchAtLogin', 'optDnsManaged']) {
     const row = $('#' + id).closest('.switch-row');
     if (row) row.hidden = rt;
   }
-  $('#killStatus').hidden = rt;
+  // The kill switch row stays on the router, with the router's wording (K1):
+  // while the VPN is on and the tunnel is down, the LAN has no internet. The
+  // banner's wording and its "off" action follow (K4): turning the VPN off
+  // (= disconnect) is what disarms it. Relabelled through data-i18n so a
+  // language switch keeps the wording.
+  const relabel = (el, key) => { if (!el) return; el.setAttribute('data-i18n', key); el.textContent = t(key); };
+  const ksRow = $('#optKillSwitch').closest('.switch-row');
+  if (ksRow) {
+    ksRow.hidden = false;
+    relabel(ksRow.querySelector('.switch-title'), rt ? 'kill.routerTitle' : 'kill.title');
+    relabel(ksRow.querySelector('.switch-sub'), rt ? 'kill.routerSub' : 'kill.sub');
+  }
+  relabel($('#killBanner .kill-banner-text'), rt ? 'kill.routerBlocked' : 'kill.blocked');
+  relabel($('#killDisarm'), rt ? 'kill.routerOff' : 'kill.disarm');
+  $('#killStatus').hidden = false;
+  // "Connect automatically" is, on a router, "Connect when the router starts":
+  // after a reboot or a power cut the VPN comes back as it was (B1) — the same
+  // setting, named for what it does there
+  const acRow = $('#optAutoConnect').closest('.switch-row');
+  if (acRow) {
+    relabel(acRow.querySelector('.switch-title'), rt ? 'autoconn.routerTitle' : 'autoconn.title');
+    relabel(acRow.querySelector('.switch-sub'), rt ? 'autoconn.routerSub' : 'autoconn.sub');
+  }
   $('#tunBackendRow').hidden = rt;
+  // the router's resolver is dnsmasq: its tunnel's DNS is always the app's (tunSingbox.dnsModeFor)
+  $('#singboxDnsRow').hidden = rt;
   $('#tunAppRow').hidden = rt;
+  // The router's tunnel is the whole network's, always (field report G2): no
+  // TUN switch (its wording is the desktop's — admin rights, "the system"), in
+  // its place one line saying so; no proxy-mode UDP block (there is no proxy
+  // mode), and no leak-guard cards (the DNS guard they choose is skipped on a
+  // router, where dnsmasq answers the LAN through the tunnel) — except while
+  // the store still holds "strict" (a desktop backup restored earlier): that
+  // level does reach the router's sing-box (strict_route), so it stays in
+  // view, where it can be set back.
+  const tunRow = $('#optTun').closest('.switch-row');
+  if (tunRow) tunRow.hidden = rt;
+  $('#tunRouterNote').hidden = !rt;
+  $('#udpBlockRow').hidden = rt;
+  const guardHidden = rt && (state.settings || {}).leakGuard !== 'strict';
+  $('#leakGuardRow').hidden = guardHidden;
+  // The inspector mirrors Settings: a row there that no switch stands behind
+  // is the "Gateway" the owner could not place (G1). The whole-network row
+  // stands for TUN; the guard row follows the guard (renderInspector).
+  $('#insTunRow').hidden = rt;
+  $('#insGuardRow').hidden = guardHidden;
+  // "Allow LAN" on a router only opens the SOCKS/HTTP ports to the LAN (the
+  // whole network is tunnelled either way): named for that, or "off" reads as
+  // "the LAN gets no VPN"
+  const lanRow = $('#optAllowLan').closest('.switch-row');
+  if (lanRow) {
+    relabel(lanRow.querySelector('.switch-title'), rt ? 'lan.routerTitle' : 'lan.title');
+    relabel(lanRow.querySelector('.switch-sub'), rt ? 'lan.routerSub' : 'lan.sub');
+  }
+  // remote access is set up in LuCI; this page says where, with links
+  $('#gwRemoteRow').hidden = !rt;
+  if (rt) renderRemotePointer();
   $('#gwQuicRow').hidden = !rt;
   $('#optLanBlockQuic').checked = !!state.settings.lanBlockQuic;
   if (rt) renderLanDevices();
@@ -979,6 +1136,60 @@ async function renderLanDevices() {
 }
 $('#btnGwRefresh').onclick = () => renderLanDevices();
 
+/**
+ * Settings, scrolled to one row. A category chip or a search can be hiding the
+ * row's card — then the page is un-filtered first, or the jump lands nowhere.
+ * Only the content column scrolls: scrollIntoView would scroll the page itself
+ * as well and push the frameless window's title bar out of view.
+ */
+function openSettingAt(sel) {
+  showView('settings');
+  const el = $(sel);
+  if (!el) return;
+  const card = el.closest('.card');
+  if (card && card.hidden) {
+    const all = document.querySelector('.settings-chip[data-category="all"]');
+    if (all) all.click();
+  }
+  const column = el.closest('.content');
+  if (column) column.scrollTop += el.getBoundingClientRect().top - column.getBoundingClientRect().top - 12;
+}
+// The inspector's gateway row is a status, not a switch: its tooltip says what
+// it means, and a click opens the one thing about it that can be changed — which
+// devices go direct (#gwRow starts with the same explanation).
+$('#insGatewayRow').onclick = () => openSettingAt('#gwRow');
+
+/**
+ * The router's pointer to remote access (field report 17), its two places as
+ * links: LuCI's Remote access page on this router (uhttpd, the router's own
+ * port — not this page's) and the guide. The words are gw.remote verbatim; a
+ * translation without "LuCI … (" and "docs/remote.md" in it stays plain text.
+ * applyI18n resets the paragraph to that plain text, so a language switch
+ * renders it again.
+ */
+function renderRemotePointer() {
+  const p = $('#gwRemote');
+  if (!p) return;
+  const text = t('gw.remote');
+  const guide = 'docs/remote.md';
+  const a = text.indexOf('LuCI'), b = text.indexOf(' (', a), g = text.indexOf(guide, b);
+  if (a < 0 || b < 0 || g < 0) { p.replaceChildren(text); return; }
+  const link = (label, href) => {
+    const el = document.createElement('a');
+    el.textContent = label;
+    el.href = href;
+    el.target = '_blank';
+    el.rel = 'noopener';
+    return el;
+  };
+  p.replaceChildren(
+    text.slice(0, a),
+    link(text.slice(a, b), `${location.protocol}//${location.hostname}/cgi-bin/luci/admin/services/irnetfree/remote`),
+    text.slice(b, g),
+    link(guide, 'https://github.com/sadrazkh/Irnetfree_xray-client/blob/main/' + guide),
+    text.slice(g + guide.length));
+}
+
 $('#btnSaveRules').onclick = async () => {
   const rules = textToCustomRules($('#customRules').value);
   await saveSettings({ customRules: rules });
@@ -995,13 +1206,14 @@ function fmtMs(ms) {
 function pingLabel(id) {
   const p = state.pings[id] || {};
   const tcp = p.tcp;
-  if (!tcp) return { txt: '—', cls: '' };
+  if (!tcp || tcp.na) return { txt: '—', cls: '' };
   return { txt: tcp.ok ? fmtMs(tcp.ms) : '×', cls: pingClass(tcp.ok ? tcp.ms : -1) };
 }
 
 /** Label for any ping result ({ ok, ms } or undefined). */
 function pingResultLabel(res) {
-  if (!res) return { txt: '—', cls: '' };
+  // `na`: nothing to measure this way (a UDP-only server has no TCP port)
+  if (!res || res.na) return { txt: '—', cls: '' };
   return { txt: res.ok ? fmtMs(res.ms) : '×', cls: pingClass(res.ok ? res.ms : -1) };
 }
 
@@ -1051,13 +1263,62 @@ function serverGroups() {
       // A subscription can be deleted while its servers stay behind. Name the
       // group honestly rather than tipping them into the hand-added pile, where
       // the next refresh would look like it had lost them.
-      groups.set(s.subId, { name: sub ? sub.name : t('srv.subGone'), items: [] });
+      groups.set(s.subId, { name: sub ? sub.name : t('srv.subGone'), sub: sub || null, items: [] });
     }
     groups.get(s.subId).items.push(s);
   }
   const out = [];
-  if (manual.length) out.push({ id: '', name: t('srv.manual'), items: manual });
-  for (const [id, g] of groups) out.push({ id, name: g.name, items: g.items });
+  if (manual.length) out.push({ id: '', name: t('srv.manual'), sub: null, items: manual });
+  for (const [id, g] of groups) out.push({ id, name: g.name, sub: g.sub, items: g.items });
+  return out;
+}
+
+/* ------------------- folded groups (remembered per window) ------------------- */
+// The groups the user folded, by key ('manual', 'sub:<id>'). Kept the way the
+// theme is — in this window's storage, and per browser on the router — and
+// open is the default, so a group nobody folded (a new subscription too) shows
+// its servers.
+const FOLDED_KEY = 'irnetfree.foldedGroups';
+const foldedGroups = loadFoldedGroups();
+function loadFoldedGroups() {
+  try {
+    const v = JSON.parse(localStorage.getItem(FOLDED_KEY) || '[]');
+    return new Set(Array.isArray(v) ? v.filter((k) => typeof k === 'string') : []);
+  } catch { return new Set(); }
+}
+function setGroupFolded(key, folded) {
+  if (folded) foldedGroups.add(key); else foldedGroups.delete(key);
+  try { localStorage.setItem(FOLDED_KEY, JSON.stringify([...foldedGroups])); } catch { /* only costs remembering it */ }
+}
+/** A group's key: the subscription it came from, or the hand-added pile. */
+function groupKey(subId) { return subId ? 'sub:' + subId : 'manual'; }
+
+/**
+ * A subscription's quota and time left, short enough for its group head:
+ * { data, time, level } — empty strings for what it does not report; `level`
+ * by the thresholds subUsageHtml() colours its bars with ('' | 'mid' | 'bad').
+ * `data` is figures only (it is set left-to-right in both languages): an
+ * unlimited quota reads "1.5 GB / ∞".
+ */
+function subUsageBrief(sub) {
+  const out = { data: '', time: '', level: '' };
+  const u = sub && sub.usage;
+  if (!u) return out;
+  const used = (u.upload || 0) + (u.download || 0);
+  let pct = 0;
+  if (u.total > 0) {
+    pct = Math.round(used / u.total * 100);
+    out.data = `${fmtBytes(used)} / ${fmtBytes(u.total)}`;
+  } else if (used > 0) {
+    out.data = `${fmtBytes(used)} / ∞`;
+  }
+  let days = Infinity;
+  if (u.expire > 0) {
+    const rem = u.expire - Date.now() / 1000;
+    days = rem / 86400;
+    out.time = rem <= 0 ? t('sub.expired') : `${fmtDuration(rem)} ${t('sub.left')}`;
+  }
+  out.level = (pct >= 90 || days < 3) ? 'bad' : (pct >= 70 || days < 7) ? 'mid' : '';
   return out;
 }
 
@@ -1069,71 +1330,199 @@ function renderServers() {
   const groups = serverGroups();
   // no headings when there is nothing to tell apart
   const labelled = groups.length > 1 || !!(groups[0] && groups[0].id);
-  for (const g of groups) {
-  let host = list;
-  if (labelled) {
-    const wrap = document.createElement('div');
-    wrap.className = 'srv-group';
-    const head = document.createElement('div');
-    head.className = 'srv-group-head';
-    head.innerHTML = `<span class="srv-group-ico">${g.id ? '🔗' : '✎'}</span>
-      <span class="srv-group-name"></span><span class="srv-group-count"></span>`;
-    head.querySelector('.srv-group-name').textContent = g.name;
-    head.querySelector('.srv-group-count').textContent = String(g.items.length);
-    wrap.appendChild(head);
-    list.appendChild(wrap);
-    host = wrap;
+  if (!labelled) {
+    for (const g of groups) for (const s of g.items) list.appendChild(serverCard(s));
+    return;
   }
-  for (const s of g.items) {
-    const card = document.createElement('div');
-    const isActive = s.id === state.activeServerId && state.connected;
-    const isSel = s.id === state.selectedServerId;
-    card.className = 'server-card' + (isActive ? ' active' : '') + (isSel ? ' selected' : '');
-    card.dataset.srvId = s.id;
+  groups.forEach((g, n) => list.appendChild(serverGroup(g, n)));
+  refreshSelection();   // a folded group holding the selection says so on its head
+}
 
-    const tl = pingResultLabel((state.pings[s.id] || {}).tcp);
-    const rl = pingResultLabel((state.pings[s.id] || {}).real);
-    const ul = pingResultLabel((state.pings[s.id] || {}).upload);
-    // always in the markup, hidden when not selected: refreshSelection() can
-    // then move it between cards without rebuilding either of them
-    const selBadge = `<span class="sel-badge"${isSel ? '' : ' hidden'}>✓ ${escapeHtml(t('srv.selected'))}</span>`;
+/**
+ * One group of the list. Its head folds it — a button with aria-expanded, the
+ * count always on it — and a subscription's head carries that subscription's
+ * own refresh, and its quota and time left when it reports them, so it can be
+ * looked after from here (adding and editing stay on the Subscriptions page).
+ * Any group of two or more configs also carries 📶 (test them all) and ⚡
+ * (connect to the fastest of them).
+ * A folded group builds no cards until it is opened: a 300-server
+ * subscription folded away costs one row.
+ */
+function serverGroup(g, n) {
+  const key = groupKey(g.id);
+  const open = !foldedGroups.has(key);
+  const wrap = document.createElement('div');
+  wrap.className = 'srv-group' + (open ? '' : ' folded');
+  wrap.dataset.group = key;
 
-    card.innerHTML = `
-      <span class="q-dot ${tl.cls}" data-ping-dot="${escapeHtml(s.id)}"></span>
-      <span class="proto-badge proto-${escapeHtml(s.protocol)}">${escapeHtml(s.protocol)}</span>
-      <div class="srv-info">
-        <div class="srv-name">${escapeHtml(s.name)} ${selBadge}</div>
-        <div class="srv-addr">${escapeHtml(s.address)}:${escapeHtml(s.port)}</div>
-      </div>
-      <div class="stat-group">
-        <span class="stat" title="${escapeHtml(t('ping.tcp'))}"><i>⚡</i><b class="stat-v ${tl.cls}" data-pbase="stat-v" data-ping="${escapeHtml(s.id)}">${tl.txt}</b></span>
-        <span class="stat" title="${escapeHtml(t('ping.real'))}"><i>↓</i><b class="stat-v ${rl.cls}" data-pbase="stat-v" data-ping-real="${escapeHtml(s.id)}">${rl.txt}</b></span>
-        <span class="stat" title="${escapeHtml(t('ping.upload'))}"><i>↑</i><b class="stat-v ${ul.cls}" data-pbase="stat-v" data-ping-up="${escapeHtml(s.id)}">${ul.txt}</b></span>
-      </div>
-      <span class="srv-usage" data-usage="${escapeHtml(s.id)}" title="${escapeHtml(t('srv.usage'))} — ${escapeHtml(t('srv.usageClick'))}">${usageLabel(s.id)}</span>
-      <div class="srv-actions">
-        <button class="icon-btn ping-srv" data-i18n-title="btn.quickPing" title="ping">⚡</button>
-        <button class="icon-btn copy-srv" data-i18n-title="btn.copy" title="copy">⧉</button>
-        <button class="icon-btn qr-srv" data-i18n-title="btn.qr" title="QR">▦</button>
-        <button class="icon-btn edit-srv" data-i18n-title="btn.edit" title="edit">✎</button>
-        <button class="icon-btn connect-srv" title="▶">▶</button>
-        <button class="icon-btn del-srv" title="🗑">🗑</button>
-      </div>`;
+  const head = document.createElement('div');
+  head.className = 'srv-group-head';
+  const toggle = document.createElement('button');
+  toggle.className = 'srv-group-toggle';
+  toggle.type = 'button';
+  toggle.innerHTML = `<span class="srv-group-chev" aria-hidden="true">▾</span>
+    <span class="srv-group-ico" aria-hidden="true">${g.id ? '🔗' : '✎'}</span>
+    <span class="srv-group-name"></span><span class="srv-group-count"></span>`;
+  toggle.querySelector('.srv-group-name').textContent = g.name;
+  toggle.querySelector('.srv-group-count').textContent = String(g.items.length);
+  toggle.title = t('srv.groupToggle');
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.setAttribute('aria-controls', 'srvGroup' + n);
+  head.appendChild(toggle);
 
-    // clicking the card body selects the server (syncs with the home picker)
-    card.querySelector('.srv-info').onclick = () => selectServer(s.id);
-    card.querySelector('.proto-badge').onclick = () => selectServer(s.id);
-    card.querySelector('.ping-srv').onclick = (e) => { e.stopPropagation(); pingServer(s.id); };
-    card.querySelector('.copy-srv').onclick = (e) => { e.stopPropagation(); copyServerLink(s.id); };
-    card.querySelector('.qr-srv').onclick = (e) => { e.stopPropagation(); showServerQr(s.id); };
-    card.querySelector('.edit-srv').onclick = (e) => { e.stopPropagation(); openEdit(s.id); };
-    card.querySelector('.connect-srv').onclick = (e) => { e.stopPropagation(); connect(s.id); };
-    card.querySelector('.del-srv').onclick = (e) => { e.stopPropagation(); deleteServer(s.id); };
-    // the lifetime figure is its own clear button — nothing to clear when empty
-    card.querySelector('.srv-usage').onclick = (e) => { e.stopPropagation(); clearUsageFor(s.id); };
-    host.appendChild(card);
+  if (g.sub) {
+    const brief = subUsageBrief(g.sub);
+    if (brief.data || brief.time) {
+      const meta = document.createElement('span');
+      meta.className = 'srv-group-meta' + (brief.level ? ' ' + brief.level : '');
+      meta.title = t('sub.lastUpdate') + ': ' + timeAgo(g.sub.lastUpdated);
+      for (const [text, dir] of [[brief.data, 'ltr'], [brief.time, '']]) {
+        if (!text) continue;
+        const part = document.createElement('span');
+        if (dir) part.dir = dir;
+        part.textContent = text;
+        meta.appendChild(part);
+      }
+      head.appendChild(meta);
     }
   }
+
+  // 📶 tests every config of the group, ⚡ connects to its fastest (connectAuto);
+  // with one config there is nothing to rank or to choose between
+  if (g.items.length >= 2) {
+    const ids = g.items.map(s => s.id);
+    const ping = document.createElement('button');
+    ping.className = 'icon-btn srv-group-ping';
+    ping.type = 'button';
+    ping.textContent = '📶';
+    ping.title = t('srv.groupPing');
+    ping.setAttribute('aria-label', ping.title);
+    ping.onclick = () => { ping.disabled = true; pingMany(ids).finally(() => { ping.disabled = false; }); };
+    const fast = document.createElement('button');
+    fast.className = 'icon-btn srv-group-fastest';
+    fast.type = 'button';
+    fast.textContent = '⚡';
+    fast.title = t('srv.groupFastest');
+    fast.setAttribute('aria-label', fast.title);
+    fast.onclick = () => connectAuto({ ids, name: g.name });
+    head.appendChild(ping);
+    head.appendChild(fast);
+  }
+
+  if (g.sub) {
+    const refresh = document.createElement('button');
+    refresh.className = 'icon-btn srv-group-refresh';
+    refresh.type = 'button';
+    refresh.textContent = '⟳';
+    refresh.title = t('srv.subRefresh');
+    refresh.setAttribute('aria-label', refresh.title);
+    refresh.onclick = () => {
+      refresh.disabled = true;
+      refreshSub(g.id).finally(() => { refresh.disabled = false; });
+    };
+    head.appendChild(refresh);
+  }
+  wrap.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'srv-group-body';
+  body.id = 'srvGroup' + n;
+  body.hidden = !open;
+  if (open) for (const s of g.items) body.appendChild(serverCard(s));
+  wrap.appendChild(body);
+
+  toggle.onclick = () => {
+    const nowOpen = toggle.getAttribute('aria-expanded') !== 'true';
+    setGroupFolded(key, !nowOpen);
+    toggle.setAttribute('aria-expanded', String(nowOpen));
+    wrap.classList.toggle('folded', !nowOpen);
+    body.hidden = !nowOpen;
+    if (nowOpen && !body.firstChild) for (const s of g.items) body.appendChild(serverCard(s));
+  };
+  return wrap;
+}
+
+/**
+ * What a card says beside a server's name, derived from its outbound and never
+ * stored: a MASQUE server's `WARP` when it holds a WARP account, and its HTTP
+ * version (`h3` / `h2`, serverFields.masqueHttpOf — the core's own rule).
+ */
+function srvTags(s) {
+  if (!s || s.protocol !== 'masque') return [];
+  const st = (s.outbound && s.outbound.streamSettings) || {};
+  const ms = st.masqueSettings || {};
+  const tags = [];
+  if (ms.warp && typeof ms.warp === 'object') tags.push('WARP');
+  tags.push(sfTable().masqueHttpOf(st.tlsSettings));
+  return tags;
+}
+
+/** One server's card, wired. */
+function serverCard(s) {
+  const card = document.createElement('div');
+  const isActive = s.id === state.activeServerId && state.connected;
+  const isSel = s.id === state.selectedServerId;
+  card.className = 'server-card' + (isActive ? ' active' : '') + (isSel ? ' selected' : '');
+  card.dataset.srvId = s.id;
+
+  const tl = pingResultLabel((state.pings[s.id] || {}).tcp);
+  const rl = pingResultLabel((state.pings[s.id] || {}).real);
+  const ul = pingResultLabel((state.pings[s.id] || {}).upload);
+  // always in the markup, hidden when not selected: refreshSelection() can
+  // then move it between cards without rebuilding either of them
+  const selBadge = `<span class="sel-badge"${isSel ? '' : ' hidden'}>✓ ${escapeHtml(t('srv.selected'))}</span>`;
+  // A JSON config (source 'json'): the badge says so and, on hover, how it runs
+  const isJson = s.source === 'json';
+  const jsonRaw = isJson && s.jsonMode === 'raw';
+  const jsonBadge = isJson
+    ? ` <span class="proto-badge proto-json json-badge${jsonRaw ? ' raw' : ''}" title="${escapeHtml(t(jsonRaw ? 'ed.jsonRaw' : 'ed.jsonFull'))}">${escapeHtml(t('srv.jsonBadge'))}</span>`
+    : '';
+  // what Copy copies: the config itself for a JSON server, the share link otherwise —
+  // which for MASQUE is its one-line JSON too (no client has a standard link for it)
+  const isMasque = s.protocol === 'masque';
+  const copyKey = isJson ? 'ed.jsonCopy' : isMasque ? 'srv.copyJson' : 'btn.copy';
+  const copyTitle = isJson || isMasque ? escapeHtml(t(copyKey)) : 'copy';
+  const qrKey = isMasque ? 'btn.qrJson' : 'btn.qr';
+  // what the record is, beside its name: WARP, and the HTTP version (MASQUE)
+  const tags = srvTags(s);
+  const tagsHtml = tags.length
+    ? `<span class="srv-tags">${tags.map((x) => `<span class="srv-tag${x === 'WARP' ? ' warp' : ''}" dir="ltr">${escapeHtml(x)}</span>`).join('')}</span>`
+    : '';
+
+  card.innerHTML = `
+    <span class="q-dot ${tl.cls}" data-ping-dot="${escapeHtml(s.id)}"></span>
+    <span class="proto-badge proto-${escapeHtml(s.protocol)}">${escapeHtml(s.protocol)}</span>
+    <div class="srv-info">
+      <div class="srv-name">${escapeHtml(s.name)}${tagsHtml} ${selBadge}</div>
+      <div class="srv-addr">${escapeHtml(s.address)}:${escapeHtml(s.port)}${jsonBadge}</div>
+    </div>
+    <div class="stat-group">
+      <span class="stat" title="${escapeHtml(t('ping.tcp'))}"><i>⚡</i><b class="stat-v ${tl.cls}" data-pbase="stat-v" data-ping="${escapeHtml(s.id)}">${tl.txt}</b></span>
+      <span class="stat" title="${escapeHtml(t('ping.real'))}"><i>↓</i><b class="stat-v ${rl.cls}" data-pbase="stat-v" data-ping-real="${escapeHtml(s.id)}">${rl.txt}</b></span>
+      <span class="stat" title="${escapeHtml(t('ping.upload'))}"><i>↑</i><b class="stat-v ${ul.cls}" data-pbase="stat-v" data-ping-up="${escapeHtml(s.id)}">${ul.txt}</b></span>
+    </div>
+    <span class="srv-usage" data-usage="${escapeHtml(s.id)}" title="${escapeHtml(t('srv.usage'))} — ${escapeHtml(t('srv.usageClick'))}">${usageLabel(s.id)}</span>
+    <div class="srv-actions">
+      <button class="icon-btn ping-srv" data-i18n-title="btn.quickPing" title="ping">⚡</button>
+      <button class="icon-btn copy-srv" data-i18n-title="${copyKey}" title="${copyTitle}">⧉</button>
+      <button class="icon-btn qr-srv" data-i18n-title="${qrKey}" title="${isMasque ? escapeHtml(t(qrKey)) : 'QR'}">▦</button>
+      <button class="icon-btn edit-srv" data-i18n-title="btn.edit" title="edit">✎</button>
+      <button class="icon-btn connect-srv" title="▶">▶</button>
+      <button class="icon-btn del-srv" title="🗑">🗑</button>
+    </div>`;
+
+  // clicking the card body selects the server (syncs with the home picker)
+  card.querySelector('.srv-info').onclick = () => selectServer(s.id);
+  card.querySelector('.proto-badge').onclick = () => selectServer(s.id);
+  card.querySelector('.ping-srv').onclick = (e) => { e.stopPropagation(); pingServer(s.id); };
+  card.querySelector('.copy-srv').onclick = (e) => { e.stopPropagation(); copyServerLink(s.id); };
+  card.querySelector('.qr-srv').onclick = (e) => { e.stopPropagation(); showServerQr(s.id); };
+  card.querySelector('.edit-srv').onclick = (e) => { e.stopPropagation(); openEdit(s.id); };
+  connectGlyph(card.querySelector('.connect-srv')).onclick = (e) => { e.stopPropagation(); connect(s.id); };
+  card.querySelector('.del-srv').onclick = (e) => { e.stopPropagation(); deleteServer(s.id); };
+  // the lifetime figure is its own clear button — nothing to clear when empty
+  card.querySelector('.srv-usage').onclick = (e) => { e.stopPropagation(); clearUsageFor(s.id); };
+  return card;
 }
 
 /**
@@ -1149,6 +1538,10 @@ function refreshSelection() {
     const badge = card.querySelector('.sel-badge');
     if (badge) badge.hidden = !on;
   });
+  // a folded group has no cards to mark: its head says it holds the selection
+  const selSrv = srvById(sel);
+  const selGroup = selSrv ? groupKey(selSrv.subId) : null;
+  $$('#serverList .srv-group[data-group]').forEach((g) => g.classList.toggle('has-sel', g.dataset.group === selGroup));
 }
 
 /** Lifetime totals changed: rewrite the spans that show them, nothing else. */
@@ -1174,16 +1567,24 @@ async function clearUsageFor(id) {
 /* ----------------------------- unified picker (home) ----------------------------- */
 const ADV_ID = '__advanced__';
 const POOL_ID = '__pool__';
+/** "Exit at the base": a routing target that is the profile's own base (routingProfiles.TARGET_BASE) — it follows the base. */
+const TARGET_BASE = 'base';
 /** The picker's "Auto" row: not a selection but an action — test, then connect to the fastest. */
 const AUTO_ID = '__auto__';
 
+/** When each target's last test finished — a group's ⚡ trusts results younger than GROUP_FRESH_MS. */
+const pingAt = {};
+const GROUP_FRESH_MS = 3 * 60 * 1000;
+
 /**
- * The fastest tested server: real delay first (it proves the tunnel carries
- * traffic), TCP handshake as the fallback for servers that only have that.
- * null when nothing has been tested — the caller runs the test first.
+ * The fastest tested server — of `ids` when given (a group's ⚡), else of every
+ * server: real delay first (it proves the tunnel carries traffic), the TCP
+ * handshake as the fallback for servers that only have that. null when nothing
+ * in it has been tested — the caller runs the test first.
  */
-function bestServerId() {
-  const scored = state.servers.map((s) => {
+function bestServerId(ids) {
+  const pool = ids ? ids.map(srvById).filter(Boolean) : state.servers;
+  const scored = pool.map((s) => {
     const p = state.pings[s.id] || {};
     const real = p.real && p.real.ok ? p.real.ms : null;
     const tcp = p.tcp && p.tcp.ok ? p.tcp.ms : null;
@@ -1192,12 +1593,34 @@ function bestServerId() {
   return scored.length ? scored[0].id : null;
 }
 
-async function connectAuto() {
-  let best = bestServerId();
-  if (!best) { await pingMany(state.servers.map(s => s.id)); best = bestServerId(); }
-  if (!best) return toast(t('t.autoNone'), 'err');
+/**
+ * ⚡: test, then connect to the fastest — of every server (the picker's Auto
+ * row: tested only when nothing ever was, as before), or of one group
+ * (`scope` = { ids, name }: a group head's ⚡ and the "Fastest — <subscription>"
+ * rows), tested again unless all of it was tested in the last GROUP_FRESH_MS.
+ */
+async function connectAuto(scope) {
+  if (state.connecting) {
+    // The picker's ⚡ Auto row is the Cancel while connecting (it says so:
+    // power.cancelHint). A group's ⚡ and a "⚡ Fastest — <subscription>" row
+    // keep their connect label, so a tap there must not quietly cancel the
+    // connect in flight: it says what is happening instead.
+    if (!scope) return cancelConnect();
+    return toast(t('t.autoGroupBusy'), 'warn');
+  }
+  const ids = scope ? scope.ids : null;
+  let best = bestServerId(ids);
+  const stale = !!scope && ids.some((id) => !(pingAt[id] > Date.now() - GROUP_FRESH_MS));
+  if (!best || stale) { await pingMany(ids || state.servers.map(s => s.id)); best = bestServerId(ids); }
+  if (!best) return toast(t(scope ? 't.autoGroupNone' : 't.autoNone'), 'err');
+  // The test takes a while. A connect that began meanwhile (another ⚡, a ▶) is
+  // the later choice, and connect() below would be its Cancel: leave it be.
+  if (scope && state.connecting) return;
   const s = srvById(best);
-  toast(`${t('picker.auto')} → ${s ? s.name : best}`, 'ok');
+  const label = scope ? t('picker.autoSub').replace('{name}', () => scope.name) : t('picker.auto');
+  toast(`${label} → ${s ? s.name : best}`, 'ok');
+  // Already on the group's fastest: connect() would be that connection's toggle.
+  if (scope && state.connected && state.activeServerId === best) return;
   return connect(best);
 }
 function chainById(id) { return state.chains.find(c => c.id === id); }
@@ -1205,7 +1628,7 @@ function isChainId(id) { return !!chainById(id); }
 function chainMembers(c) { return ((c && c.members) || []).map(srvById).filter(Boolean); }
 function chainReady(c) { return chainMembers(c).length >= 2; }
 function anyChainReady() { return state.chains.some(chainReady); }
-function isPseudo(id) { return id === ADV_ID || id === POOL_ID || isChainId(id); }
+function isPseudo(id) { return id === ADV_ID || String(id).startsWith(ADV_ID + ':') || id === POOL_ID || isChainId(id); }
 
 /** A pool target ('chain:<id>' or a server id) that currently resolves. */
 function poolTargetValid(target) {
@@ -1226,9 +1649,56 @@ function poolEnabledValid() {
   return state.pool.filter(e => e.enabled && e.socksPort && poolTargetValid(e.target));
 }
 function poolReady() { return poolEnabledValid().length > 0; }
-function advancedReady() {
-  return !!state.settings.advancedRouting &&
-    (((state.settings.routeRules || []).length > 0) || !!state.settings.routeDefault);
+/**
+ * Whether advanced routing can be connected: `id` one selection of it
+ * ('__advanced__' = the first profile, '__advanced__:<id>' = that one), or —
+ * without `id` — any of it. With routing profiles a profile counts once it has
+ * rules or a default; without them (an older back end) today's settings do,
+ * and a profile id means nothing.
+ */
+function advancedReady(id) {
+  if (!state.settings.advancedRouting) return false;
+  if (!Array.isArray(state.profiles)) {
+    if (id !== undefined && id !== ADV_ID) return false;
+    return ((state.settings.routeRules || []).length > 0) || !!state.settings.routeDefault;
+  }
+  return id === undefined ? state.profiles.some(profileReady) : profileReady(profileOfSel(id));
+}
+
+/**
+ * Which config the picker points at: the first of `candidates` that can still
+ * be selected (`valid`), else the first server, else nothing. Pure — the order
+ * of the candidates is the caller's (see init and keepSelectionValid).
+ */
+function resolveSelection(candidates, valid, servers) {
+  for (const id of candidates || []) if (id && valid(id)) return id;
+  return (servers && servers[0] && servers[0].id) || null;
+}
+
+/** Whether `id` can be connected right now: a server, a ready chain, advanced routing or the pool once set up. */
+function selectable(id) {
+  if (id === ADV_ID || String(id).startsWith(ADV_ID + ':')) return advancedReady(id);
+  if (id === POOL_ID) return poolReady();
+  if (isChainId(id)) return chainReady(chainById(id));
+  return !!srvById(id);
+}
+
+/**
+ * The selection survives a restart (main's selectedServerId). Checked whenever
+ * the picker is drawn — which every change of what can be selected ends in —
+ * so one that is gone falls back to the live connection, the last one made,
+ * then the first server; and whatever it is now goes to main when it moved.
+ */
+function keepSelectionValid() {
+  const id = resolveSelection([state.selectedServerId, state.activeServerId, state.lastServerId], selectable, state.servers);
+  if (id !== state.selectedServerId) {
+    state.selectedServerId = id;
+    refreshSelection();
+  }
+  if (id !== state.savedSelection && window.api.setSelection) {
+    state.savedSelection = id;
+    Promise.resolve(window.api.setSelection(id)).catch(() => { state.savedSelection = undefined; });
+  }
 }
 
 function selectServer(id) {
@@ -1238,7 +1708,7 @@ function selectServer(id) {
   // the path draws the SELECTED config's route, so it follows this choice
   refreshConnLabels();
   // immediate ping feedback for the chosen target (chains ping too; skip adv/pool)
-  if (id && id !== ADV_ID && id !== POOL_ID && !state.pings[id]) pingServer(id);
+  if (id && id !== ADV_ID && id !== POOL_ID && !String(id).startsWith(ADV_ID + ':') && !state.pings[id]) pingServer(id);
 }
 
 function renderPicker() {
@@ -1247,15 +1717,18 @@ function renderPicker() {
   const btnPing = $('#pickerPing');
   const menu = $('#pickerMenu');
 
-  // drop a stale pseudo selection if its feature is no longer available
-  if (isChainId(state.selectedServerId) && !chainReady(chainById(state.selectedServerId))) state.selectedServerId = null;
-  if (state.selectedServerId === ADV_ID && !advancedReady()) state.selectedServerId = null;
-  if (state.selectedServerId === POOL_ID && !poolReady()) state.selectedServerId = null;
+  // a selection that can no longer be connected (a server deleted or dropped
+  // by a refresh, a chain that lost a hop, the pool or advanced routing
+  // emptied) falls back — and whatever it is now, main keeps it
+  keepSelectionValid();
 
   const selId = state.selectedServerId;
   const sel = state.servers.find(s => s.id === selId);
   const selChain = chainById(selId);
   const hasAny = state.servers.length || anyChainReady() || advancedReady() || poolReady();
+  // the plain '__advanced__' selection (LuCI, an older store) is the first
+  // routing profile, and that profile's row is the one marked
+  const selKey = selId === ADV_ID && Array.isArray(state.profiles) && state.profiles[0] ? ADV_ID + ':' + state.profiles[0].id : selId;
 
   if (!hasAny) {
     btnProto.hidden = true;
@@ -1269,11 +1742,11 @@ function renderPicker() {
     const pl = pingLabel(selChain.id);
     btnPing.textContent = pl.txt === '—' ? '' : pl.txt;
     btnPing.className = 'picker-ping ' + pl.cls;
-  } else if (selId === ADV_ID) {
+  } else if (selId === ADV_ID || String(selId).startsWith(ADV_ID + ':')) {
     btnProto.hidden = false;
     btnProto.textContent = '🧭';
     btnProto.className = 'proto-badge proto-advanced';
-    btnName.textContent = t('picker.advanced');
+    btnName.textContent = advSelName(selId);
     btnPing.textContent = '';
   } else if (selId === POOL_ID) {
     btnProto.hidden = false;
@@ -1310,7 +1783,7 @@ function renderPicker() {
     const rl = pingId ? pingResultLabel((state.pings[pingId] || {}).real) : null;
     const ul = pingId ? pingResultLabel((state.pings[pingId] || {}).upload) : null;
     const row = document.createElement('div');
-    row.className = 'picker-item' + (isSpecial ? ' picker-special' : '') + (id === selId ? ' active' : '');
+    row.className = 'picker-item' + (isSpecial ? ' picker-special' : '') + (id === selId || id === selKey ? ' active' : '');
     const pingPart = pingId
       ? `<span class="stat-group">` +
           `<span class="stat" title="${escapeHtml(t('ping.tcp'))}"><i>⚡</i><b class="stat-v ${tl.cls}" data-pbase="stat-v" data-ping="${escapeHtml(id)}">${tl.txt}</b></span>` +
@@ -1332,13 +1805,34 @@ function renderPicker() {
   // and connects, and the picker then shows the server that won.
   if (state.servers.length >= 2) {
     const row = document.createElement('div');
-    row.className = 'picker-item picker-special';
-    row.innerHTML = `<span class="q-dot"></span><span class="proto-badge proto-auto">⚡</span><span class="pi-name">${escapeHtml(t('picker.auto'))}</span>`;
+    row.className = 'picker-item picker-special picker-auto';
+    row.innerHTML = `<span class="q-dot"></span><span class="proto-badge proto-auto">⚡</span><span class="pi-name">${escapeHtml(t(state.connecting ? 'power.cancelHint' : 'picker.auto'))}</span>`;
     row.onclick = () => { closePicker(); connectAuto(); };
     menu.appendChild(row);
   }
+  // "Fastest — <subscription>": the same ⚡ for one subscription, when there are
+  // groups to choose between. The Servers page has the hand-added pile's own.
+  const groups = serverGroups();
+  if (groups.length >= 2) {
+    for (const g of groups) {
+      if (!g.id || g.items.length < 2) continue;
+      const row = document.createElement('div');
+      row.className = 'picker-item picker-special picker-auto picker-auto-sub';
+      row.innerHTML = '<span class="q-dot"></span><span class="proto-badge proto-auto">⚡</span><span class="pi-name"></span>';
+      row.querySelector('.pi-name').textContent = t('picker.autoSub').replace('{name}', () => g.name);
+      row.onclick = () => { closePicker(); connectAuto({ ids: g.items.map(s => s.id), name: g.name }); };
+      menu.appendChild(row);
+    }
+  }
   if (poolReady()) addRow(POOL_ID, '<span class="proto-badge proto-pool">🧩</span>', t('picker.pool') + ' (' + poolEnabledValid().length + ')', null, true);
-  if (advancedReady()) addRow(ADV_ID, '<span class="proto-badge proto-advanced">🧭</span>', t('picker.advanced'), null, true);
+  if (Array.isArray(state.profiles)) {
+    // one 🧭 row per routing profile that has rules or a default
+    if (state.settings.advancedRouting) {
+      for (const p of state.profiles) {
+        if (profileReady(p)) addRow(ADV_ID + ':' + p.id, '<span class="proto-badge proto-advanced">🧭</span>', p.name || t('picker.advanced'), null, true);
+      }
+    }
+  } else if (advancedReady()) addRow(ADV_ID, '<span class="proto-badge proto-advanced">🧭</span>', t('picker.advanced'), null, true);
   for (const c of state.chains) {
     if (chainReady(c)) addRow(c.id, '<span class="proto-badge proto-chain">⛓</span>', c.name, c.id, true);
   }
@@ -1375,16 +1869,39 @@ $('#btnImportCancel').onclick = () => { $('#importBox').hidden = true; $('#impor
 const HTTP_PROXY_LINK = /^http:\/\/(?:(?:[A-Za-z0-9+/=]+|[^/?#\s@]+)@)?[^/?#\s@]+:\d{1,5}(?:#\S*)?$/i;
 
 /**
+ * Text that opens like a JSON document: an object, or an array of them. Only a
+ * routing hint — whether it is a config at all is parseMany's call (main side),
+ * which also reads a WireGuard `[Interface]` blob first (smartImport checks that
+ * before this, so an `[` here is never a .conf).
+ */
+function looksLikeJsonText(text) {
+  // \x7b is "{" — an escape, so the tests that cut functions out of this file by counting braces keep their count
+  return /^\s*[\[\x7b]/.test(String(text || ''));
+}
+
+/** The first import error's reason, short enough for a toast ('' when there is none). */
+function importErrorReason(errors) {
+  const e = (errors || [])[0];
+  const why = e ? String((e && e.error) || (typeof e === 'string' ? e : '')) : '';
+  return why.length > 140 ? why.slice(0, 137) + '…' : why;
+}
+
+/**
  * Smart import: figures out what was pasted and routes it correctly.
  *  - http(s) lines  -> added & fetched as subscriptions (auto-update capable)
  *  - vless/vmess/…  -> imported as servers
  *  - http proxy link -> imported as a server (see HTTP_PROXY_LINK above)
  *  - base64 blob    -> decoded & imported as servers (handled by parseMany)
+ *  - JSON config(s) -> sent whole to parseMany (one server per config, or per balancer outbound)
+ *  - irnetfree://routing/… -> a routing profile's or a chain's share link: its own preview, then import
  * Mixed input works too (URLs become subs, the rest become servers).
  */
 async function smartImport(text) {
   text = String(text || '').trim();
   if (!text) return;
+  // A routing or chain share link carries servers, chains and a profile in one
+  // line: nothing is written before its preview has been seen and accepted.
+  if (/^irnetfree:\/\/routing\//i.test(text)) return openRoutingImport(text);
   // A pasted WireGuard .conf is one multi-line config, not a list of links —
   // hand the whole blob to parseMany (main-side) before the per-line split.
   if (/^\s*\[interface\]/im.test(text) && /^\s*\[peer\]/im.test(text)) {
@@ -1396,12 +1913,27 @@ async function smartImport(text) {
     toast(failed ? `${t('t.failed')}: ${res.errors[0].error}` : t('t.wgAdded'), failed ? 'err' : 'ok');
     return;
   }
+  // Pasted JSON — one Xray / sing-box config, or an array of them — is one
+  // document: it goes to the main process exactly as typed, never split into
+  // lines (parseMany reads it before it looks for links).
+  if (looksLikeJsonText(text)) {
+    const res = await window.api.importServers(text);
+    state.servers = res.servers;
+    if (!state.selectedServerId && state.servers.length) state.selectedServerId = state.servers[0].id;
+    renderServers(); renderPicker(); renderChains(); renderPool();
+    const errCount = (res.errors || []).length;
+    const why = importErrorReason(res.errors);
+    const added = res.added || 0;
+    toast(added ? `${added} ${t('t.serversAdded')}` + (errCount ? ` (${errCount} ${t('t.errors')}${why ? ': ' + why : ''})` : '')
+      : (why ? `${t('t.failed')}: ${why}` : t('t.nothingFound')), added ? 'ok' : 'err');
+    return;
+  }
   const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const isSubUrl = (l) => /^https?:\/\//i.test(l) && !HTTP_PROXY_LINK.test(l);
   const urlLines = lines.filter(isSubUrl);
   const configText = lines.filter(l => !isSubUrl(l)).join('\n');
 
-  let subCount = 0, subAdded = 0, srvAdded = 0, errCount = 0;
+  let subCount = 0, subAdded = 0, srvAdded = 0, errCount = 0, firstWhy = '';
 
   for (const url of urlLines) {
     try { const res = await window.api.addSub(url, ''); subCount++; subAdded += res.added || 0; }
@@ -1416,6 +1948,7 @@ async function smartImport(text) {
     state.servers = res.servers;
     srvAdded = res.added || 0;
     errCount += (res.errors || []).length;
+    firstWhy = importErrorReason(res.errors);
   }
 
   if (!state.selectedServerId && state.servers.length) state.selectedServerId = state.servers[0].id;
@@ -1425,7 +1958,9 @@ async function smartImport(text) {
   if (subCount) parts.push(`${subCount} ${t('t.subAddedShort')} • ${subAdded} ${t('sub.servers')}`);
   if (srvAdded || (configText && !subCount)) parts.push(`${srvAdded} ${t('t.serversAdded')}`);
   const ok = subCount || srvAdded;
-  const msg = (parts.join(' • ') || t('t.nothingFound')) + (errCount ? ` (${errCount} ${t('t.errors')})` : '');
+  // the first error's reason rides along: "Clash YAML is not supported — use the
+  // subscription link" is the whole point of that refusal
+  const msg = (parts.join(' • ') || t('t.nothingFound')) + (errCount ? ` (${errCount} ${t('t.errors')}${firstWhy ? ': ' + firstWhy : ''})` : '');
   toast(msg, ok ? 'ok' : 'err');
   return { subCount, subAdded, srvAdded, errCount };
 }
@@ -1448,10 +1983,12 @@ document.addEventListener('paste', (e) => {
   const cd = e.clipboardData || window.clipboardData;
   const text = cd && cd.getData('text');
   if (!text || !text.trim()) return;
-  // ignore unrelated clipboard text; a .conf blob counts as importable too
-  const looksImportable = /^(https?:\/\/|vless:\/\/|vmess:\/\/|trojan:\/\/|ss:\/\/|socks:\/\/|socks5:\/\/|wireguard:\/\/|wg:\/\/)/im.test(text.trim())
+  // ignore unrelated clipboard text; a .conf blob counts as importable too, and
+  // so does a routing / chain share link (smartImport opens its preview)
+  const looksImportable = /^(https?:\/\/|vless:\/\/|vmess:\/\/|trojan:\/\/|ss:\/\/|socks:\/\/|socks5:\/\/|wireguard:\/\/|wg:\/\/|hysteria2:\/\/|hy2:\/\/|irnetfree:\/\/routing\/)/im.test(text.trim())
     || /[A-Za-z0-9+/=]{24,}/.test(text.trim())
-    || (/^\s*\[interface\]/im.test(text) && /^\s*\[peer\]/im.test(text));
+    || (/^\s*\[interface\]/im.test(text) && /^\s*\[peer\]/im.test(text))
+    || (looksLikeJsonText(text) && text.includes('"outbounds"'));   // an Xray / sing-box config
   if (!looksImportable) return;
   e.preventDefault();
   toast(t('t.pasteDetected'));
@@ -1461,7 +1998,8 @@ document.addEventListener('paste', (e) => {
 async function deleteServer(id) {
   state.servers = await window.api.deleteServer(id);
   delete state.pings[id];
-  if (state.selectedServerId === id) state.selectedServerId = state.servers[0] && state.servers[0].id || null;
+  // the picker falls back to the live connection, the last one made, then the first server (keepSelectionValid)
+  if (state.selectedServerId === id) state.selectedServerId = null;
   // prune the deleted server from any named chains
   const inAnyChain = state.chains.some(c => (c.members || []).includes(id));
   if (inAnyChain) {
@@ -1485,6 +2023,7 @@ $('#btnClearServers').onclick = async () => {
   renderPicker();
   renderChains();
   renderPool();
+  renderAdvanced();   // every target is gone: the rules and the flow tree say so
   toast(t('t.allServersDeleted'));
 };
 
@@ -1514,6 +2053,7 @@ async function pingServer(id) {
   setPhasePending(id, 'data-ping-real');           // ← testing download now
   const real = await window.api.pingReal(id);
   state.pings[id] = Object.assign(state.pings[id] || {}, { real });
+  pingAt[id] = Date.now();
   applyPingDisplays(id);
   setPhasePending(id, 'data-ping-up');             // ← testing upload now
   const upload = await window.api.pingUpload(id);
@@ -1532,6 +2072,7 @@ async function pingTcpOnly(id) {
 async function pingRealOnly(id) {
   const real = await window.api.pingReal(id);
   state.pings[id] = Object.assign(state.pings[id] || {}, { real });
+  pingAt[id] = Date.now();
   applyPingDisplays(id);
   return real;
 }
@@ -1550,6 +2091,7 @@ async function pingMany(ids) {
     const res = await window.api.pingRealMany(ids);
     for (const id of ids) {
       state.pings[id] = Object.assign(state.pings[id] || {}, { real: (res && res[id]) || { ok: false, error: 'no result' } });
+      pingAt[id] = Date.now();
       applyPingDisplays(id);
     }
   } else {
@@ -1564,14 +2106,15 @@ $('#btnClearUsage').onclick = () => clearUsageFor(null);
 
 /* quick ping (home) — fills the TCP ping + Real delay cards for one target */
 async function quickPing(id) {
-  if (!id || id === ADV_ID || id === POOL_ID) return;
+  if (!id || id === ADV_ID || id === POOL_ID || String(id).startsWith(ADV_ID + ':')) return;
   $('#statTcp').textContent = '...';
   $('#statReal').textContent = '...';
   const tcp = await window.api.pingTcp(id);
-  $('#statTcp').textContent = tcp.ok ? tcp.ms + 'ms' : t('t.error');
+  $('#statTcp').textContent = tcp.ok ? tcp.ms + 'ms' : (tcp.na ? '—' : t('t.error'));
   const real = await window.api.pingReal(id);
   $('#statReal').textContent = real.ok ? real.ms + 'ms' : t('t.error');
   state.pings[id] = Object.assign(state.pings[id] || {}, { tcp, real });
+  pingAt[id] = Date.now();
   applyPingDisplays(id);
   renderPicker();
 }
@@ -1616,19 +2159,30 @@ function showGeo(info) {
 function hideGeo() { $('#connGeo').hidden = true; }
 
 /* ----------------------------- connect / disconnect ----------------------------- */
+// The connect this window is waiting on, and the last one the user cancelled:
+// a cancelled connect that then fails has failed because of the cancel, and
+// is no error to show.
+let connectSeq = 0;
+let cancelledSeq = 0;
+
 async function connect(id) {
-  if (state.connecting) return;
+  // A connect in flight (or a rebuild): every control that would start one is
+  // its Cancel. It used to do nothing here, so a connect that hung — a dead
+  // server, no network — could only be waited out.
+  if (state.connecting) return cancelConnect();
   if (state.connected && state.activeServerId === id) return disconnect();
   // TUN wanted but not elevated (Windows): offer to relaunch as admin first.
   if (state.settings.tunMode && state.tunAvailable && !state.elevated && state.platform === 'win32') {
     if (await promptRelaunchAdmin()) return;
   }
   selectServer(id);
+  const seq = ++connectSeq;
   state.connecting = true;
   setConnUI('connecting', id);
   try {
     await window.api.connect(id);
   } catch (e) {
+    if (seq <= cancelledSeq) return;   // the 'disconnected' the Cancel brought is the last word
     state.connecting = false;
     setConnUI('error');
     toast(t('t.connectFailed') + ': ' + e.message, 'err');
@@ -1641,7 +2195,20 @@ async function disconnect() {
   try { await window.api.disconnect(); } catch (e) { toast(e.message, 'err'); }
 }
 
+/**
+ * Stop the connect in flight. It is a disconnect: main's (or the service's)
+ * disconnect overtakes the connect, which gives way at its next step and
+ * undoes whatever it started after the teardown, and the 'disconnected' status
+ * brings every window — and every browser on the router — back.
+ */
+function cancelConnect() {
+  cancelledSeq = connectSeq;
+  $('#connState').textContent = t('state.cancelling');
+  return disconnect();
+}
+
 $('#powerBtn').onclick = () => {
+  if (state.connecting) return cancelConnect();
   if (state.connected) return disconnect();
   const id = state.selectedServerId || state.activeServerId || (state.servers[0] && state.servers[0].id);
   if (!id) return toast(t('t.addServerFirst'), 'err');
@@ -1668,8 +2235,8 @@ function setConnUI(stateStr, id) {
   if (effChain) {
     const names = chainMembers(effChain).map(s => s.name);
     srv.textContent = '⛓ ' + effChain.name + (names.length ? ' (' + names.join(' → ') + ')' : '');
-  } else if (effId === ADV_ID) {
-    srv.textContent = '🧭 ' + t('picker.advanced');
+  } else if (effId === ADV_ID || String(effId).startsWith(ADV_ID + ':')) {
+    srv.textContent = '🧭 ' + advSelName(effId);
   } else if (effId === POOL_ID) {
     const list = poolEnabledValid();
     srv.textContent = '🧩 ' + t('picker.pool') + ' — ' +
@@ -1721,6 +2288,37 @@ function setConnUI(stateStr, id) {
   startUptime(stateStr === 'connected');
   renderTrafficPath(stateStr);
   renderInspector();
+  renderConnIssues(stateStr);
+  refreshConnectControls();
+}
+
+/**
+ * While a connect is in flight every control that would start one says what it
+ * does now: Cancel (see connect()). The power button's tooltip and accessible
+ * name, the ▶ of each server and chain, the pool's connect button and the
+ * picker's Auto row — rewritten where they exist; the ones built later ask
+ * connectGlyph() themselves.
+ */
+function refreshConnectControls() {
+  const busy = !!state.connecting;
+  const hint = t(busy ? 'power.cancelHint' : state.connected ? 'power.disconnect' : 'power.connect');
+  const power = $('#powerBtn');
+  power.title = hint;
+  power.setAttribute('aria-label', hint);
+  $$('.connect-srv, .ch-connect').forEach((b) => connectGlyph(b));
+  const pool = $('#btnPoolConnect');
+  if (pool) pool.textContent = t(busy ? 'power.cancel' : 'pool.connect');
+  const auto = $('#pickerMenu .picker-auto .pi-name');
+  if (auto) auto.textContent = t(busy ? 'power.cancelHint' : 'picker.auto');
+}
+
+/** A ▶ button: play while idle, stop (the connect's Cancel) while one is in flight. */
+function connectGlyph(btn) {
+  const busy = !!state.connecting;
+  btn.textContent = busy ? '■' : '▶';
+  btn.title = t(busy ? 'power.cancel' : 'power.connect');
+  btn.setAttribute('aria-label', btn.title);
+  return btn;
 }
 
 /* ------------------------- title-bar uptime clock ------------------------- */
@@ -1732,7 +2330,8 @@ function setConnUI(stateStr, id) {
  */
 let uptimeTimer = null;
 let uptimeFrom = 0;
-function startUptime(on) {
+/** `from`: when the service says the tunnel came up (a snapshot) — else now. */
+function startUptime(on, from) {
   const el = $('#tbUptime');
   const meta = $('#connMeta');
   if (!on) {
@@ -1742,8 +2341,11 @@ function startUptime(on) {
     if (meta) meta.textContent = state.xrayVersion ? 'core ' + state.xrayVersion : '';
     return;
   }
-  if (uptimeTimer) return;              // already counting this connection
-  uptimeFrom = Date.now();
+  if (uptimeTimer) {                    // already counting this connection
+    if (from) uptimeFrom = from;        // …but the service knows better when it came up
+    return;
+  }
+  uptimeFrom = from || Date.now();
   const tick = () => {
     const s = Math.max(0, Math.floor((Date.now() - uptimeFrom) / 1000));
     const hh = String(Math.floor(s / 3600)).padStart(2, '0');
@@ -1757,31 +2359,229 @@ function startUptime(on) {
   uptimeTimer = setInterval(tick, 1000);
 }
 
-/* ---------------------------- the traffic path ---------------------------- */
+/* ---------------------- the connection as one fact (snapshot) ---------------------- */
 
-/** A node in the path diagram. */
-function pathNode(ico, name, meta, cls) {
-  const el = document.createElement('div');
-  el.className = 'path-node' + (cls ? ' ' + cls : '');
-  el.innerHTML = `<span class="path-ico">${ico}</span>
-    <span class="path-name"></span>
-    <span class="path-meta"></span>`;
-  el.querySelector('.path-name').textContent = name;
-  el.querySelector('.path-meta').textContent = meta || '';
-  return el;
-}
-
-function pathLink(live, capId) {
-  const el = document.createElement('div');
-  el.className = 'path-link' + (live ? ' live' : '');
-  if (capId) {
-    const cap = document.createElement('span');
-    cap.className = 'path-cap';
-    cap.id = capId;
-    el.appendChild(cap);
+/**
+ * What the service says the connection IS — app:init.conn on every page load
+ * and the first event of every events (re)connect (web-api.js). Applied
+ * idempotently: no toast, no log line, the uptime from the service's `since`.
+ * A phone that reloads a background tab used to see "disconnected" while the
+ * tunnel was up, with no event ever coming to correct it (v1.16 S1).
+ */
+function applyConnSnapshot(conn) {
+  if (!conn || !conn.state) return;
+  const id = conn.serverId || null;
+  state.wasReconnecting = false;
+  if (conn.state === 'connected') {
+    state.connected = true;
+    state.connecting = false;
+    state.activeServerId = id;
+    state.activeEngine = conn.engine || '';
+    setConnUI('connected', id);
+    startUptime(true, conn.since || null);
+  } else if (conn.state === 'connecting') {
+    state.connected = false;
+    state.connecting = true;
+    setConnUI('connecting', id || state.activeServerId);
+  } else if (conn.state === 'reconnecting' || conn.state === 'waiting') {
+    state.connected = false;
+    state.connecting = true;
+    state.wasReconnecting = conn.state === 'reconnecting';
+    state.reconnectReason = conn.reason || '';
+    setConnUI('connecting', id || state.activeServerId);
+    $('#connState').textContent = attemptText(conn.state, conn.attempt);
+  } else if (conn.state === 'error') {
+    state.connected = false;
+    state.connecting = false;
+    state.activeServerId = null;
+    state.activeEngine = '';
+    setConnUI('error');
+    showErrorReason(conn.reason);
+  } else {
+    state.connected = false;
+    state.connecting = false;
+    state.activeServerId = null;
+    state.activeEngine = '';
+    setConnUI('disconnected');
   }
-  return el;
+  applyKillSwitchState(conn.killSwitch);
+  renderServers();
+  renderPicker();
 }
+
+/**
+ * The router's error state with its reason, as LuCI's badge says it
+ * ("Error: …"): a connect the router made on its own (at boot, in a
+ * recovery) that the core refused — a finalmask server with no Xray-PattN —
+ * has no click waiting for a toast, and a bare "Error" said nothing.
+ */
+function showErrorReason(reason) {
+  if (state.flavor === 'openwrt' && reason) $('#connState').textContent = t('state.error') + ': ' + reason;
+}
+
+/* ------------- what the connection did not do, and what this PC does to it (v1.16.3) ------------- */
+
+/**
+ * The lines Home keeps under the connection state while it is up: failures of
+ * THIS connection that were only ever a log line — TUN was asked for and the
+ * tunnel did not come up (the connect went on proxy-only), or the tunnel came
+ * up and the leak guard did not (the adapters kept their own resolvers, so
+ * names can leave outside it). A guardError with no tunnel is the proxy mode's
+ * UDP block, not the guard: not said here.
+ */
+function connIssuesFrom(d) {
+  const out = [];
+  if (!d) return out;
+  if (d.tunError) out.push({ id: 'proxyOnly', reason: String(d.tunError) });
+  if (d.tun && d.guardError) out.push({ id: 'guardFailed', reason: String(d.guardError) });
+  return out;
+}
+
+/**
+ * A notice in the user's language: 'notice.<id>' with each {field} filled in
+ * from the notice, literally. A field main cannot say in the user's language —
+ * a record's group "added by hand" — comes as { t: <i18n key> } and is this
+ * window's own string.
+ */
+function noticeText(n) {
+  if (!n || !n.id) return '';
+  return t('notice.' + n.id).replace(/\{(\w+)\}/g, (m, k) => {
+    const v = n[k];
+    if (v == null) return m;
+    if (typeof v === 'object') return typeof v.t === 'string' ? t(v.t) : m;
+    return String(v);
+  });
+}
+
+/** Those lines: shown while connected, gone with the connection; repainted by setConnUI (a language switch too). */
+function renderConnIssues(stateStr) {
+  const box = $('#connIssues');
+  if (!box) return;
+  const list = stateStr === 'connected' ? (state.connIssues || []) : [];
+  box.textContent = '';
+  for (const n of list) {
+    const line = document.createElement('div');
+    line.className = 'conn-issue';
+    line.textContent = noticeText(n);
+    box.appendChild(line);
+  }
+  box.hidden = !list.length;
+}
+
+/**
+ * What a 'connected' status says in toasts, in order: the failures above (the
+ * tunError toast, now saying what it means), the missing geo files as before,
+ * then what main found (Windows only: a WireGuard identity stored twice, a LAN
+ * that holds what a routed tunnel needs, managed DNS off for a corporate
+ * resolver), each with what to do. A recovery that finds the same thing again
+ * never repeats it. This PC's findings come back with the next connection (its
+ * network may have changed); a WireGuard identity stored twice is a fact about
+ * the store, the same on every connect — said once per run.
+ */
+function connectToasts(d) {
+  const out = connIssuesFrom(d).map(n => ({ msg: noticeText(n), kind: 'err', ms: 9000 }));
+  if (d && d.geoWarn) out.push({ msg: d.geoWarn, kind: 'warn', ms: 2600 });
+  if (!state.noticesToasted) state.noticesToasted = new Set();
+  if (!state.noticesOnce) state.noticesOnce = new Set();
+  const listed = new Set();
+  for (const n of (d && Array.isArray(d.notices)) ? d.notices : []) {
+    if (!n || !n.id) continue;
+    const key = JSON.stringify(n);
+    // wgSharedKey / wgSharedAddress and their …Sub forms (the twin in a subscription): the store's, once per run
+    const said = /^wgShared(Key|Address)(Sub)?$/.test(n.id) ? state.noticesOnce : state.noticesToasted;
+    if (said.has(key) || listed.has(key)) continue;
+    listed.add(key);
+    // said once it is on screen: a series cut short (the connection went) leaves it to the next connection
+    out.push({ msg: noticeText(n), kind: 'warn', ms: 12000, shown: () => said.add(key) });
+  }
+  return out;
+}
+
+/**
+ * Toasts one after another: there is one toast element, and a second toast()
+ * replaces the first unread. One series at a time — a new one ends the last,
+ * and so does the connection going (cancelToastSeries); an item's `shown` runs
+ * once it is actually on screen.
+ */
+function toastSeries(items) {
+  cancelToastSeries();
+  const list = (items || []).filter(i => i && i.msg);
+  const next = () => {
+    toastSeries._t = null;
+    const it = list.shift();
+    if (!it) return;
+    toast(it.msg, it.kind, it.ms);
+    if (typeof it.shown === 'function') it.shown();
+    if (list.length) toastSeries._t = setTimeout(next, it.ms + 300);
+  };
+  next();
+}
+
+/** The rest of a series, not shown yet, goes with its connection (a disconnect, a switch, a rebuild). */
+function cancelToastSeries() {
+  clearTimeout(toastSeries._t);
+  toastSeries._t = null;
+}
+
+/* ------------- Windows: the logon task starts another copy (v1.16.3, L1) ------------- */
+
+/**
+ * Asked once the window has loaded — main only READS the task: a logon task
+ * that starts ANOTHER copy of the app (an old build from before the v1.14 DNS
+ * fix, a portable that was moved) gets a banner whose button points it at this
+ * one. Silent everywhere else: off Windows, on the router's page (its web api
+ * has no such call), and where the task is this copy, absent or unreadable.
+ */
+async function checkAutostart() {
+  if (state.platform !== 'win32' || !window.api.autostartCheck) return;
+  let r = null;
+  try { r = await window.api.autostartCheck(); } catch { return; }
+  state.autostartStale = (r && r.stale) ? { task: r.taskExe, current: r.currentExe } : null;
+  renderAutostartBanner();
+}
+
+function renderAutostartBanner() {
+  const banner = $('#autostartBanner');
+  if (!banner) return;
+  const s = state.autostartStale;
+  banner.hidden = !s;
+  if (s) $('#autostartBannerText').textContent = noticeText(Object.assign({ id: 'autostartStale' }, s));
+}
+
+/** The banner's button — the one write of this check, and only on this click. */
+async function repointAutostart() {
+  let r = null;
+  try { r = await window.api.autostartRepoint(); } catch (e) { r = { ok: false, error: (e && e.message) || String(e) }; }
+  if (r && r.ok) {
+    state.autostartStale = null;
+    renderAutostartBanner();
+    toast(t('notice.autostartFixed'), 'ok');
+  } else {
+    toast(noticeText({ id: 'autostartFixFailed', error: (r && r.error) || '' }), 'err', 8000);
+  }
+}
+
+/** "Reconnecting… (attempt n)" / "Waiting for internet… (attempt n)" — the router's two in-between states. */
+function attemptText(kind, n) {
+  return t(kind === 'waiting' ? 'state.waiting' : 'state.reconnectingN').replace('{n}', String(n || 1));
+}
+
+/**
+ * The router's kill switch, from a snapshot or a killswitch event:
+ * {enabled, armed, blocking} — the banner shows while it blocks the LAN
+ * (the tunnel is down and the VPN is meant to be on; "Turn the VPN off" =
+ * disconnect, which disarms it).
+ */
+function applyKillSwitchState(ks) {
+  if (!ks || typeof ks !== 'object' || state.flavor !== 'openwrt') return;
+  state.killSwitch = ks;
+  state.killEngaged = !!ks.blocking;
+  const banner = $('#killBanner');
+  if (banner) banner.hidden = !ks.blocking;
+  if (typeof updateKillStatus === 'function') updateKillStatus();
+}
+
+/* ---------------------------- the traffic path ---------------------------- */
 
 /** Short label for a routing target, in the user's language. */
 function targetLabel(target) {
@@ -1806,6 +2606,17 @@ function outboundTagFor(target) {
   return 'out-' + target;
 }
 
+/** A base's key inside configBuilder's tags: the server's id, or 'chain-<cid>' for a chain. */
+function baseKeyOf(base) {
+  return String(base).indexOf('chain:') === 0 ? 'chain-' + String(base).slice(6) : String(base);
+}
+
+/** The tag of a target dialled through a base: 'out-<id>@<baseKey>' / 'out-chain-<cid>@<baseKey>'. */
+function viaTagFor(target, base) { return outboundTagFor(target) + '@' + baseKeyOf(base); }
+
+/** A base's own outbound (its exit, shared by everything through it): 'base-<id>' / 'base-chain-<cid>'. */
+function baseTagFor(base) { return 'base-' + baseKeyOf(base); }
+
 /** First of `tags` the core actually reported, so single/chain ('proxy') and
  *  advanced ('out-…') plans can share one lookup. */
 function pickTag(per, tags) {
@@ -1823,7 +2634,10 @@ function trafficSpan(tags) {
 }
 
 /**
- * What is going where.
+ * What is going where — the routing page's flow tree, minimal: this device →
+ * the rules → ⚓ the base they ride on → the targets, each target with its own
+ * traffic and every line in its target's colour, so what goes direct, what
+ * rides the base and what goes anywhere else never mix.
  *
  * Two things it must get right, both of which it used to get wrong:
  *
@@ -1831,13 +2645,13 @@ function trafficSpan(tags) {
  *     are drawn only when the advanced entry is the one being connected —
  *     picking a single server used to still show the rule fan-out, which is
  *     why the picture looked unrelated to the choice above it.
- *  2. Every hop carries ITS OWN traffic, read per outbound from the core's
+ *  2. Every target carries ITS OWN traffic, read per outbound from the core's
  *     counters, so "how much went through this config" is answerable at a
  *     glance instead of being one grand total for everything at once.
  *
  * Built on a status change and on a settings save — NEVER on a stats tick. The
  * per-second update is applyPathTraffic(), which only writes text into the
- * captions this function created.
+ * captions this function created; the lines follow the boxes (drawHomeFlow).
  */
 function renderTrafficPath(stateStr) {
   const host = $('#trafficPath');
@@ -1852,84 +2666,299 @@ function renderTrafficPath(stateStr) {
   const id = busy
     ? (state.activeServerId || state.selectedServerId)
     : (state.selectedServerId || state.activeServerId);
-  const chain = chainById(id);
-  const frag = document.createDocumentFragment();
-
-  frag.appendChild(pathNode('🖥', t('path.device'), s.tunMode ? 'TUN' : 'SOCKS/HTTP'));
-
-  if (id === ADV_ID) {
-    // the fan-out: one line per rule, each with its own figures
-    frag.appendChild(pathLink(live, 'pathCapIn'));
-    const rules = document.createElement('div');
-    rules.className = 'path-rules';
-    const list = (s.routeRules || []).filter(r => r && r.value && r.target);
-    const SHOWN = 4;
-    list.slice(0, SHOWN).forEach((r, i) => {
-      rules.appendChild(pathRule(String(i + 1).padStart(2, '0'), r.value, r.target));
-    });
-    if (list.length > SHOWN) {
-      const more = document.createElement('div');
-      more.className = 'path-rule';
-      more.innerHTML = '<span class="pr-idx">··</span><span class="pr-cond"></span>';
-      more.querySelector('.pr-cond').textContent = t('path.andMore').replace('{n}', list.length - SHOWN);
-      rules.appendChild(more);
-    }
-    const def = pathRule('↓', t('path.rest'), s.routeDefault || 'direct');
-    def.classList.add('is-default');
-    def.querySelector('.pr-cond').classList.add('is-label');
-    rules.appendChild(def);
-    frag.appendChild(rules);
-  } else if (chain) {
-    // every hop, in order, with the exit carrying the figures
-    const members = chainMembers(chain);
-    members.forEach((m, i) => {
-      frag.appendChild(pathLink(live, i === 0 ? 'pathCapIn' : null));
-      const node = pathNode('🛡', m.name, (m.protocol || '').toUpperCase(),
-        live && i === members.length - 1 ? 'exit' : '');
-      if (i === members.length - 1) node.appendChild(trafficSpan(['proxy', outboundTagFor(chain.id ? 'chain:' + chain.id : 'chain')]));
-      frag.appendChild(node);
-    });
-    if (!members.length) frag.appendChild(pathNode('🛡', chain.name, '', ''));
-  } else if (id === POOL_ID) {
-    frag.appendChild(pathLink(live, 'pathCapIn'));
-    const rules = document.createElement('div');
-    rules.className = 'path-rules';
-    for (const e of poolEnabledValid()) {
-      rules.appendChild(pathRule(String(e.socksPort), e.name, e.target));
-    }
-    frag.appendChild(rules);
-  } else {
-    frag.appendChild(pathLink(live, 'pathCapIn'));
-    const srv = srvById(id);
-    const node = pathNode('🛡', srv ? srv.name : t('path.noServer'),
-      srv ? (srv.protocol || '').toUpperCase() : '', live ? 'exit' : '');
-    node.appendChild(trafficSpan(['proxy', outboundTagFor(id)]));
-    frag.appendChild(node);
-    frag.appendChild(pathLink(live));
-  }
-
+  hfModel = homeFlowModel(id);
   // the exit IP is whatever the last check found — read from the readout that
   // already holds it rather than keeping a second copy in sync
   const ipEl = $('#statIp');
   const ip = ipEl && ipEl.textContent !== '—' ? ipEl.textContent : '';
-  frag.appendChild(pathNode('🌐', t('path.internet'), live ? ip : t('path.offline')));
-  host.replaceChildren(frag);
+  host.replaceChildren(buildHomeFlow(hfModel, { live, ip, mode: s.tunMode ? 'TUN' : 'SOCKS/HTTP' }));
   applyPathTraffic(lastPerOutbound);
+  // the routing page's flow tree is live only while its profile is the one up
+  applyFlowTraffic(lastPerOutbound);
+  drawHomeFlowSoon();
 }
 
-/** One "condition → target" line, with its own traffic caption. */
-function pathRule(idx, cond, target) {
-  const row = document.createElement('div');
-  row.className = 'path-rule';
-  const kind = target === 'direct' ? ' to-direct' : target === 'block' ? ' to-block' : ' to-proxy';
-  row.innerHTML = `<span class="pr-idx"></span><span class="pr-cond"></span>
-    <span class="pr-arrow">→</span><span class="pr-to${kind}"></span>`;
-  row.querySelector('.pr-idx').textContent = idx;
-  row.querySelector('.pr-cond').textContent = cond;
-  row.querySelector('.pr-to').textContent = targetLabel(target);
-  row.appendChild(trafficSpan([outboundTagFor(target)]));
-  return row;
+let hfModel = null;   // the home flow on screen (its lines are drawn from it)
+let hfColumns = null;  // watches its columns: when their boxes move, the lines are drawn again
+
+/** How many of a profile's own rule nodes the home flow shows before "+N more". */
+const HOME_FLOW_RULES = 4;
+/**
+ * The hue of proxy lane `n` (1, 2, …): five chosen ones — sky, violet, amber,
+ * pink, coral — then the golden angle for as many more as a profile has,
+ * never near direct's green or block's red. The theme picks the lightness.
+ */
+function laneHue(n) {
+  const CHOSEN = [212, 268, 38, 325, 18];
+  if (n >= 1 && n <= CHOSEN.length) return CHOSEN[n - 1];
+  let h = Math.round((212 + (n - 1) * 137.508) % 360);
+  for (let i = 0; i < 12 && ((h >= 80 && h <= 175) || h >= 345 || h <= 10); i++) h = (h + 47) % 360;
+  return h;
 }
+
+/**
+ * The home flow as data: { groups, bases, targets, edges, more } — the shapes
+ * of flowModel (routing page), plus `lane` on every target and edge (its
+ * target's colour: 'direct', 'block', or 'c1'…'c5' in order of appearance)
+ * and the device's own edge to every rule ('o' → group).
+ *
+ *   a routing profile  its flow (flowModel: the app's own rules, the bases,
+ *                      "exit at the base"), its own rules cut at
+ *                      HOME_FLOW_RULES with the rest counted in `more`
+ *   the pool           an entry per local port
+ *   a chain or server  the simple mode's: ads → block, the local network →
+ *                      direct, the mode's country → direct, everything else →
+ *                      the config (direct in the direct mode); a raw JSON
+ *                      server in proxy mode runs its own routing: just it
+ */
+function homeFlowModel(id) {
+  const s = state.settings || {};
+  let m;
+  let more = 0;
+  if (id === ADV_ID || String(id).startsWith(ADV_ID + ':')) {
+    const prof = profileOfSel(id) || { id: '', rules: s.routeRules || [], def: s.routeDefault, defVia: 'inherit', base: null, useMode: !!s.advancedUseMode };
+    m = flowModel(prof);
+    // its own rules beyond HOME_FLOW_RULES are counted, not drawn — and so is whatever only they lead to
+    const own = m.groups.filter(g => !g.sys && !g.isDefault);
+    const cut = new Set(own.slice(HOME_FLOW_RULES).map(g => g.key));
+    more = own.slice(HOME_FLOW_RULES).reduce((n, g) => n + g.idxs.length, 0);
+    const groups = m.groups.filter(g => !cut.has(g.key));
+    const kept = new Set(groups.map(g => g.to));
+    const targets = m.targets.filter(t => kept.has(t.key));
+    const edges = m.edges.filter(e => (e.from.startsWith('b:') ? kept.has(e.to) : !cut.has(e.from)));
+    const baseKeys = new Set(edges.filter(e => e.from.startsWith('b:')).map(e => e.from).concat(edges.filter(e => e.to.startsWith('b:')).map(e => e.to)));
+    m = { groups, targets, bases: m.bases.filter(b => baseKeys.has(b.key)), edges, prof };
+  } else if (id === POOL_ID) {
+    m = { groups: [], targets: [], bases: [], edges: [] };
+    const seen = {};
+    for (const e of poolEnabledValid()) {
+      const key = 't:' + e.target;
+      if (!seen[key]) {
+        const kind = String(e.target).startsWith('chain:') ? 'chain' : 'server';
+        seen[key] = { key, kind, ref: e.target, via: null, why: refProblem(e.target), tags: [outboundTagFor(e.target)] };
+        m.targets.push(seen[key]);
+      }
+      const g = { key: 'p' + e.socksPort, kind: 'rule', pool: true, port: e.socksPort, name: e.name, idxs: [], items: [], target: e.target, via: null, to: key };
+      m.groups.push(g);
+      m.edges.push({ from: g.key, to: key, danger: !!seen[key].why });
+    }
+  } else {
+    const chain = chainById(id);
+    const srv = chain ? null : srvById(id);
+    const raw = !!srv && srv.jsonMode === 'raw' && !s.tunMode;
+    const mode = s.routingMode || 'global';
+    const exit = mode === 'direct' && !raw ? 'direct' : (chain ? 'chain:' + chain.id : (srv ? srv.id : ''));
+    const targets = {};
+    const target = (ref) => {
+      if (!targets[ref]) {
+        const kind = ref === 'direct' || ref === 'block' ? ref : chain && ref === 'chain:' + chain.id ? 'chain' : 'server';
+        const tags = !ref ? [] : ref === 'direct' ? ['direct'] : ref === 'block' ? ['block'] : ['proxy', outboundTagFor(ref)];
+        targets[ref] = { key: 't:' + (ref || 'none'), kind: ref ? kind : 'none', ref, via: null, why: '', tags, chain: kind === 'chain' ? chain : null };
+      }
+      return targets[ref];
+    };
+    const groups = [];
+    const geo = geoReady();
+    const add = (g) => { groups.push(Object.assign({ kind: 'rule', idxs: [], items: [], via: null, to: target(g.target).key }, g)); };
+    if (!raw) {
+      if (s.blockAds && geo) add({ key: 'sys-ads', sys: 'ads', target: 'block' });
+      add({ key: 'sys-lan', sys: 'lan', target: 'direct' });
+      if (geo && (mode === 'bypass-ir' || mode === 'bypass-cn')) add({ key: 'sys-' + (mode === 'bypass-ir' ? 'ir' : 'cn'), sys: mode === 'bypass-ir' ? 'ir' : 'cn', target: 'direct' });
+    }
+    add({ key: 'def', isDefault: true, target: exit });
+    const ordered = [];
+    for (const g of groups) { const t = targets[g.target]; if (!ordered.includes(t)) ordered.push(t); }
+    m = { groups, targets: ordered, bases: [], edges: groups.map(g => ({ from: g.key, to: g.to, danger: false })) };
+  }
+  // the device starts every line
+  m.edges = m.groups.map(g => ({ from: 'o', to: g.key, danger: false })).concat(m.edges);
+  // one colour per target: direct and block keep theirs, every other one a lane of its own (p1, p2, … without end)
+  let n = 0;
+  const laneOf = {}, hueOf = {};
+  for (const t of m.targets) {
+    t.lane = t.kind === 'direct' ? 'direct' : t.kind === 'block' ? 'block' : t.kind === 'none' ? 'none' : 'p' + (++n);
+    t.hue = t.lane.charAt(0) === 'p' ? laneHue(n) : null;
+    laneOf[t.key] = t.lane;
+    hueOf[t.key] = t.hue;
+  }
+  const groupTo = {};
+  for (const g of m.groups) groupTo[g.key] = g.to;
+  for (const e of m.edges) {
+    // a rule's line is its target's colour; a base's line to a target, that target's
+    const tk = e.from === 'o' ? groupTo[e.to] : e.from.startsWith('b:') ? e.to : groupTo[e.from];
+    e.lane = laneOf[tk] || 'none';
+    e.hue = hueOf[tk] == null ? null : hueOf[tk];
+  }
+  m.more = more;
+  return m;
+}
+
+/** Give a home-flow box its target's colour: direct / block / none by class, a proxy lane by its hue. */
+function paintLane(el, target) {
+  const lane = target ? target.lane : 'none';
+  if (/^p\d+$/.test(lane)) {
+    el.classList.add('lane-p');
+    if (el.style && typeof el.style.setProperty === 'function') el.style.setProperty('--lane-h', String(target.hue));
+    else if (el.style) el.style['--lane-h'] = String(target.hue);
+  } else el.classList.add('lane-' + (lane === 'direct' || lane === 'block' ? lane : 'none'));
+}
+
+/** One box of the home flow: its number (a rule's, a pool port), icon, words; the rest as the caller adds it. */
+function homeFlowNode(cls, key, icon, label, idx) {
+  const el = document.createElement('div');
+  el.className = 'mf-node ' + cls;
+  el.dataset.key = key;
+  if (idx) spanIn(el, 'mf-idx', idx);
+  if (icon) spanIn(el, 'mf-ico', icon);
+  spanIn(el, 'mf-label', label);
+  return el;
+}
+
+/** The home flow on screen: four columns (three without a base), the lines drawn under them once laid out. */
+function buildHomeFlow(m, { live, ip, mode }) {
+  const grid = document.createElement('div');
+  grid.className = 'mf' + (m.bases.length ? '' : ' no-bases') + (live ? ' live' : '');
+  const column = (name) => {
+    const col = document.createElement('div');
+    col.className = 'mf-col';
+    col.dataset.col = name;
+    grid.appendChild(col);
+    return col;
+  };
+  // this device, with the session's live speed (the stats tick writes #pathCapIn)
+  const origin = homeFlowNode('mf-origin', 'o', '', '🖥 ' + t('path.device'));
+  spanIn(origin, 'mf-meta', mode);
+  const cap = spanIn(origin, 'mf-speed', '');
+  cap.id = 'pathCapIn';
+  column('origin').appendChild(origin);
+
+  const prof = m.prof || null;
+  const rules = column('rules');
+  const byKey = {};
+  for (const tg of m.targets) byKey[tg.key] = tg;
+  for (const g of m.groups) {
+    let el;
+    if (g.sys) {
+      const [icon, label, note] = appRuleWords(g.sys);
+      el = homeFlowNode('mf-rule app', g.key, icon, t(label));
+      el.title = t(label) + ' (' + t(note) + ')';
+    } else if (g.isDefault) {
+      el = homeFlowNode('mf-rule rest', g.key, '↓', t('path.rest'));
+    } else if (g.pool) {
+      el = homeFlowNode('mf-rule', g.key, '', g.name || 'SOCKS', ':' + g.port);
+    } else {
+      const sum = ruleSummary(g.items);
+      const nums = g.idxs.map(i => String(i + 1).padStart(2, '0'));
+      el = homeFlowNode('mf-rule', g.key, [...new Set(g.items.map(it => it.type))].map(ruleTypeIcon).join(''), sum.text || '—',
+        nums.length > 1 ? nums[0] + '–' + nums[nums.length - 1] : nums[0]);
+      el.querySelector('.mf-label').dir = 'ltr';
+      if (sum.more) spanIn(el, 'mf-more', '+' + sum.more);
+      el.title = sum.full;
+    }
+    paintLane(el, byKey[g.to]);
+    // the stacked (narrow) layout has no lines: this says where the rule goes instead
+    spanIn(el, 'mf-to', flowArrow() + ' ' + homeFlowTo(g, prof));
+    el.title = (el.title || el.querySelector('.mf-label').textContent) + ' ' + flowArrow() + ' ' + homeFlowTo(g, prof);
+    rules.appendChild(el);
+  }
+  if (m.more) spanIn(rules, 'mf-morerules', t('path.andMore').replace('{n}', m.more));
+
+  if (m.bases.length) {
+    const bases = column('bases');
+    for (const b of m.bases) {
+      const el = homeFlowNode('mf-base' + (b.why ? ' danger' : ''), b.key, '⚓', refName(b.ref));
+      el.title = refName(b.ref) + ' — ' + t('rp.base') + (b.why ? ' — ' + t(b.why) : '');
+      bases.appendChild(el);
+    }
+  }
+
+  const targets = column('targets');
+  for (const tg of m.targets) {
+    const icon = tg.kind === 'direct' ? '↗' : tg.kind === 'block' ? '⛔' : tg.kind === 'exit' ? '🌐' : tg.kind === 'chain' ? '⛓' : '🛡';
+    const label = tg.kind === 'direct' ? t('path.direct') : tg.kind === 'block' ? t('path.block')
+      : tg.kind === 'exit' ? t('path.exitHere') : tg.kind === 'none' ? t('path.noServer')
+        : tg.chain ? tg.chain.name : refName(tg.ref, prof);
+    const el = homeFlowNode('mf-target' + (tg.why ? ' danger' : ''), tg.key, icon, label);
+    paintLane(el, tg);
+    // a chain says its hops when asked; a target behind a base, which one
+    const ch = tg.chain || (String(tg.ref).startsWith('chain:') ? chainById(String(tg.ref).slice(6)) : null);
+    const hops = ch ? chainMembers(ch).map(x => x.name).join(' → ') : '';
+    el.title = [label, hops, tg.via ? t('rp.viaBase').replace('{base}', () => refName(tg.via)) : '', tg.why ? t(tg.why) : ''].filter(Boolean).join(' — ');
+    // block carries nothing worth counting
+    if (tg.kind !== 'block' && tg.tags.length) el.appendChild(trafficSpan(tg.tags));
+    targets.appendChild(el);
+  }
+
+  const layer = document.createElement('div');
+  layer.className = 'mf-edges';
+  layer.setAttribute('aria-hidden', 'true');
+  grid.appendChild(layer);
+  // the boxes move when a column does (a font arriving, a label growing): the lines follow every one of them
+  if (hfColumns) hfColumns.disconnect();
+  if (typeof ResizeObserver !== 'undefined') {
+    hfColumns = new ResizeObserver(() => drawHomeFlowSoon());
+    for (const col of grid.children) if (col.classList && col.classList.contains('mf-col')) hfColumns.observe(col);
+  }
+
+  const foot = document.createElement('div');
+  foot.className = 'mf-foot';
+  spanIn(foot, 'mf-exit', '🌐 ' + t('path.internet'));
+  spanIn(foot, 'mf-ip', live ? (ip || '—') : t('path.offline'));
+  grid.appendChild(foot);
+  return grid;
+}
+
+/** The arrow of a flow's words, the way the page reads: → in English, ← in Persian. */
+function flowArrow() {
+  return typeof document !== 'undefined' && document.documentElement && document.documentElement.dir === 'rtl' ? '←' : '→';
+}
+
+/** Where a rule of the home flow leads, in words: "⚓ base → target". */
+function homeFlowTo(g, prof) {
+  const ar = ' ' + flowArrow() + ' ';
+  if (g.target === TARGET_BASE) return prof && prof.base ? '⚓ ' + refName(prof.base) + ar + t('path.exitHere') : t('rp.exitAtBaseNone');
+  const to = !g.target ? t('path.noServer') : g.target === 'direct' ? t('path.direct') : g.target === 'block' ? t('path.block') : targetLabel(g.target);
+  return g.via ? '⚓ ' + refName(g.via) + ar + to : to;
+}
+
+/** Draw the home flow's lines from where its boxes landed — each in its target's colour. Nothing while hidden. */
+function drawHomeFlow() {
+  const host = $('#trafficPath');
+  const grid = host && host.querySelector ? host.querySelector('.mf') : null;
+  const layer = grid ? grid.querySelector('.mf-edges') : null;
+  if (!layer || !hfModel || typeof grid.getBoundingClientRect !== 'function') return;
+  const box = grid.getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  const rects = {};
+  for (const n of grid.querySelectorAll('.mf-node')) rects[n.dataset.key] = n.getBoundingClientRect();
+  const rtl = getComputedStyle(grid).direction === 'rtl';
+  const w = Math.ceil(box.width), h = Math.ceil(box.height);
+  // each line's colour: direct / block / none by name, a proxy lane by its hue (a number)
+  const paint = {};
+  for (const e of hfModel.edges) {
+    const hue = Number(e.hue);
+    paint[e.from + '>' + e.to] = /^(direct|block|none)$/.test(e.lane) ? `lane-${e.lane}"`
+      : (e.hue != null && Number.isFinite(hue) ? `lane-p" style="--lane-h:${Math.round(hue)}"` : 'lane-none"');
+  }
+  const bases = [...grid.querySelectorAll('.mf-base')].map(n => n.getBoundingClientRect());
+  // everything below is a literal, a number or one of the lane names above
+  layer.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" focusable="false">` +
+    flowEdgePaths(hfModel.edges, rects, box, rtl, bases)
+      .map(line => `<path d="${line.d}" class="mf-edge${line.danger ? ' danger' : ''} ${paint[line.from + '>' + line.to]}/>`).join('') +
+    '</svg>';
+}
+
+let hfDrawPending = false;
+/** Draw the home flow's lines on the next frame (once, however many renders asked). */
+function drawHomeFlowSoon() {
+  if (hfDrawPending) return;
+  hfDrawPending = true;
+  const run = () => { hfDrawPending = false; drawHomeFlow(); };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+  else setTimeout(run, 0);
+}
+// the window or the rail resizing moves every box: the lines follow
+if (typeof ResizeObserver !== 'undefined' && $('#trafficPath')) new ResizeObserver(() => drawHomeFlowSoon()).observe($('#trafficPath'));
 
 /**
  * Fill every caption from the core's per-outbound counters. Text only — the
@@ -1967,17 +2996,27 @@ function renderInspector() {
   set('#insCore', state.activeEngine || (s.defaultEngine === 'xray-pattn' ? 'xray-pattn' : 'xray'));
   const insRouting = $('#insRouting');
   if (insRouting) {
+    // the rules of the routing profile in use (connected, else selected, else the first)
+    const advProf = Array.isArray(state.profiles)
+      ? (profileOfSel(state.activeServerId || state.selectedServerId) || state.profiles[0] || { rules: [] }) : null;
     insRouting.textContent = s.advancedRouting
-      ? t('path.rules').replace('{n}', (s.routeRules || []).length)
+      ? t('path.rules').replace('{n}', (advProf ? advProf.rules : (s.routeRules || [])).length)
       : (s.routingMode || 'global');
   }
   if (state.flavor === 'openwrt') {
+    // the guard row is there only while a stored "strict" is live (applyFlavor),
+    // and goes with the save that lowers it
+    const guardRow = $('#insGuardRow');
+    if (guardRow) guardRow.hidden = s.leakGuard !== 'strict';
     const n = (s.lanBypassMacs || []).length;
     // the LIVE gateway, not the switch: connected (on a router a gateway that
     // did not come up is a failed connect) with the TUN the connection was
     // built with — a switch flipped since is only pending
     const gatewayUp = !!state.connected && (!!s.tunMode !== (state.pendingReconnect || []).includes('tunMode'));
-    set('#insGateway', gatewayUp ? t('gw.insWhole') + (n ? ' · ' + t('gw.insDirect').replace('{n}', n) : '') : off, gatewayUp ? 'on' : 'off');
+    // a recovery or the boot connect waiting for the WAN is not "the VPN is
+    // off": the VPN is on its way back (and an armed kill switch is holding the LAN)
+    if (!gatewayUp && state.connecting) set('#insGateway', t('state.connecting'));
+    else set('#insGateway', gatewayUp ? t('gw.insWhole') + (n ? ' · ' + t('gw.insDirect').replace('{n}', n) : '') : t('gw.insOff'), gatewayUp ? 'on' : 'off');
   }
 }
 
@@ -1995,14 +3034,25 @@ function failedKey(reason) {
   return DROP_REASONS.includes(reason) ? 'net.dropFailed' : 'net.failed';
 }
 window.api.onStatus((d) => {
+  // "Give my internet back" belongs to a give-up with the guard held, and to
+  // nothing after it: a reconnect that came back (or is being built) owns the
+  // guard again, and its button would put every adapter on the ISP's resolvers
+  // under a live tunnel. A failed teardown is no new state: it leaves it be.
+  const gb = $('#guardBanner');
+  if (gb && d.state !== 'cleanup-failed') gb.hidden = !(d.state === 'reconnect-failed' && d.guardHeld);
+  // the last connection's toasts not shown yet go with it ('connected' starts its own series)
+  if (d.state !== 'connected' && d.state !== 'cleanup-failed') cancelToastSeries();
   if (d.state === 'connected') {
     state.connected = true;
     state.connecting = false;
     state.activeServerId = d.serverId;
+    state.lastServerId = d.serverId;   // main's lastServerId moved with it
     state.lan = d.lan || null;
     // a fresh connect is built from the current settings — nothing is stale
     setPending(d.pendingReconnect || []);
     state.activeEngine = d.engine || '';
+    // what this connection did not do stays under the state while it is up (setConnUI paints it)
+    state.connIssues = connIssuesFrom(d);
     setConnUI('connected', d.serverId);
     // only say "reconnected" when we actually were recovering from a network change
     if (state.wasReconnecting) { toast(t('net.reconnected'), 'ok'); state.wasReconnecting = false; }
@@ -2011,16 +3061,19 @@ window.api.onStatus((d) => {
     renderServers();
     renderPicker();
     if (d.tunError) {
-      toast(d.tunError, 'err');
       updateAdminBtn(true);
     } else if (state.settings.tunMode && d.tun) {
       updateAdminBtn(false);
     }
-    if (d.geoWarn) toast(d.geoWarn, 'warn');
+    // proxy only / the leak guard, the geo files, main's notices about this PC — one after another
+    toastSeries(connectToasts(d));
     setTimeout(() => checkIp(3, true), 1200);
     // auto-measure TCP ping + real delay for the active config so the home
     // cards show real numbers (real delay = proof the config actually works)
-    setTimeout(() => quickPing(d.serverId), 700);
+    // — not on a router: a test core beside the live one on every connect
+    // (and every recovery) is memory a 512 MB box does not have (S6); the
+    // ⚡ button still measures on request
+    if (state.flavor !== 'openwrt') setTimeout(() => quickPing(d.serverId), 700);
   } else if (d.state === 'connecting') {
     state.connecting = true;
     setConnUI('connecting', d.serverId);
@@ -2033,6 +3086,8 @@ window.api.onStatus((d) => {
     state.wasReconnecting = false;   // no live tunnel left to recover
     state.lan = null;
     state.activeEngine = '';
+    state.connIssues = [];
+    state.noticesToasted = new Set();   // the next connection says its notices again
     setPending([]);          // nothing live to be out of sync with
     setConnUI('disconnected');
     $('#statIp').textContent = '—';
@@ -2052,22 +3107,31 @@ window.api.onStatus((d) => {
     state.wasReconnecting = true;
     state.reconnectReason = d.reason || '';
     setConnUI('connecting', d.serverId || state.activeServerId);
-    $('#connState').textContent = t(reconnectingKey());
+    // the router says which attempt this is, and keeps saying so through the
+    // backoff (S4); the desktop keeps its own wording
+    $('#connState').textContent = state.flavor === 'openwrt' && d.attempt ? attemptText('reconnecting', d.attempt) : t(reconnectingKey());
+  } else if (d.state === 'waiting') {
+    // the router's boot connect waiting for the WAN (B3): between its
+    // retries, and during one — never "error" until it comes up
+    state.connected = false;
+    state.connecting = true;
+    state.wasReconnecting = false;
+    setConnUI('connecting', d.serverId || state.activeServerId);
+    $('#connState').textContent = attemptText('waiting', d.attempt);
   } else if (d.state === 'reconnect-failed') {
     // every retry is spent — the user has to act
     state.connecting = false;
     state.wasReconnecting = false;
     // The guard was HELD across every attempt so the ISP never answered a
     // lookup, and it is still holding. Nothing leaks, but nothing resolves
-    // either — say so and offer the way out, or a leak has been traded for
-    // a mystery.
-    const gb = $('#guardBanner');
-    if (gb) gb.hidden = !d.guardHeld;
+    // either — say so and offer the way out (#guardBanner, shown above when
+    // d.guardHeld), or a leak has been traded for a mystery.
     if (d.proxyUp) {
       // The tunnel itself came back and only TUN did not: xray is running and the
       // proxy ports work, so the red error state would be wrong. Stay connected
       // and say what is actually missing.
       state.connected = true;
+      state.connIssues = [{ id: 'proxyOnly', reason: d.tunError || '—' }];
       setConnUI('connected', state.activeServerId);
       toast(t('net.tunFailed'), 'warn', 8000);
       if (d.tunError) appendLog('Reconnect gave up on TUN: ' + d.tunError, 'warn');
@@ -2085,6 +3149,7 @@ window.api.onStatus((d) => {
     state.connected = false;
     state.connecting = false;
     setConnUI('error');
+    showErrorReason(d.message);
     renderPendingBanner();
     renderServers();
     renderPicker();
@@ -2092,8 +3157,12 @@ window.api.onStatus((d) => {
 });
 
 window.api.onXrayStatus((d) => {
-  if (d.state === 'stopped' && state.connected) {
+  // `rebuilding`: the core died under a live connection and the service is
+  // about to rebuild it — its "reconnecting" follows at once; painting
+  // "disconnected" with a red toast here was the whole backoff's display (S4)
+  if (d.state === 'stopped' && state.connected && !d.rebuilding) {
     state.connected = false;
+    cancelToastSeries();
     setConnUI('disconnected');
     renderPendingBanner();
     renderServers();
@@ -2124,6 +3193,9 @@ function reportStoreError(d) {
   toast(d.recovered ? t('store.recovered') : t('store.lost'), 'err', 12000);
 }
 window.api.onStoreError(reportStoreError);
+// the headless server replays the connection as the first event of every
+// events (re)connect; the desktop bridge has no such channel (app:init is enough there)
+if (window.api.onConnSnapshot) window.api.onConnSnapshot(applyConnSnapshot);
 
 /* ----------------------------- kill switch ----------------------------- */
 window.api.onKillSwitch((d) => {
@@ -2131,6 +3203,13 @@ window.api.onKillSwitch((d) => {
   state.killEngaged = !!(d && d.engaged);
   const banner = $('#killBanner');
   if (banner) banner.hidden = !state.killEngaged;
+  // the router's switch carries its whole state (armed, blocking): the status
+  // line follows it, and the toast says what it blocks — the LAN
+  if (d && d.router) {
+    applyKillSwitchState(d);
+    if (state.killEngaged && !wasEngaged) toast(t('kill.routerBlocked'), 'err');
+    return;
+  }
   // on the way in only: a second drop under a switch already closed is not news
   if (state.killEngaged && !wasEngaged) toast(t('kill.blocked'), 'err');
 });
@@ -2164,13 +3243,19 @@ $('#guardRetry').onclick = async () => {
   $('#guardBanner').hidden = true;
   await doReconnect();
 };
-$('#guardRelease').onclick = async () => {
-  // Deliberate: puts the adapters' own resolvers back. From here on the machine
-  // resolves through its ISP again — which is why it takes an explicit click.
+/**
+ * The guard banner's "give my internet back". Deliberate: puts the adapters'
+ * own resolvers back, and from here on the machine resolves through its ISP
+ * again — which is why it takes an explicit click. Main refuses while a
+ * connection uses the guard (`refused`): said in the user's language.
+ */
+async function giveInternetBack() {
   const r = await window.api.releaseGuard();
   $('#guardBanner').hidden = true;
+  if (r && r.refused) return toast(t('guard.releaseRefused'), 'err');
   toast(r && r.ok === false ? (r.error || 'failed') : t('t.guardReleased'), r && r.ok === false ? 'err' : 'ok');
-};
+}
+$('#guardRelease').onclick = giveInternetBack;
 
 $('#killReconnect').onclick = async () => {
   const id = state.activeServerId || state.selectedServerId || (state.servers[0] && state.servers[0].id);
@@ -2230,7 +3315,8 @@ $('#btnClearLogs').onclick = () => { $('#logBox').innerHTML = ''; };
 function defaultUiMode() {
   const s = state.settings || {};
   const hasPro = (state.chains || []).length > 0 || (state.pool || []).length > 0 ||
-    (s.routeRules || []).length > 0 || !!s.advancedRouting;
+    (s.routeRules || []).length > 0 || !!s.advancedRouting ||
+    (state.profiles || []).some(p => (p.rules || []).length > 0);
   return hasPro ? 'advanced' : 'simple';
 }
 
@@ -2292,10 +3378,11 @@ $('#btnDownloadHelp').onclick = () => {
 };
 
 /* ----------------------------- required components ----------------------------- */
+// `pick`: the row offers the version picker (corePicker.js) beside its update button
 const COMPONENTS = [
-  { key: 'xray', label: 'comp.xray', ver: 'xray' },
-  { key: 'xray-pattn', label: 'comp.xrayPattn', ver: 'xray-pattn' },
-  { key: 'sing-box', label: 'comp.singbox', has: (a) => !!a['sing-box'] },
+  { key: 'xray', label: 'comp.xray', ver: 'xray', pick: true },
+  { key: 'xray-pattn', label: 'comp.xrayPattn', ver: 'xray-pattn', pick: true },
+  { key: 'sing-box', label: 'comp.singbox', ver: 'sing-box', pick: true, has: (a) => !!a['sing-box'] },
   { key: 'geo', label: 'comp.geo', has: (a) => a.geoip && a.geosite },
   { key: 'tun2socks', label: 'comp.tun2socksLegacy' },
   { key: 'wintun', label: 'comp.wintun', winOnly: true }
@@ -2306,23 +3393,32 @@ function renderComponents() {
   list.innerHTML = '';
   const a = state.assets || {};
   const isWin = (a.platform || 'win32') === 'win32';
+  const rt = state.flavor === 'openwrt';
 
   for (const c of COMPONENTS) {
     if (c.winOnly && !isWin) continue;
+    // a router's tunnel is sing-box's: tun2socks never runs there, wintun is Windows'
+    if (rt && (c.key === 'tun2socks' || c.key === 'wintun')) continue;
     const present = c.has ? c.has(a) : !!a[c.key];
     const v = c.ver && present ? state.coreVersions[c.ver] : '';
     const ver = v ? ` <span class="comp-ver">v${escapeHtml(v)}</span>` : '';
+    // sing-box on a router is the whole-network tunnel, not a TUN mode's backend
+    const label = rt && c.key === 'sing-box' ? 'comp.singboxRouter' : c.label;
+    // a core: «انتخاب نسخه» first, then the update button exactly as it was
+    const pick = c.pick ? `<button class="btn ghost comp-pick" type="button">${escapeHtml(t('cv.choose'))}</button>` : '';
     const row = document.createElement('div');
     row.className = 'comp-row';
     row.innerHTML = `
       <div class="comp-info">
         <span class="comp-dot ${present ? 'ok' : 'missing'}"></span>
-        <span class="comp-name">${escapeHtml(t(c.label))}${ver}</span>
+        <span class="comp-name">${escapeHtml(t(label))}${ver}</span>
         <span class="comp-state ${present ? 'ok' : 'missing'}">${present ? t('comp.installed') : t('comp.missing')}</span>
       </div>
-      <button class="btn ${present ? 'ghost' : 'primary'} comp-btn">${present ? t('btn.update') : t('btn.download')}</button>`;
+      <div class="comp-actions">${pick}<button class="btn ${present ? 'ghost' : 'primary'} comp-btn">${present ? t('btn.update') : t('btn.download')}</button></div>`;
     const btn = row.querySelector('.comp-btn');
     btn.onclick = () => downloadComponent(c.key, btn);
+    const pickBtn = row.querySelector('.comp-pick');
+    if (pickBtn) pickBtn.onclick = () => openCorePicker(c.key, pickBtn);
     list.appendChild(row);
   }
 
@@ -2335,7 +3431,27 @@ function renderComponents() {
   // sing-box OR tun2socks, plus wintun on Windows). Older mains do not send it —
   // then say nothing rather than guess from a single component.
   const tunNote = $('#compTunNote');
-  if (tunNote) tunNote.hidden = typeof a.tunReady !== 'boolean' || a.tunReady;
+  if (!tunNote) return;
+  if (rt) {
+    // The router's own reading: tunReady also counts tun2socks, which cannot
+    // carry the gateway — the tunnel's availability is the service's to say.
+    const key = routerTunMissingKey();
+    tunNote.setAttribute('data-i18n', key);
+    tunNote.textContent = t(key);
+    tunNote.hidden = !!state.tunAvailable;
+  } else {
+    tunNote.hidden = typeof a.tunReady !== 'boolean' || a.tunReady;
+  }
+}
+
+/**
+ * Why the router's whole-network tunnel is unavailable, as a string key. It
+ * needs sing-box AND nft (TunOpenwrt.isAvailable): with sing-box there, the
+ * missing half is nft — "download sing-box" would fix nothing (and
+ * missingEssentials does not ask for it then).
+ */
+function routerTunMissingKey() {
+  return (state.assets || {})['sing-box'] ? 'tun.routerNoNft' : 'tun.routerUnavailable';
 }
 
 async function downloadComponent(key, btn) {
@@ -2352,13 +3468,44 @@ async function downloadComponent(key, btn) {
     renderComponents();
     updateXrayStatus(res.xrayReady);
     updateTunStatus();
-    if (key === 'xray' || key === 'xray-pattn') refreshXrayVersion();
+    if (CORE_KEYS.includes(key)) refreshXrayVersion();
     toast(t('t.downloaded'), 'ok');
   } else {
     state.assets = res.assets || state.assets;
     renderComponents();
-    toast(t('t.downloadFailed') + ': ' + (res.error || ''), 'err');
+    // a version install (corePicker.js) holds this core right now: said, not an error
+    if (res.coreBusy) toast(t('comp.coreBusy'), 'warn');
+    else toast(t('t.downloadFailed') + ': ' + (res.error || ''), 'err');
   }
+}
+
+/**
+ * Settings → Required files → «انتخاب نسخه»: the version picker (corePicker.js)
+ * for one core. Busy is this window's own reading of the connection (the
+ * service refuses on its own as well); after an install the rows, the core
+ * status and the versions are read again, as after a download.
+ */
+function openCorePicker(key, opener) {
+  if (!window.corePicker) return;
+  window.corePicker.open(key, {
+    opener,
+    busy: () => !!(state.connected || state.connecting),
+    toast,
+    onInstalled: async (res) => {
+      let r = res || {};
+      // an install whose answer was lost (the picker asked the service how it
+      // ended) carries no assets: read them, and keep what is not said
+      if (!r.assets && window.api.assetsStatus) {
+        try { r = Object.assign({}, r, { assets: await window.api.assetsStatus() }); } catch { /* the rows keep what they had */ }
+      }
+      if (r.assets) state.assets = r.assets;
+      if (typeof r.tunAvailable === 'boolean') state.tunAvailable = r.tunAvailable;
+      renderComponents();
+      updateXrayStatus(typeof r.xrayReady === 'boolean' ? r.xrayReady : anyXrayCore());
+      updateTunStatus();
+      refreshXrayVersion();
+    }
+  });
 }
 
 window.api.onAssetProgress((d) => {
@@ -2368,6 +3515,8 @@ window.api.onAssetProgress((d) => {
     if (st) st.textContent = t('about.downloading') + ' ' + Math.round(Number(d.pct) || 0) + '%';
     return;
   }
+  // a version the picker is installing: its card shows the progress, no toast on top
+  if (window.corePicker && window.corePicker.progress(d)) return;
   // surface coarse progress through the toast + the files modal if open
   toast(`${t('t.downloading')} ${d.component}: ${d.pct}%`);
   const fp = $('#filesProgress');
@@ -2485,24 +3634,38 @@ function missingEssentials() {
   const list = [];
   if (!anyXrayCore()) list.push('xray');
   if (!(a.geoip && a.geosite)) list.push('geo');
-  // on a router sing-box is the backend and tun2socks never runs
-  if (want && !a.tun2socks && state.flavor !== 'openwrt') list.push('tun2socks');
-  if (want && isWin && !a.wintun) list.push('wintun');
+  // On a router sing-box is the backend and tun2socks never runs — and sing-box
+  // is not optional there: without it the whole-network tunnel cannot start, and
+  // the package does not depend on it (a freshly flashed router meets it first
+  // as a failed connect). Only when it is the missing piece: with sing-box
+  // present and the tunnel still unavailable, downloading it again fixes nothing.
+  if (state.flavor === 'openwrt') {
+    if (!state.tunAvailable && !a['sing-box']) list.push('sing-box');
+  } else {
+    if (want && !a.tun2socks) list.push('tun2socks');
+    if (want && isWin && !a.wintun) list.push('wintun');
+  }
   return list;
 }
 
 function maybePromptMissingFiles() {
   const missing = missingEssentials();
   // Only auto-prompt when the core (xray) is missing — geo/tun are optional and
-  // already surfaced in Settings → Required files.
-  if (!missing.includes('xray')) return;
+  // already surfaced in Settings → Required files. On a router sing-box is not
+  // optional (it IS the gateway), so it prompts too.
+  if (!missing.includes('xray') && !missing.includes('sing-box')) return;
   openFilesModal(missing);
 }
 
 const COMP_LABEL = {
-  xray: 'comp.xray', 'xray-pattn': 'comp.xrayPattn',
+  xray: 'comp.xray', 'xray-pattn': 'comp.xrayPattn', 'sing-box': 'comp.singbox',
   geo: 'comp.geo', tun2socks: 'comp.tun2socks', wintun: 'comp.wintun'
 };
+/** The prompt's name for a component: on a router sing-box is the whole-network tunnel. */
+function compLabel(key) {
+  if (key === 'sing-box' && state.flavor === 'openwrt') return 'comp.singboxRouter';
+  return COMP_LABEL[key] || key;
+}
 
 function openFilesModal(missing) {
   const listEl = $('#filesList');
@@ -2510,7 +3673,7 @@ function openFilesModal(missing) {
   for (const key of missing) {
     const row = document.createElement('div');
     row.className = 'files-row';
-    row.innerHTML = `<span class="files-dot missing"></span><span class="files-name">${escapeHtml(t(COMP_LABEL[key] || key))}</span>`;
+    row.innerHTML = `<span class="files-dot missing"></span><span class="files-name">${escapeHtml(t(compLabel(key)))}</span>`;
     listEl.appendChild(row);
   }
   $('#filesProgress').textContent = '';
@@ -2527,7 +3690,7 @@ $('#filesDownload').onclick = async () => {
   const btn = $('#filesDownload');
   btn.disabled = true;
   for (const key of missing) {
-    $('#filesProgress').textContent = `${t('t.downloading')} ${t(COMP_LABEL[key] || key)}…`;
+    $('#filesProgress').textContent = `${t('t.downloading')} ${t(compLabel(key))}…`;
     const res = await window.api.downloadAsset(key);
     if (res && res.ok) {
       state.assets = res.assets || state.assets;
@@ -2583,6 +3746,15 @@ function updateTunStatus() {
   updateGuardRows();
   const el = $('#tunStatus');
   if (!el) return;
+  if (state.flavor === 'openwrt') {
+    // The router has no TUN switch and no admin question: the whole-network
+    // tunnel is ready, or sing-box (else nft) is missing — the line says which,
+    // and where to get it.
+    el.textContent = t(state.tunAvailable ? 'tun.routerReady' : routerTunMissingKey());
+    el.className = 'tun-status ' + (state.tunAvailable ? 'ok' : 'warn');
+    updateAdminBtn(false);
+    return;
+  }
   if (!state.tunAvailable) {
     el.textContent = t('tun.unavailable');
     el.className = 'tun-status warn';
@@ -2708,6 +3880,8 @@ window.api.onSubsUpdated((d) => {
   state.subscriptions = d.subs;
   state.servers = d.servers;
   renderSubs(); renderServers(); renderPicker(); renderChains(); renderPool();
+  // a refresh that dropped a server a routing profile uses: its rule and its tree say so
+  if (Array.isArray(state.profiles)) renderAdvanced();
 });
 
 /* ----------------------------- edit server modal ----------------------------- */
@@ -2728,7 +3902,8 @@ function readServerFields(s) {
     cipherSuites: (st.tlsSettings && st.tlsSettings.cipherSuites) || '',
     finalMask: st.finalmask ? JSON.stringify(st.finalmask) : '',
     engine: s.engine || 'xray',
-    certPin: s.certPin || ''
+    certPin: s.certPin || '',
+    ech: '', pcs: '', vcn: '', pqv: '', hy2Obfs: '', hy2Ports: ''
   };
 
   if (s.protocol === 'vless' || s.protocol === 'vmess') {
@@ -2740,6 +3915,13 @@ function readServerFields(s) {
   } else if (s.protocol === 'shadowsocks') {
     const srv = ob.settings && ob.settings.servers && ob.settings.servers[0];
     if (srv) { f.cred = srv.password || ''; f.method = srv.method || ''; }
+  } else if (s.protocol === 'hysteria2') {
+    f.cred = (st.hysteriaSettings && st.hysteriaSettings.auth) || '';
+    const masks = (st.finalmask && Array.isArray(st.finalmask.udp)) ? st.finalmask.udp : [];
+    const sal = masks.find(m => m && m.type === 'salamander');
+    const hop = masks.find(m => m && m.type === 'udphop');
+    f.hy2Obfs = (sal && sal.settings && sal.settings.password) || '';
+    f.hy2Ports = hop && hop.settings ? String(hop.settings.remotePorts || '') : '';
   } else if (s.protocol === 'socks' || s.protocol === 'http') {
     const srv = ob.settings && ob.settings.servers && ob.settings.servers[0];
     const u = srv && srv.users && srv.users[0];
@@ -2756,11 +3938,21 @@ function readServerFields(s) {
     f.wgAllowed = (peer && peer.allowedIPs || []).join(', ');
     // One field, as wg-quick writes it: resolvers first, then search domains.
     f.wgDns = [...(Array.isArray(s.dns) ? s.dns : []), ...(Array.isArray(s.dnsDomains) ? s.dnsDomains : [])].join(', ');
+  } else if (s.protocol === 'masque') {
+    // its HTTP version (the core's rule on the ALPN), a Basic user and password,
+    // or a WARP account — which the Simple view only summarises
+    const ms = st.masqueSettings || {};
+    const w = ms.warp && typeof ms.warp === 'object' ? ms.warp : null;
+    f.masqueHttp = sfTable().masqueHttpOf(st.tlsSettings);
+    f.masqueUser = ms.user || '';
+    f.masquePass = ms.pass || '';
+    f.warpAddress = w ? [].concat(w.address || []).join(', ') : '';
+    f.warp = !!w;
   }
 
   // transport details
   if (st.wsSettings) { f.path = st.wsSettings.path || ''; f.host = (st.wsSettings.headers && st.wsSettings.headers.Host) || ''; }
-  else if (st.grpcSettings) { f.path = st.grpcSettings.serviceName || ''; }
+  else if (st.grpcSettings) { f.path = st.grpcSettings.serviceName || ''; f.host = st.grpcSettings.authority || ''; }
   else if (st.httpSettings) { f.path = st.httpSettings.path || ''; f.host = (st.httpSettings.host || []).join(','); }
   else if (st.xhttpSettings) { f.path = st.xhttpSettings.path || ''; f.host = st.xhttpSettings.host || ''; }
   else if (st.httpupgradeSettings) { f.path = st.httpupgradeSettings.path || ''; f.host = st.httpupgradeSettings.host || ''; }
@@ -2775,11 +3967,15 @@ function readServerFields(s) {
     f.fp = st.tlsSettings.fingerprint || '';
     f.alpn = (st.tlsSettings.alpn || []).join(',');
     if (!f.host && st.tlsSettings.serverName) f.host = '';
+    f.ech = st.tlsSettings.echConfigList || '';
+    f.pcs = st.tlsSettings.pinnedPeerCertSha256 || '';
+    f.vcn = st.tlsSettings.verifyPeerCertByName || '';
   } else if (st.realitySettings) {
     f.sni = st.realitySettings.serverName || '';
     f.fp = st.realitySettings.fingerprint || '';
     f.pbk = st.realitySettings.publicKey || '';
     f.sid = st.realitySettings.shortId || '';
+    f.pqv = st.realitySettings.mldsa65Verify || '';
   }
   return f;
 }
@@ -2810,10 +4006,11 @@ function readNoiseField() {
   return v; // preset keyword, expanded at build time
 }
 
-// Show the custom spec input only when the dropdown is set to Custom.
+// Show the custom spec input only when the dropdown is set to Custom (and shown: MASQUE over HTTP/2 takes no noise).
 function syncNoiseCustom() {
   const sel = $('#edNoise'); if (!sel) return;
-  show('#edNoiseCustomRow', sel.value === 'custom');
+  const wrap = $('#edNoiseWrap');
+  show('#edNoiseCustomRow', sel.value === 'custom' && !(wrap && wrap.hidden));
 }
 
 /* --------------------- copy / QR share link (carries ALL settings) --------------------- */
@@ -2829,12 +4026,41 @@ async function copyText(text) {
   try { await navigator.clipboard.writeText(text); }
   catch { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
 }
+/**
+ * A JSON server's QR carries its config as minified JSON — when it is small
+ * enough to scan. 1,700 bytes is about version 30 at level L (137 modules):
+ * the 320px box (.qr-image, less its padding and the quiet zone) then keeps
+ * 2 px per module, which a phone camera can still resolve; the largest code
+ * (2,953 bytes, 177 modules) gets 1.6 px and does not scan. Above the limit
+ * nothing is drawn, and the dialog says so.
+ */
+const QR_JSON_MAX_BYTES = 1700;
+
+/**
+ * The text a QR encodes for a JSON server: the config minified, with every
+ * non-ASCII character written as a \uXXXX escape. The QR library keeps one
+ * byte per character (the low 8 bits), so a Persian remark or an emoji would
+ * come out scrambled; the escape is plain ASCII that any scanner reads, and
+ * JSON.parse gives the same config back. ASCII only, so its length is its
+ * size in bytes.
+ */
+function qrJsonText(pretty) {
+  let min = pretty;
+  try { min = JSON.stringify(JSON.parse(pretty)); } catch {}
+  return min.replace(/[\u0080-\uffff]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+}
+
 async function showServerQr(id) {
   const link = await window.api.serverLink(id);
   if (!link) return toast('—', 'err');
+  const srv = (state.servers || []).find(x => x.id === id);
+  // a MASQUE server's link IS its JSON (parser.buildShareLink): the same ASCII-only text and size limit
+  const isJson = !!srv && (srv.source === 'json' || srv.protocol === 'masque');
+  const text = isJson ? qrJsonText(link) : link;
   const box = $('#qrImage'); box.innerHTML = '';
   try {
-    const qr = qrcode(0, 'L'); qr.addData(link); qr.make();
+    if (isJson && text.length > QR_JSON_MAX_BYTES) throw new Error('too large for a QR');
+    const qr = qrcode(0, 'L'); qr.addData(text); qr.make();
     // A scalable SVG, not createImgTag's fixed-size GIF: a long link (an xhttp
     // `extra` object, a WireGuard peer) makes a 350px+ bitmap that overflowed the
     // modal and could not shrink. The SVG takes whatever width the box gives it
@@ -2842,20 +4068,175 @@ async function showServerQr(id) {
     // for; 6px was 1.5 modules, which scanners refuse.
     box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 16, scalable: true });
   } catch (e) {
-    box.innerHTML = '<p class="hint" style="padding:24px 8px">' + (t('qr.tooBig') || 'Link too long for a QR — use Copy.') + '</p>';
+    box.innerHTML = '<p class="hint" style="padding:24px 8px">' + (t(isJson ? 'qr.tooLarge' : 'qr.tooBig') || 'Link too long for a QR — use Copy.') + '</p>';
   }
-  $('#qrLink').value = link;
+  // too large to draw: the readable (pretty) JSON stays in the box to copy
+  $('#qrLink').value = isJson && text.length > QR_JSON_MAX_BYTES ? link : text;
+  $('#qrCopy').textContent = t(isJson ? 'ed.jsonCopy' : 'qr.copy');
   $('#qrModal').hidden = false;
 }
 if ($('#qrClose')) $('#qrClose').onclick = () => { $('#qrModal').hidden = true; };
 if ($('#qrModal')) $('#qrModal').onclick = (e) => { if (e.target === $('#qrModal')) $('#qrModal').hidden = true; };
 if ($('#qrCopy')) $('#qrCopy').onclick = () => { copyText($('#qrLink').value); toast(t('t.copied') || 'Copied ✓', 'ok'); };
 
+/* ---------- a JSON server's edit form: the config itself, no link fields ---------- */
+let editJsonMode = 'full';   // the Full / Raw switch of the open JSON form
+
+/** Show the JSON form or the link form in the edit modal (never both). */
+function setEditKind(isJson) {
+  show('#edJsonWrap', isJson);
+  show('#edLinkFields', !isJson);
+  show('#edAddrWrap', !isJson);       // the name stays, alone in its row
+  $('#edNameRow').classList.toggle('single', isJson);
+}
+
+/** The reason a save was refused, under the editor; null clears it. */
+function showJsonError(reason) {
+  const el = $('#edJsonError');
+  if (!el) return;
+  const text = reason === null || reason === undefined ? '' : (t('ed.jsonInvalid') + (reason ? ': ' + reason : ''));
+  el.textContent = text;
+  el.hidden = !text;
+  if (text) {
+    toast(text, 'err');
+    if (el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+/**
+ * One of jsonInfo's rules, in words: "<match> → <to>". The core writes neutral
+ * tokens — match `*` for the rule that catches everything left over (else its
+ * conditions joined with " + "), to `balancer:<tag>` for a balancer and empty
+ * for none. The other condition words are the config's own and stay as written.
+ */
+function jsonRuleText(r) {
+  const m = r && r.match != null ? String(r.match) : '';
+  const to = r && r.to != null ? String(r.to) : '';
+  const match = m === '*' ? t('ed.jsonNaAll') : (m || '?');
+  const target = !to ? '—' : to.startsWith('balancer:') ? t('ed.jsonNaBalancer').replace('{tag}', () => to.slice(9)) : to;
+  return match + ' → ' + target;
+}
+
+/**
+ * What full mode leaves unused, from the record's jsonInfo: the config's own
+ * routing rules (each "match → to"), and a line each for its DNS, balancers and
+ * observatory. Shown in full mode only — raw runs all of it. Values are the
+ * config's own text, so they go in as text nodes, never as markup.
+ */
+function renderJsonInfo(info, mode) {
+  const box = $('#edJsonInfo');
+  if (!box) return;
+  box.innerHTML = '';
+  const i = info || {};
+  const rules = Array.isArray(i.rules) ? i.rules : [];
+  const list = document.createElement('ul');
+  list.className = 'ed-json-list';
+  const item = (text) => {
+    const li = document.createElement('li');
+    li.textContent = text;
+    list.appendChild(li);
+    return li;
+  };
+  if (rules.length) {
+    const li = item(t('ed.jsonNaRules').replace('{n}', () => String(rules.length)));
+    const sub = document.createElement('ul');
+    sub.className = 'ed-json-rules';
+    for (const r of rules) {
+      const row = document.createElement('li');
+      const text = document.createElement('bdi');
+      text.dir = 'ltr';
+      text.textContent = jsonRuleText(r);
+      row.appendChild(text);
+      sub.appendChild(row);
+    }
+    li.appendChild(sub);
+  }
+  if (i.dns) item(t('ed.jsonNaDns'));
+  if (i.balancers) item(t('ed.jsonNaBalancers'));
+  if (i.observatory) item(t('ed.jsonNaObservatory'));
+  if (list.children.length) {
+    const head = document.createElement('div');
+    head.className = 'field-label';
+    head.textContent = t('ed.jsonNotApplied');
+    box.appendChild(head);
+    box.appendChild(list);
+  }
+  box.hidden = mode !== 'full' || !list.children.length;
+}
+
+/** Full / Raw: the switch, its one line, and the not-applied summary that only full has. */
+function setJsonMode(mode) {
+  editJsonMode = mode === 'raw' ? 'raw' : 'full';
+  $$('#edJsonMode .seg-btn').forEach((b) => {
+    const on = b.dataset.jsonMode === editJsonMode;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', String(on));
+  });
+  $('#edJsonHelp').textContent = t(editJsonMode === 'raw' ? 'ed.jsonRawHelp' : 'ed.jsonFullHelp');
+  // the router's web UI keeps the Raw option, but the router always runs the full form
+  const note = $('#edJsonRouterNote');
+  const onRouter = state.flavor === 'openwrt';
+  note.textContent = onRouter ? t('ed.jsonRawRouter') : '';
+  note.hidden = !(onRouter && editJsonMode === 'raw');
+  renderJsonInfo(editOriginal && editOriginal.jsonInfo, editJsonMode);
+}
+
+/** The language changed with a JSON edit form open: say its help line and summary again. */
+function refreshJsonFormLang() {
+  if (editDraft && $('#editModal') && !$('#editModal').hidden) {
+    if (editView === 'pro') renderEditPro(); else { renderSimpleExtras(); renderMasqueSimple(); fillMoreInPro(); if (editDraft.protocol === 'masque') updateSpoofLabels(); }
+    $('#edFootNote').textContent = editView === 'pro' ? t('edit.localNote') : '';
+    if (editNew) $('#edTitle').textContent = t('edit.newTitle');
+  }
+  // editingId first: setLang also runs at start-up, before the edit state below exists
+  if (!state.editingId || !editOriginal || editOriginal.source !== 'json') return;
+  setJsonMode(editJsonMode);
+}
+
+function openEditJson(s) {
+  $('#edName').value = s.name || '';
+  $('#edJson').value = JSON.stringify(s.json || {}, null, 2);
+  showJsonError(null);
+  setJsonMode(s.jsonMode);
+  $('#editModal').hidden = false;
+  $('#edJson').scrollTop = 0;
+}
+
+/** { name, jsonMode, json } for a save — or null, with the reason on screen, when the text is not a JSON object. */
+function collectJsonFields() {
+  let json;
+  try { json = JSON.parse($('#edJson').value); }
+  catch (e) { showJsonError(e && e.message ? e.message : String(e)); return null; }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) { showJsonError(t('ed.jsonNotObject')); return null; }
+  showJsonError(null);
+  return { name: $('#edName').value, jsonMode: editJsonMode, json };
+}
+
+$$('#edJsonMode .seg-btn').forEach((b) => { b.onclick = () => setJsonMode(b.dataset.jsonMode); });
+/** Copy JSON: what is in the editor (edits included), pretty as shown. */
+async function copyEditJson() {
+  await copyText($('#edJson').value);
+  toast(t('t.copied') || 'Copied ✓', 'ok');
+}
+if ($('#edJsonCopy')) $('#edJsonCopy').onclick = copyEditJson;
+
 function openEdit(id) {
   const s = state.servers.find(x => x.id === id);
   if (!s) return;
   state.editingId = id;
   editOriginal = s;
+  setEditKind(s.source === 'json');
+  editNew = false;
+  editBad = null;
+  $('#edTitle').textContent = t('edit.title');
+  if (s.source === 'json') {
+    // a JSON server is its config: one form, no Simple or Pro
+    editDraft = null;
+    show('#edView', false); show('#edPro', false); show('#edSimple', true); show('#edMoreInPro', false);
+    $('#edHeadProto').textContent = '';
+    $('#edFootNote').textContent = '';
+    return openEditJson(s);
+  }
   const f = readServerFields(s);
   const proto = s.protocol;
   fillEditForm(f, proto);
@@ -2869,6 +4250,7 @@ function openEdit(id) {
   // credential label per protocol
   const credLabel = $('#edCredLabel');
   const isStd = (proto === 'vless' || proto === 'vmess' || proto === 'trojan');
+  const isHy2 = proto === 'hysteria2';
   credLabel.textContent = proto === 'wireguard' ? t('wg.privateKey')
     : (proto === 'vless' || proto === 'vmess') ? t('edit.uuid')
     : t('edit.password');
@@ -2881,19 +4263,40 @@ function openEdit(id) {
   const isWg = proto === 'wireguard';
   const isSs = proto === 'shadowsocks';
   const isProxy = proto === 'socks' || proto === 'http';
+  const isMasque = proto === 'masque';
   show('#edTransportRow', isStd);
-  show('#edTlsRow', isStd);
+  show('#edTlsRow', isStd || isHy2 || isMasque);
   show('#edPathRow', isStd);
   show('#edPattWrap', isStd);
-  show('#edInsecureRow', isStd);
-  show('#edInsecureHint', isStd);
-  show('#edCertPinRow', isStd && !!f.certPin);
+  show('#edInsecureRow', isStd || isHy2);
+  show('#edInsecureHint', isStd || isHy2);
+  // Hysteria2 is QUIC: no first-use pin — what the switch does there is its own
+  $('#edInsecureHint').textContent = t(isHy2 ? 'edit.insecureHintHy2' : 'edit.insecureHint');
+  show('#edCertPinRow', (isStd || isHy2) && !!f.certPin);
+  show('#edHy2Row', isHy2);
   show('#edWgExtra', isWg);
   show('#edProxyRow', isProxy);
-  // socks/http carry no single "credential" field — user/pass live in edProxyRow
-  show('#edCredWrap', !isProxy);
+  // socks/http carry no single "credential" field — user/pass live in edProxyRow;
+  // MASQUE's (a user and password, or a WARP account) are its own block
+  show('#edCredWrap', !isProxy && !isMasque);
+  show('#edMasqueRow', isMasque);
+  show('#edMasqueAuth', isMasque);
+  // MASQUE runs on Xray or Xray-PattN — sing-box has no MASQUE (the parser never stores it)
+  const singbox = $('#edEngine') && $('#edEngine').querySelector('option[value="sing-box"]');
+  if (singbox) { singbox.hidden = isMasque; singbox.disabled = isMasque; }
+  show('#edEngineHint', !isMasque);
+  show('#edEngineHintMasque', isMasque);
   $('#edRealityRow').hidden = !(isStd && $('#edSecurity').value === 'reality');
   updateSpoofLabels();
+
+  // one draft for both views, opened in the view used last
+  editDraft = draftOf(s);
+  editView = savedEditView();
+  editTab = 'protocol';
+  show('#edView', true);
+  show('#edMoreInPro', true);
+  $('#edHeadProto').textContent = PROTO_NAMES[proto] || proto;
+  showEditView();
 
   $('#editModal').hidden = false;
 }
@@ -2923,6 +4326,12 @@ function fillEditForm(f, proto) {
   if ($('#edFinalMask')) $('#edFinalMask').value = f.finalMask || '';
   if ($('#edEngine')) selectValue($('#edEngine'), f.engine || 'xray');
   $('#edInsecure').checked = !!f.allowInsecure;
+  $('#edEch').value = f.ech || '';
+  $('#edPcs').value = f.pcs || '';
+  $('#edVcn').value = f.vcn || '';
+  $('#edPqv').value = f.pqv || '';
+  $('#edHy2Obfs').value = f.hy2Obfs || '';
+  $('#edHy2Ports').value = f.hy2Ports || '';
 
   if (proto === 'socks' || proto === 'http') {
     $('#edProxyUser').value = f.pxUser || '';
@@ -2938,6 +4347,36 @@ function fillEditForm(f, proto) {
     $('#edWgAllowed').value = f.wgAllowed || '';
     $('#edWgDns').value = f.wgDns || '';
   }
+
+  if (proto === 'masque') {
+    $('#edMasqueUser').value = f.masqueUser || '';
+    $('#edMasquePass').value = f.masquePass || '';
+    setMasqueHttpForm(f.masqueHttp);
+  } else {
+    // every other protocol takes both anti-DPI fields
+    show('#edFragmentWrap', true);
+    show('#edNoiseWrap', true);
+    syncNoiseCustom();
+  }
+}
+
+/**
+ * The Simple form's MASQUE HTTP version: its two cards, and the one anti-DPI
+ * field that version takes — a fragment cuts TCP (HTTP/2), noise goes before
+ * UDP (HTTP/3); the parser drops the other (checkMasque).
+ */
+function setMasqueHttpForm(v) {
+  const http = v === 'h2' ? 'h2' : 'h3';
+  const box = $('#edMasqueHttp');
+  box.dataset.value = http;
+  for (const b of box.querySelectorAll('[data-masque-http]')) {
+    const on = b.dataset.masqueHttp === http;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+  }
+  show('#edFragmentWrap', http === 'h2');
+  show('#edNoiseWrap', http === 'h3');
+  syncNoiseCustom();
 }
 
 /**
@@ -2970,12 +4409,30 @@ function show(sel, on) { const el = $(sel); if (el) el.hidden = !on; }
  *  - none → no TLS SNI at all (section hidden)
  */
 function updateSpoofLabels() {
+  // MASQUE is always TLS, with no transport to front: its SNI alone, one wide
+  // field — the pin, ECH and the rest of TLS are in the Pro view
+  const isMasque = !!editOriginal && editOriginal.protocol === 'masque';
+  $('#edTlsRow').classList.toggle('single', isMasque);
+  if (isMasque) {
+    show('#edSpoofHead', false); show('#edTlsRow', true); show('#edTlsExtra', false); show('#edPqvRow', false);
+    show('#edHideSniRow', false); show('#edSpoofHint', false);
+    updateHideSniNote();
+    $('#edSniLabel').textContent = t('sf.sni');
+    const hostWrap = $('#edHostWrap'); if (hostWrap) hostWrap.style.display = 'none';
+    return;
+  }
   const isStd = editOriginal && ['vless', 'vmess', 'trojan'].includes(editOriginal.protocol);
-  const sec = $('#edSecurity').value || 'none';
-  const net = $('#edNetwork').value || 'tcp';
-  const on = isStd && (sec === 'tls' || sec === 'reality');
+  // Hysteria2 is always TLS (over QUIC), with no transport of its own to pick
+  const isHy2 = !!editOriginal && editOriginal.protocol === 'hysteria2';
+  const sec = isHy2 ? 'tls' : ($('#edSecurity').value || 'none');
+  const net = isHy2 ? 'hysteria' : ($('#edNetwork').value || 'tcp');
+  const on = (isStd || isHy2) && (sec === 'tls' || sec === 'reality');
   show('#edSpoofHead', on); show('#edTlsRow', on);
-  show('#edHideSniRow', on);
+  show('#edTlsExtra', on && sec === 'tls');
+  show('#edPqvRow', isStd && sec === 'reality');
+  // the TLS fragment splits a TCP ClientHello: nothing to split in QUIC
+  show('#edHideSniRow', on && !isHy2);
+  updateHideSniNote();   // follows the switch row, shown or not
   const hintEl = $('#edSpoofHint'); if (hintEl) hintEl.hidden = !on;
   if (!on) return;
 
@@ -2997,6 +4454,18 @@ function updateSpoofLabels() {
   $('#edHideSni').checked = !!($('#edFragment').value || '').trim();
 }
 
+/**
+ * A server that already fragments its ClientHello with finalmask (the
+ * patterniha subscriptions) gets a second, generic fragmenter in front of it
+ * when Hide SNI is turned on — say so under the switch, while the form's
+ * finalmask is non-empty and the switch is showing.
+ */
+function updateHideSniNote() {
+  const row = $('#edHideSniRow');
+  const fm = $('#edFinalMask');
+  show('#edHideSniFmNote', !!(row && !row.hidden && fm && (fm.value || '').trim()));
+}
+
 // The default SNI-hiding fragment (patterniha-style: fragment the ClientHello
 // so DPI can't read the SNI). Editable later in Advanced → Fragment.
 const HIDE_SNI_FRAGMENT = 'tlshello,100-200,10-20';
@@ -3007,6 +4476,7 @@ $('#edSecurity').onchange = () => {
   updateSpoofLabels();
 };
 $('#edNetwork').onchange = () => updateSpoofLabels();
+if ($('#edFinalMask')) $('#edFinalMask').oninput = updateHideSniNote;
 // Hide-SNI toggle drives the (advanced) Fragment field with a sensible default.
 if ($('#edHideSni')) $('#edHideSni').onchange = () => {
   const frag = $('#edFragment');
@@ -3014,14 +4484,21 @@ if ($('#edHideSni')) $('#edHideSni').onchange = () => {
   else frag.value = '';
 };
 
-function closeEdit() { $('#editModal').hidden = true; state.editingId = null; editOriginal = null; editClearPin = false; }
+function closeEdit() {
+  $('#editModal').hidden = true;
+  state.editingId = null; editOriginal = null; editClearPin = false;
+  editNew = false; editDraft = null; editBad = null;
+}
 
 // The pin goes when the form is saved; until then the row just disappears.
 $('#edCertPinClear').onclick = () => { editClearPin = true; show('#edCertPinRow', false); };
+for (const b of document.querySelectorAll('#edView [data-edit-view]')) b.onclick = () => setEditView(b.dataset.editView);
+if ($('#btnManualOpen')) $('#btnManualOpen').onclick = openNewServer;
 $('#editClose').onclick = closeEdit;
 $('#editCancel').onclick = closeEdit;
 $('#editModal').onclick = (e) => { if (e.target === $('#editModal')) closeEdit(); };
 if ($('#edNoise')) $('#edNoise').onchange = syncNoiseCustom;
+for (const b of document.querySelectorAll('#edMasqueHttp [data-masque-http]')) b.onclick = () => setMasqueHttpForm(b.dataset.masqueHttp);
 
 /**
  * What a save sends: every field of the form, read back from the inputs that
@@ -3039,7 +4516,7 @@ function collectEditFields(orig, clearPin) {
   };
   const cred = $('#edCred').value.trim();
   if (proto === 'vless' || proto === 'vmess') { if (cred) fields.uuid = cred; }
-  else if (proto === 'trojan' || proto === 'shadowsocks') { if (cred) fields.password = cred; }
+  else if (proto === 'trojan' || proto === 'shadowsocks' || proto === 'hysteria2') { if (cred) fields.password = cred; }
   else if (proto === 'wireguard') { if (cred) fields.privateKey = cred; }
 
   if (['vless', 'vmess', 'trojan'].includes(proto)) {
@@ -3060,6 +4537,20 @@ function collectEditFields(orig, clearPin) {
     // preserve alpn from original (no field for it)
     const shown = readServerFields(orig);
     if (shown.alpn) fields.alpn = shown.alpn;
+    // newer TLS / REALITY knobs ('' clears them)
+    fields.ech = $('#edEch').value.trim();
+    fields.pcs = $('#edPcs').value.trim();
+    fields.vcn = $('#edVcn').value.trim();
+    fields.pqv = $('#edPqv').value.trim();
+  } else if (proto === 'hysteria2') {
+    fields.sni = $('#edSni').value.trim();
+    fields.allowInsecure = $('#edInsecure').checked;
+    if (clearPin) fields.clearCertPin = true;
+    fields.ech = $('#edEch').value.trim();
+    fields.pcs = $('#edPcs').value.trim();
+    fields.vcn = $('#edVcn').value.trim();
+    fields.obfsPassword = $('#edHy2Obfs').value.trim();
+    fields.mport = $('#edHy2Ports').value.trim();
   } else if (proto === 'wireguard') {
     fields.publicKey = $('#edWgPub').value.trim();
     // `address` above is the ENDPOINT host (#edAddress); the interface address
@@ -3074,39 +4565,904 @@ function collectEditFields(orig, clearPin) {
   } else if (proto === 'socks' || proto === 'http') {
     fields.username = $('#edProxyUser').value.trim();
     fields.password = $('#edProxyPass').value.trim();
+  } else if (proto === 'masque') {
+    fields.sni = $('#edSni').value.trim();
+    const http = $('#edMasqueHttp').dataset.value;
+    if (http) fields.masqueHttp = http;
+    // a WARP account takes no user and password: the form shows neither for one
+    if (!$('#edMasqueCred').hidden) {
+      fields.masqueUser = $('#edMasqueUser').value.trim();
+      fields.masquePass = $('#edMasquePass').value.trim();
+    }
   }
 
   return fields;
 }
 
-$('#editSave').onclick = async () => {
+/**
+ * Is server `id` part of the connection that is up right now — the server
+ * itself, a member of the live chain, or a target of the live pool or advanced
+ * plan (resolved the way the main process builds them)? A save only writes the
+ * store: the running tunnel keeps the record it was built from until a
+ * reconnect, so an edit of a live server is not live yet.
+ */
+function serverInLivePlan(id) {
+  const live = state.activeServerId;
+  if (!id || !live || !state.connected) return false;
+  if (live === id) return true;
+  const chainHas = (cid) => {
+    const c = (state.chains || []).find(x => x.id === cid);
+    return !!(c && (c.members || []).includes(id));
+  };
+  const targetHas = (tg) => tg === id
+    || (tg === 'chain' && (state.chain || []).includes(id))
+    || (String(tg).startsWith('chain:') && chainHas(String(tg).slice(6)));
+  if (live === '__chain__') return (state.chain || []).includes(id);
+  // the pool runs the entries that are enabled AND have a port (as main builds it)
+  if (live === '__pool__') return (state.pool || []).some(e => e && e.enabled && e.socksPort && targetHas(e.target));
+  if (live === '__advanced__' || String(live).startsWith('__advanced__:')) {
+    const s = state.settings || {};
+    const first = (state.servers || [])[0];
+    if (Array.isArray(state.profiles)) {
+      // the routing profile that is up: its targets, its rules' vias and its base all dial
+      const p = profileOfSel(live);
+      if (!p) return false;
+      const refs = [...p.rules.map(r => r && r.target), p.def || (first && first.id) || 'direct',
+        ...p.rules.map(r => r && r.via), p.defVia, p.base];
+      return refs.filter(v => v && v !== 'inherit' && v !== 'none').some(targetHas);
+    }
+    const def = s.routeDefault || (first && first.id) || 'direct';
+    return [...(s.routeRules || []).map(r => r && r.target), def].some(targetHas);
+  }
+  return chainHas(live);
+}
+
+/* ---------- the full editor: Simple and Pro over one draft (serverFields.js) ---------- */
+// docs/superpowers/specs/2026-10-12-server-editor-design.md. The Simple view is
+// the form above, with what it lacked (flow, VLESS Encryption, the VMess cipher,
+// the Shadowsocks method) drawn from the table into #edSimpleExtra; the Pro view
+// is the whole table, in five tabs, drawn into #edPro. Both read and write ONE
+// draft — field id → what the form holds — so switching never loses a value,
+// and a save sends all of it (parser.applyServerEdits keeps what did not change).
+
+let editDraft = null;       // field id → text, or a boolean for a switch
+let editView = 'simple';    // 'simple' | 'pro' — the last one used, remembered
+let editTab = 'protocol';   // the Pro view's open tab
+let editNew = false;        // a server made from scratch: Pro, Basics first
+let editBad = null;         // { id, tab } of the field a save refused, marked until it changes
+const EDIT_VIEW_KEY = 'irnf.editView';
+const PROTO_NAMES = { vless: 'VLESS', vmess: 'VMess', trojan: 'Trojan', shadowsocks: 'Shadowsocks', hysteria2: 'Hysteria2', masque: 'MASQUE', wireguard: 'WireGuard', socks: 'SOCKS5', http: 'HTTP' };
+/** The picker's «new» tag (the sample's): protocols this release added. */
+const NEW_PROTOCOLS = ['masque'];
+/** The fields of a WARP account (MASQUE): all three or none. */
+const WARP_FIELDS = ['warpPrivateKey', 'warpPublicKey', 'warpAddress'];
+
+/** append(), leaving out what is not there: DOM append() writes null as the text "null". */
+function appendSome(node, ...kids) { node.append(...kids.filter((k) => k != null && k !== false)); return node; }
+
+/** The field table (serverFields.js, loaded before this file). */
+function sfTable() { return window.ServerFields; }
+
+/** The view the editor opens in: the one used last. */
+function savedEditView() {
+  try { return localStorage.getItem(EDIT_VIEW_KEY) === 'pro' ? 'pro' : 'simple'; } catch { return 'simple'; }
+}
+
+/** A small element: `props` as attributes (`text` → textContent), `kids` appended. */
+function edNode(tag, props, kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'text') n.textContent = v;
+    else if (k === 'class') n.className = v;
+    else n.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const c of [].concat(kids || [])) if (c != null) appendSome(n, c);
+  return n;
+}
+
+/** A record's values in the table's terms — what parser.editFields says, read here. */
+function draftOf(s) {
+  const F = sfTable();
+  const f = readServerFields(s);
+  const p = s.protocol;
+  const d = {
+    protocol: p, name: f.name || '', address: f.address || '', port: f.port != null ? String(f.port) : '',
+    engine: f.engine || 'xray', fragment: f.fragment || '', noise: f.noise || '',
+    cipherSuites: f.cipherSuites || '', finalMask: f.finalMask || '',
+    network: f.network || 'tcp', security: p === 'hysteria2' || p === 'masque' ? 'tls' : (f.security || 'none'),
+    // MASQUE writes the fingerprint where the form says one (parser.applyServerEdits): none stays none
+    sni: f.sni || '', host: f.host || '', path: f.path || '', fp: f.fp || (p === 'masque' ? '' : 'chrome'), pbk: f.pbk || '', sid: f.sid || '',
+    alpn: f.alpn || '', allowInsecure: !!f.allowInsecure, ech: f.ech || '', pcs: f.pcs || '', vcn: f.vcn || '', pqv: f.pqv || ''
+  };
+  if (p === 'vless' || p === 'vmess') d.uuid = f.cred || '';
+  if (p === 'trojan' || p === 'shadowsocks' || p === 'hysteria2') d.password = f.cred || '';
+  if (p === 'hysteria2') Object.assign(d, { obfsPassword: f.hy2Obfs || '', mport: f.hy2Ports || '' });
+  if (p === 'wireguard') {
+    Object.assign(d, {
+      privateKey: f.cred || '', publicKey: f.wgPub || '', localAddress: f.wgAddr || '', presharedKey: f.wgPsk || '',
+      mtu: f.wgMtu != null ? String(f.wgMtu) : '', reserved: f.wgReserved || '', allowedIPs: f.wgAllowed || '', dns: f.wgDns || ''
+    });
+  }
+  if (p === 'socks' || p === 'http') Object.assign(d, { username: f.pxUser || '', password: f.pxPass || '' });
+  Object.assign(d, F.specialsOf(s));
+  const ctx = F.contextOf(s);
+  for (const fld of F.PATH_FIELDS) if (F.fieldApplies(fld, ctx)) d[fld.id] = F.toForm(fld, F.getPath(s, fld.path));
+  return d;
+}
+
+/** A new server's draft: the protocol's defaults, and what the form had in common with another protocol. */
+function newDraft(protocol, keep) {
+  const F = sfTable();
+  const d = {
+    protocol, name: '', address: '', port: '443', engine: 'xray', fragment: '', noise: '', cipherSuites: '', finalMask: '',
+    network: 'tcp', security: protocol === 'hysteria2' ? 'tls' : 'none', sni: '', host: '', path: '', fp: 'chrome', pbk: '', sid: '',
+    alpn: '', allowInsecure: false, ech: '', pcs: '', vcn: '', pqv: '', uuid: '', password: '', username: '',
+    flow: '', encryption: 'none', vmessSecurity: 'auto', alterId: '0', method: F.SS_METHODS[0], uot: protocol === 'shadowsocks',
+    plugin: '', headerType: 'none', grpcMode: 'gun', xhttpMode: 'auto', kcpHeader: 'none', kcpSeed: '', spx: '',
+    privateKey: '', publicKey: '', localAddress: '', presharedKey: '', allowedIPs: '0.0.0.0/0, ::/0', reserved: '', mtu: '1420', dns: '',
+    obfsPassword: '', mport: '', hopInterval: '', up: '', down: '', mux: ''
+  };
+  if (protocol === 'wireguard') d.port = '51820';
+  if (protocol === 'socks') d.port = '1080';
+  if (protocol === 'http') d.port = '8080';
+  // MASQUE: over TLS always, HTTP/3 until told otherwise, the core's own fingerprint; a WARP account is added in its card
+  if (protocol === 'masque') Object.assign(d, { network: 'masque', security: 'tls', fp: '', masqueHttp: 'h3' });
+  if (keep) for (const k of ['name', 'address']) if (keep[k]) d[k] = keep[k];
+  return d;
+}
+
+/** The draft's protocol / transport / security, in the table's terms. */
+function draftCtx() {
+  const d = editDraft || {};
+  const tlsOnly = d.protocol === 'hysteria2' || d.protocol === 'masque';
+  return { protocol: d.protocol, network: d.network || 'tcp', security: tlsOnly ? 'tls' : (d.security || 'none') };
+}
+
+/** MASQUE: does the draft hold a WARP account? The card's switch once touched, else whether one of its fields is filled. */
+function masqueWarpOn(d) {
+  if (!d) return false;
+  if (d._warpOn != null) return !!d._warpOn;
+  return WARP_FIELDS.some((k) => String(d[k] == null ? '' : d[k]).trim() !== '');
+}
+
+/**
+ * Is this field part of the form right now? The table says, and TCP's Host and
+ * path only with its HTTP header. MASQUE: the anti-DPI field of its HTTP
+ * version only (a fragment over HTTP/2, noise over HTTP/3); a WARP account's
+ * fields while its card is on — and then no user or password, and the host,
+ * path and headers only when they hold something (WARP's own are the default).
+ */
+function fieldShown(fld) {
+  const F = sfTable();
+  const ctx = draftCtx();
+  if (!F.fieldApplies(fld, ctx)) return false;
+  if ((fld.id === 'host' || fld.id === 'path') && ctx.network === 'tcp') return editDraft.headerType === 'http';
+  if (ctx.protocol === 'masque') {
+    const h2 = editDraft.masqueHttp === 'h2';
+    if (fld.id === 'fragment') return h2;
+    if (fld.id === 'noise') return !h2;
+    const warp = masqueWarpOn(editDraft);
+    if (WARP_FIELDS.includes(fld.id)) return warp;
+    if (fld.id === 'masqueUser' || fld.id === 'masquePass') return !warp;
+    if (['masqueHost', 'masquePath', 'masqueHeaders'].includes(fld.id)) return !warp || String(editDraft[fld.id] || '').trim() !== '';
+  }
+  return true;
+}
+
+/** A field's label: by protocol or transport where it reads differently (a Hysteria2 password, gRPC's Host). */
+function fieldLabel(fld) {
+  const ctx = draftCtx();
+  for (const k of [`sf.${fld.id}.${ctx.protocol}`, `sf.${fld.id}.${ctx.network}`, `sf.${fld.id}`]) {
+    const v = t(k);
+    if (v !== k) return v;
+  }
+  return fld.id;
+}
+
+/** An option's label: its own key where it has one (`_` = the empty one), else the value itself. */
+function optionLabel(fld, o) {
+  if (!fld.optionLabels || (fld.optionLabels !== 'all' && o)) return o;
+  const k = `sfo.${fld.id}.${o || '_'}`;
+  const v = t(k);
+  return v === k ? (o || '—') : v;
+}
+
+/**
+ * A field's hint: by context first where it reads differently — a MASQUE
+ * server's with a WARP account (`sf.<id>.hint.warp`), over its HTTP version
+ * (`.h3` / `.h2`), any MASQUE one (`.masque`) — then the table's own.
+ */
+function fieldHint(fld) {
+  const ctx = draftCtx();
+  const keys = [];
+  if (ctx.protocol === 'masque') {
+    if (masqueWarpOn(editDraft)) keys.push(`sf.${fld.id}.hint.warp`);
+    keys.push(`sf.${fld.id}.hint.${editDraft.masqueHttp === 'h2' ? 'h2' : 'h3'}`, `sf.${fld.id}.hint.masque`);
+  }
+  if (fld.hint) keys.push(`sf.${fld.id}.hint`);
+  for (const k of keys) {
+    const v = t(k);
+    if (v !== k) return v;
+  }
+  return '';
+}
+
+/** A group's heading: by protocol where it reads differently (MASQUE's finalmask is no patterniha's). */
+function groupLabel(group) {
+  const k = `sfg.${group}.${draftCtx().protocol}`;
+  const v = t(k);
+  return v !== k ? v : t('sfg.' + group);
+}
+
+/** The draft changed: what it shows may have too (a new transport, a protocol, MASQUE's HTTP version or WARP card). */
+function draftChanged(id) {
+  if (editBad && editBad.id === id) editBad = null;
+  if (['protocol', 'network', 'security', 'headerType', 'masqueHttp', 'warp'].includes(id)) {
+    if (editView === 'pro') renderEditPro(); else renderSimpleExtras();
+  }
+  if (id === 'protocol' || id === 'network' || id === 'security' || id === 'address') renderEditTabs();
+}
+
+/** The label row of a field: its name, its technical key, and the "this device only" tag. */
+function fieldHead(fld, forId) {
+  return edNode('label', { class: 'field-label', for: forId }, [
+    edNode('span', { text: fieldLabel(fld) }), ' ',
+    edNode('span', { class: 'ed-key', dir: 'ltr', text: fld.key }),
+    fld.local ? edNode('span', { class: 'ed-local', title: t('edit.localTip'), text: t('edit.local') }) : null
+  ]);
+}
+
+/** VLESS Encryption read back: the auth, its mode, 0-RTT or 1-RTT — or why it is not one. */
+function encryptionChips(box, v) {
+  const r = sfTable().readEncryption(v);
+  box.textContent = '';
+  if (!r) return;
+  if (r.bad) { appendSome(box, edNode('span', { class: 'bad', text: '✗ ' + t(r.bad) })); return; }
+  const pq = r.auth === 'ML-KEM-768';
+  appendSome(box, 
+    edNode('span', { class: pq ? 'pq' : '' }, [t('edit.enc.auth').replace('{v}', ''), edNode('bdi', { text: r.auth + (pq ? ' — ' + t('edit.enc.pq') : '') })]),
+    edNode('span', {}, [t('edit.enc.mode').replace('{v}', ''), edNode('bdi', { text: r.mode })]),
+    edNode('span', {}, [edNode('bdi', { text: r.rtt === '0rtt' ? '0-RTT' : '1-RTT' })]),
+    r.padded ? edNode('span', { text: t('edit.enc.padding') }) : null
+  );
+}
+
+/** A random v4 UUID — getRandomValues, which a router's plain-http page still has. */
+function newUuid() {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+/** One field of the draft, as the form shows it; every input writes straight back to the draft. */
+function fieldNode(fld) {
+  const d = editDraft;
+  const id = 'edf-' + fld.id;
+  const bad = editBad && editBad.id === fld.id;
+  const wrap = edNode('div', { class: 'ed-f' + (fld.span === 2 || ['seg', 'chips', 'json', 'encryption', 'network', 'security'].includes(fld.kind) ? ' span2' : '') + (bad ? ' is-bad' : ''), 'data-field': fld.id });
+  const put = (v) => { d[fld.id] = v; draftChanged(fld.id); };
+  const hintText = fieldHint(fld);
+  const hint = hintText ? edNode('p', { class: 'hint', text: hintText }) : null;
+  const val = d[fld.id] == null ? '' : d[fld.id];
+  const isMasque = draftCtx().protocol === 'masque';
+  const text = (kind) => {
+    const inp = edNode('input', { class: 'input', id, dir: 'ltr', placeholder: fld.placeholder || null, inputmode: kind === 'number' ? 'numeric' : null, spellcheck: 'false' });
+    inp.value = String(val);
+    inp.oninput = () => { d[fld.id] = inp.value; if (editBad && editBad.id === fld.id) { editBad = null; wrap.classList.remove('is-bad'); renderEditTabs(); } };
+    inp.onchange = () => put(inp.value);
+    return inp;
+  };
+  const seg = (options, label) => {
+    const box = edNode('div', { class: 'seg ed-seg-wide', role: 'radiogroup', 'aria-label': fieldLabel(fld) });
+    for (const o of options) {
+      const b = edNode('button', { type: 'button', class: 'seg-btn' + (String(val) === o ? ' active' : ''), role: 'radio', 'aria-checked': String(String(val) === o), dir: 'ltr', text: label ? label(o) : o });
+      b.onclick = () => put(o);
+      appendSome(box, b);
+    }
+    return box;
+  };
+  switch (fld.kind) {
+    case 'switch': {
+      const inp = edNode('input', { type: 'checkbox', id });
+      inp.checked = !!val;
+      inp.onchange = () => put(inp.checked);
+      appendSome(wrap, edNode('label', { class: 'ed-switch', for: id }, [
+        edNode('span', { class: 'switch-title' }, [edNode('span', { text: fieldLabel(fld) }), edNode('span', { class: 'ed-key', dir: 'ltr', text: fld.key }),
+          fld.local ? edNode('span', { class: 'ed-local', title: t('edit.localTip'), text: t('edit.local') }) : null]),
+        edNode('span', { class: 'switch' }, [inp, edNode('span', { class: 'slider' })])
+      ]), hint);
+      if (fld.id === 'allowInsecure' && editOriginal && editOriginal.certPin && !editClearPin) {
+        const pin = edNode('p', { class: 'hint', dir: 'ltr' }, [t('edit.certPinShown').replace('{pin}', editOriginal.certPin.slice(0, 6) + '…' + editOriginal.certPin.slice(-4)) + ' ']);
+        const clear = edNode('button', { type: 'button', class: 'btn ghost tiny', text: t('edit.certPinClear') });
+        clear.onclick = () => { editClearPin = true; pin.remove(); show('#edCertPinRow', false); };
+        appendSome(pin, clear);
+        appendSome(wrap, pin);
+      }
+      return wrap;
+    }
+    case 'select': {
+      const sel = edNode('select', { class: 'select', id });
+      let opts = [...fld.options];
+      let cur = String(val);
+      // MASQUE runs on Xray or Xray-PattN only (sing-box has none); its fingerprint may be none at all — the core's own
+      if (isMasque && fld.id === 'engine') { opts = opts.filter((o) => o !== 'sing-box'); if (cur === 'sing-box') cur = 'xray'; }
+      if (isMasque && fld.id === 'fp') opts.unshift('');
+      if (cur !== '' && !opts.includes(cur)) opts.push(cur);   // a value the list does not have stays as it is
+      for (const o of opts) appendSome(sel, edNode('option', { value: o, text: fld.id === 'fp' && o === '' ? t('sfo.fp._') : optionLabel(fld, o) }));
+      sel.value = cur;
+      sel.onchange = () => put(sel.value);
+      appendSome(wrap, fieldHead(fld, id), sel, hint);
+      return wrap;
+    }
+    case 'json': {
+      const ta = edNode('textarea', { class: 'textarea', id, dir: 'ltr', rows: '3', spellcheck: 'false', placeholder: fld.placeholder || null });
+      ta.value = String(val);
+      ta.oninput = () => { d[fld.id] = ta.value; };
+      appendSome(wrap, fieldHead(fld, id), ta, hint);
+      return wrap;
+    }
+    case 'chips': {
+      const on = String(val).split(/[,\s]+/).filter(Boolean);
+      const box = edNode('div', { class: 'ed-chips', role: 'group', 'aria-label': fieldLabel(fld) });
+      for (const o of fld.options) {
+        const b = edNode('button', { type: 'button', class: 'ed-chip' + (on.includes(o) ? ' on' : ''), 'aria-pressed': String(on.includes(o)), dir: 'ltr', text: o });
+        b.onclick = () => {
+          const next = on.includes(o) ? on.filter((x) => x !== o) : fld.options.filter((x) => x === o || on.includes(x));
+          put(next.join(','));
+          if (editView === 'pro') renderEditPro(); else renderSimpleExtras();
+        };
+        appendSome(box, b);
+      }
+      appendSome(wrap, edNode('div', { class: 'field-label' }, [edNode('span', { text: fieldLabel(fld) }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: fld.key })]), box, hint);
+      return wrap;
+    }
+    case 'seg':
+      // MASQUE's HTTP version: the sample's two cards, each saying what it runs over (they carry the hint)
+      if (fld.id === 'masqueHttp') {
+        appendSome(wrap, edNode('div', { class: 'field-label' }, [edNode('span', { text: fieldLabel(fld) }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: fld.key })]),
+          httpCards(String(val) === 'h2' ? 'h2' : 'h3', (o) => put(o)));
+        return wrap;
+      }
+      appendSome(wrap, edNode('div', { class: 'field-label' }, [edNode('span', { text: fieldLabel(fld) }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: fld.key })]), seg(fld.options), hint);
+      return wrap;
+    case 'network':
+      appendSome(wrap, edNode('div', { class: 'field-label' }, [edNode('span', { text: fieldLabel(fld) }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: fld.key })]),
+        seg(sfTable().NETWORKS, (o) => t('sfo.network.' + o)));
+      return wrap;
+    case 'security':
+      appendSome(wrap, edNode('div', { class: 'field-label' }, [edNode('span', { text: fieldLabel(fld) }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: fld.key })]),
+        seg(sfTable().securitiesOf(draftCtx().protocol), (o) => t('sfo.security.' + o)));
+      return wrap;
+    case 'uuid': {
+      const inp = text('text');
+      const gen = edNode('button', { type: 'button', class: 'btn small', text: t('edit.genUuid') });
+      gen.onclick = () => { inp.value = newUuid(); d[fld.id] = inp.value; };
+      appendSome(wrap, fieldHead(fld, id), edNode('div', { class: 'ed-inline' }, [inp, gen]), hint);
+      return wrap;
+    }
+    case 'encryption': {
+      const isOn = d._encOn != null ? d._encOn : (String(val) !== '' && String(val) !== 'none');
+      const sel = edNode('select', { class: 'select', id: id + '-mode' }, [
+        edNode('option', { value: 'none', text: t('sfo.encMode.none') }), edNode('option', { value: 'mlkem', text: t('sfo.encMode.mlkem') })]);
+      sel.value = isOn ? 'mlkem' : 'none';
+      const ta = edNode('textarea', { class: 'textarea ed-mono', id, dir: 'ltr', rows: '2', spellcheck: 'false', placeholder: 'mlkem768x25519plus.native.0rtt.…' });
+      ta.value = isOn && String(val) !== 'none' ? String(val) : '';
+      const chips = edNode('div', { class: 'ed-enc-read', 'aria-live': 'polite' });
+      encryptionChips(chips, ta.value);
+      const body = edNode('div', { class: 'ed-enc-body', hidden: !isOn }, [
+        edNode('label', { class: 'field-label', for: id }, [edNode('span', { text: t('sf.encryptionValue') }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: 'mlkem768x25519plus.…' })]),
+        ta, chips, hint]);
+      sel.onchange = () => {
+        d._encOn = sel.value === 'mlkem';
+        body.hidden = !d._encOn;
+        d.encryption = d._encOn ? ta.value.trim() : 'none';
+      };
+      ta.oninput = () => { d.encryption = ta.value.trim(); encryptionChips(chips, d.encryption); };
+      appendSome(wrap, edNode('div', { class: 'ed-grid' }, [edNode('div', { class: 'ed-f' }, [fieldHead(fld, id + '-mode'), sel])]), body);
+      return wrap;
+    }
+    default:
+      if (fld.id === 'warpPrivateKey' || fld.id === 'warpPublicKey') {
+        // a key is long: two lines of monospace, as in the sample
+        const ta = edNode('textarea', { class: 'textarea ed-mono', id, dir: 'ltr', rows: '2', spellcheck: 'false', autocomplete: 'off' });
+        ta.value = String(val);
+        ta.oninput = () => { d[fld.id] = ta.value; if (editBad && editBad.id === fld.id) { editBad = null; wrap.classList.remove('is-bad'); renderEditTabs(); } };
+        ta.onchange = () => put(ta.value);
+        appendSome(wrap, fieldHead(fld, id), ta, hint);
+        return wrap;
+      }
+      appendSome(wrap, fieldHead(fld, id), text(fld.kind), hint);
+      return wrap;
+  }
+}
+
+/**
+ * MASQUE's HTTP version as the sample's cards — HTTP/3 and HTTP/2, each with
+ * what it runs over — and, in the + WARP dialog, a third: both (two servers).
+ * `pick(id)` on a click.
+ */
+function httpCards(cur, pick, withBoth) {
+  const opts = [['h3', 'HTTP/3', 'masque.h3Desc'], ['h2', 'HTTP/2', 'masque.h2Desc']];
+  if (withBoth) opts.push(['both', t('warp.httpBoth'), 'warp.httpBothDesc']);
+  const box = edNode('div', { class: 'ed-http' + (withBoth ? ' three' : ''), role: 'radiogroup' });
+  for (const [id, name, desc] of opts) {
+    const on = id === cur;
+    const b = edNode('button', { type: 'button', class: 'ed-http-opt' + (on ? ' on' : ''), role: 'radio', 'aria-checked': String(on), 'data-http': id }, [
+      id === 'both' ? edNode('span', { class: 'ui', text: name }) : edNode('span', {}, [edNode('bdi', { dir: 'ltr', text: name })]),
+      edNode('small', { text: t(desc) })]);
+    b.onclick = () => pick(id);
+    appendSome(box, b);
+  }
+  return box;
+}
+
+/** A field MASQUE does not take, shown off with the reason why (the sample's disabled select). */
+function offField(label, key, value, why) {
+  return edNode('div', { class: 'ed-f' }, [
+    edNode('div', { class: 'field-label' }, [edNode('span', { text: label }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: key })]),
+    edNode('select', { class: 'select', disabled: true, 'aria-label': label }, [edNode('option', { text: value })]),
+    edNode('p', { class: 'hint', text: why })]);
+}
+
+/**
+ * What a MASQUE server's Pro view shows after a field, beyond the table: the
+ * certificate note of a WARP account after vcn, Mux shown off after the core,
+ * and the anti-DPI field its HTTP version does not take, off, beside the one it does.
+ */
+function fieldExtras(fld) {
+  if (!editDraft || draftCtx().protocol !== 'masque') return [];
+  const h2 = editDraft.masqueHttp === 'h2';
+  const byId = (id) => sfTable().FIELDS.find((f) => f.id === id);
+  if (fld.id === 'vcn' && masqueWarpOn(editDraft)) return [edNode('p', { class: 'hint span2 ed-gridnote', text: t('masque.certNoteWarp') })];
+  if (fld.id === 'engine') return [offField(t('sf.mux'), 'mux', t('masque.muxNone'), t('masque.muxHint'))];
+  if (fld.id === 'noise' && !h2) return [offField(fieldLabel(byId('fragment')), 'fragment', t('masque.off'), t('masque.fragmentOffH3'))];
+  if (fld.id === 'fragment' && h2) return [offField(fieldLabel(byId('noise')), 'noise', t('masque.off'), t('masque.noiseOffH2'))];
+  return [];
+}
+
+/**
+ * A translated line with **bold** parts and {name} slots: a slot's text goes
+ * in isolated left-to-right (an IP, a key, a path inside Persian), a node as it is.
+ */
+function richLine(text, slots) {
+  const out = [];
+  for (const part of String(text).split(/(\*\*[^*]+\*\*|\{\w+\})/)) {
+    if (!part) continue;
+    const b = /^\*\*([^*]+)\*\*$/.exec(part);
+    const s = /^\{(\w+)\}$/.exec(part);
+    if (b) out.push(edNode('b', { text: b[1] }));
+    else if (s && slots && Object.prototype.hasOwnProperty.call(slots, s[1])) {
+      const v = slots[s[1]];
+      out.push(typeof v === 'string' ? edNode('bdi', { dir: 'ltr', text: v }) : v);
+    } else out.push(part);
+  }
+  return out;
+}
+
+/** Fields in a grid, with a heading where a group starts (none inside a card that is its own heading); MASQUE's extras after their field. */
+function fieldGrid(list, opts) {
+  const heads = !(opts && opts.heads === false);
+  const grid = edNode('div', { class: 'ed-grid' });
+  let group = null;
+  for (const fld of list) {
+    if (heads && fld.group && fld.group !== group) {
+      appendSome(grid, edNode('div', { class: 'ed-sub span2', text: groupLabel(fld.group) }));
+    }
+    group = fld.group || null;
+    appendSome(grid, fieldNode(fld), ...fieldExtras(fld));
+  }
+  return grid;
+}
+
+/** The WARP account of a MASQUE server: the sample's card — its switch in the head, its three fields under it while on. */
+function masqueWarpCard(list) {
+  const on = masqueWarpOn(editDraft);
+  const sw = edNode('input', { type: 'checkbox', id: 'edf-warp', 'aria-label': t('masque.warpTitle') });
+  sw.checked = on;
+  sw.onchange = () => setMasqueWarp(sw.checked);
+  return edNode('div', { class: 'ed-card', 'data-field': 'warp' }, [
+    edNode('div', { class: 'ed-card-head' }, [
+      edNode('span', { class: 'warp-ico sm', 'aria-hidden': 'true', text: '☁' }),
+      edNode('span', {}, [edNode('span', { class: 'ttl', text: t('masque.warpTitle') }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: 'warp' }),
+        edNode('br'), edNode('span', { class: 'sub', text: t('masque.warpOff') })]),
+      edNode('label', { class: 'switch', title: 'WARP' }, [sw, edNode('span', { class: 'slider' })])
+    ]),
+    on && list.length ? fieldGrid(list, { heads: false }) : null
+  ]);
+}
+
+/**
+ * The WARP card's switch. On: its fields (as they were, when it was on before)
+ * and no user or password — a WARP account takes none (parser.checkMasque);
+ * off: its fields cleared, so the save writes no account. What one side clears
+ * the other side's switch gives back.
+ */
+function setMasqueWarp(on) {
+  const d = editDraft;
+  const clear = on ? ['masqueUser', 'masquePass'] : WARP_FIELDS;
+  const back = on ? WARP_FIELDS : ['masqueUser', 'masquePass'];
+  d._stash = Object.assign({}, d._stash);
+  for (const k of clear) {
+    if (String(d[k] == null ? '' : d[k]) !== '') d._stash[k] = d[k];
+    d[k] = '';
+  }
+  for (const k of back) {
+    if (String(d[k] == null ? '' : d[k]) === '' && d._stash[k] != null) { d[k] = d._stash[k]; delete d._stash[k]; }
+  }
+  d._warpOn = !!on;
+  draftChanged('warp');
+}
+
+/** MASQUE's Protocol tab, as the sample lays it out: the HTTP version, the WARP card, then a server of one's own's fields. */
+function masqueProtocolPane(fields) {
+  const warp = masqueWarpOn(editDraft);
+  const own = fields.filter((f) => f.id !== 'masqueHttp' && !WARP_FIELDS.includes(f.id));
+  const out = [fieldGrid(fields.filter((f) => f.id === 'masqueHttp')), masqueWarpCard(fields.filter((f) => WARP_FIELDS.includes(f.id)))];
+  if (own.length) out.push(fieldGrid(own));
+  if (warp && !own.some((f) => f.id === 'masqueHost' || f.id === 'masquePath')) {
+    out.push(edNode('p', { class: 'hint' }, richLine(t('masque.warpAuto'), { host: 'cloudflareaccess.com', path: '/' })));
+  }
+  return out;
+}
+
+/** MASQUE has no transport of its own: the line its (disabled) Transport tab says. */
+function masqueNoTransport() {
+  return richLine(t('masque.noTransport'), { over: editDraft && editDraft.masqueHttp === 'h2' ? 'TCP (HTTP/2)' : 'QUIC (HTTP/3)' });
+}
+
+/** MASQUE's Security tab head: TLS, the only choice there is, said so. */
+function masqueTlsOnly() {
+  return edNode('div', { class: 'ed-f' }, [
+    edNode('div', { class: 'field-label' }, [edNode('span', { text: t('sf.security') }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: 'security' })]),
+    edNode('div', { class: 'seg ed-seg-wide', role: 'radiogroup', 'aria-label': t('sf.security') }, [
+      edNode('button', { type: 'button', class: 'seg-btn active', role: 'radio', 'aria-checked': 'true', dir: 'ltr', text: 'TLS' })]),
+    edNode('p', { class: 'hint', text: t('masque.tlsOnly') })]);
+}
+
+/** The Pro view's tab bar: each tab with what is chosen in it underneath, a dot where a save found something wrong. */
+function renderEditTabs() {
+  const bar = $('#edTabs');
+  if (!bar || !editDraft) return;
+  const F = sfTable();
+  const ctx = draftCtx();
+  const d = editDraft;
+  const isMasque = ctx.protocol === 'masque';
+  const sub = {
+    basics: editNew ? t('edit.tabNew') : (d.address || '—'),
+    protocol: (PROTO_NAMES[ctx.protocol] || ctx.protocol) + (isMasque && masqueWarpOn(d) ? ' · WARP' : ''),
+    transport: F.hasTransport(ctx.protocol) ? t('sfo.network.' + ctx.network) : '—',
+    security: F.securitiesOf(ctx.protocol).length ? ctx.security : '—',
+    advanced: 'engine · dpi'
+  };
+  bar.textContent = '';
+  for (const tab of F.TABS) {
+    const off = (tab === 'transport' && !F.hasTransport(ctx.protocol)) || (tab === 'security' && !F.securitiesOf(ctx.protocol).length);
+    // MASQUE's Transport tab says why it is off, on hover (its transport is its HTTP version)
+    const why = off && isMasque && tab === 'transport' ? masqueNoTransport().map((n) => (typeof n === 'string' ? n : n.textContent)).join('') : null;
+    const b = edNode('button', {
+      type: 'button', class: 'ed-tab' + (tab === editTab ? ' active' : ''), role: 'tab', 'aria-selected': String(tab === editTab),
+      'aria-disabled': off ? 'true' : null, 'data-tab': tab, title: why
+    }, [edNode('span', { class: 'ed-tab-name' }, [t('edit.tab.' + tab), editBad && editBad.tab === tab ? edNode('span', { class: 'ed-tab-bad', 'aria-hidden': 'true', text: '●' }) : null]),
+      edNode('small', { dir: 'ltr', text: sub[tab] })]);
+    b.onclick = () => { if (off) return; editTab = tab; renderEditPro(); };
+    appendSome(bar, b);
+  }
+}
+
+/** The Pro view: the open tab's fields, from the table. */
+function renderEditPro() {
+  const pane = $('#edProPane');
+  if (!pane || !editDraft) return;
+  const F = sfTable();
+  const ctx = draftCtx();
+  const name = PROTO_NAMES[ctx.protocol] || ctx.protocol;
+  if ((editTab === 'transport' && !F.hasTransport(ctx.protocol)) || (editTab === 'security' && !F.securitiesOf(ctx.protocol).length)) editTab = 'protocol';
+  renderEditTabs();
+  pane.textContent = '';
+  const fields = F.FIELDS.filter((f) => f.tab === editTab && f.kind !== 'protocol' && fieldShown(f));
+  if (editTab === 'basics') {
+    const picker = edNode('div', { class: 'ed-protos', role: 'radiogroup', 'aria-label': t('sf.protocol') });
+    for (const p of F.PROTOCOLS) {
+      const on = p === ctx.protocol;
+      const fixed = !editNew && !on;
+      // the name left-to-right in its own box, the «new» tag beside it, the line under it in the page's direction
+      const b = edNode('button', { type: 'button', class: 'ed-proto' + (on ? ' on' : ''), role: 'radio', 'aria-checked': String(on), 'aria-disabled': fixed ? 'true' : null, 'data-proto': p },
+        [edNode('span', { class: 'ed-proto-top' }, [edNode('bdi', { dir: 'ltr', text: PROTO_NAMES[p] || p }),
+          NEW_PROTOCOLS.includes(p) ? edNode('span', { class: 'ed-new', text: t('edit.protoNew') }) : null]),
+        edNode('small', { text: t('sfp.' + p) })]);
+      b.onclick = () => {
+        if (fixed || on) return;
+        editDraft = newDraft(p, editDraft);
+        draftChanged('protocol');
+      };
+      appendSome(picker, b);
+    }
+    appendSome(pane, edNode('div', { class: 'ed-f' }, [edNode('div', { class: 'field-label', text: t('sf.protocol') }), picker,
+      edNode('p', { class: 'hint', text: t(editNew ? 'edit.protoPick' : 'edit.protoFixed') })]));
+  }
+  const isMasque = ctx.protocol === 'masque';
+  if (editTab === 'transport' && !F.hasTransport(ctx.protocol)) {
+    appendSome(pane, isMasque ? edNode('p', { class: 'ed-empty' }, [edNode('span', {}, masqueNoTransport())])
+      : edNode('p', { class: 'ed-empty', text: t('edit.noTransport').replace('{proto}', name) }));
+  } else if (editTab === 'security' && !F.securitiesOf(ctx.protocol).length) appendSome(pane, edNode('p', { class: 'ed-empty', text: t('edit.noSecurity').replace('{proto}', name) }));
+  else if (isMasque && editTab === 'protocol') appendSome(pane, ...masqueProtocolPane(fields));
+  else {
+    if (isMasque && editTab === 'security') appendSome(pane, masqueTlsOnly());
+    appendSome(pane, fieldGrid(fields));
+  }
+  if (editTab === 'security' && ctx.security === 'none' && F.securitiesOf(ctx.protocol).length) appendSome(pane, edNode('p', { class: 'ed-warn', text: t('edit.noTls') }));
+  $('#edHeadProto').textContent = name;
+}
+
+/** The Simple view's additions: what the form above lacked, for this protocol. */
+function renderSimpleExtras() {
+  const box = $('#edSimpleExtra');
+  if (!box || !editDraft) return;
+  const F = sfTable();
+  const ids = { vless: ['flow', 'encryption'], vmess: ['vmessSecurity', 'alterId'], shadowsocks: ['method'] }[draftCtx().protocol] || [];
+  box.textContent = '';
+  if (ids.length) appendSome(box, fieldGrid(ids.map((id) => F.FIELDS.find((f) => f.id === id))));
+  box.hidden = !ids.length;
+}
+
+/** The Simple form's inputs, into the draft (the parser's names, as a save sends them). */
+function absorbSimple() {
+  if (!editDraft || !editOriginal) return;
+  const f = collectEditFields(editOriginal, editClearPin);
+  delete f.clearCertPin;
+  Object.assign(editDraft, f);
+}
+
+/** The draft, into the Simple form's inputs. */
+function fillSimple() {
+  if (!editDraft || !editOriginal) return;
+  const d = editDraft;
+  const p = editOriginal.protocol;
+  fillEditForm({
+    name: d.name, address: d.address, port: d.port,
+    cred: p === 'wireguard' ? d.privateKey : (p === 'vless' || p === 'vmess') ? d.uuid : d.password,
+    network: d.network, security: d.security, sni: d.sni, host: d.host, path: d.path, fp: d.fp, pbk: d.pbk, sid: d.sid,
+    fragment: d.fragment, noise: d.noise, cipherSuites: d.cipherSuites, finalMask: d.finalMask, engine: d.engine,
+    allowInsecure: d.allowInsecure, ech: d.ech, pcs: d.pcs, vcn: d.vcn, pqv: d.pqv, hy2Obfs: d.obfsPassword, hy2Ports: d.mport,
+    pxUser: d.username, pxPass: d.password, wgPub: d.publicKey, wgAddr: d.localAddress, wgPsk: d.presharedKey,
+    wgMtu: d.mtu, wgReserved: d.reserved, wgAllowed: d.allowedIPs, wgDns: d.dns,
+    masqueHttp: d.masqueHttp, masqueUser: d.masqueUser, masquePass: d.masquePass
+  }, p);
+  const isStd = ['vless', 'vmess', 'trojan'].includes(p);
+  $('#edRealityRow').hidden = !(isStd && $('#edSecurity').value === 'reality');
+  updateSpoofLabels();
+  renderSimpleExtras();
+  renderMasqueSimple();
+}
+
+/**
+ * The Simple view's MASQUE account: a WARP account's summary — its two keys,
+ * its addresses — or the user and password of a server of one's own. The WARP
+ * keys themselves are edited in the Pro view.
+ */
+function renderMasqueSimple() {
+  const d = editDraft;
+  if (!d || d.protocol !== 'masque') return;
+  const warp = masqueWarpOn(d);
+  show('#edWarpCard', warp);
+  show('#edMasqueCred', !warp);
+  const box = $('#edWarpChips');
+  box.textContent = '';
+  if (warp) {
+    const has = (k) => String(d[k] == null ? '' : d[k]).trim() !== '';
+    appendSome(box, ...warpChips({ key: has('warpPrivateKey'), pub: has('warpPublicKey'), addrs: String(d.warpAddress || '').split(/[,\s]+/) }));
+  }
+}
+
+/**
+ * A WARP account read back as chips: its device key (P-256 when that is seen),
+ * the endpoint's key, then each tunnel address without its /32 or /128 — with
+ * its family named when `family` (the + WARP dialog's import).
+ */
+function warpChips(r, family) {
+  const chips = [
+    edNode('span', { class: r.key ? null : 'bad', text: t(!r.key ? 'warp.chipNoKey' : r.p256 ? 'warp.chipKeyP256' : 'warp.chipKey') }),
+    edNode('span', { class: r.pub ? null : 'bad', text: t(r.pub ? 'warp.chipPub' : 'warp.chipNoPub') })
+  ];
+  for (const a of r.addrs || []) {
+    const ip = String(a == null ? '' : a).trim().replace(/\/\d+$/, '');
+    if (!ip) continue;
+    // one left-to-right run, the family first: "IPv4 172.16.0.2" in Persian too
+    chips.push(edNode('span', { class: 'info' }, [edNode('bdi', { dir: 'ltr', text: (family ? (ip.includes(':') ? 'IPv6 ' : 'IPv4 ') : '') + ip })]));
+  }
+  return chips;
+}
+
+/** The Simple view's last line: everything else is one click away, in the Pro view. */
+function fillMoreInPro() {
+  const more = $('#edMoreInPro');
+  if (!more) return;
+  const [a, b] = t(editDraft && editDraft.protocol === 'masque' ? 'edit.moreInPro.masque' : 'edit.moreInPro').split('{link}');
+  const go = edNode('button', { type: 'button', class: 'ed-pro-link', text: t('edit.proLink') });
+  go.onclick = () => setEditView('pro');
+  more.textContent = '';
+  appendSome(more, a || '', go, b || '');
+}
+
+/** Show the view the editor is in (`editView`). */
+function showEditView() {
+  const pro = editView === 'pro';
+  show('#edSimple', !pro);
+  show('#edPro', pro);
+  for (const b of document.querySelectorAll('#edView [data-edit-view]')) {
+    const on = b.dataset.editView === editView;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', String(on));
+  }
+  $('#edFootNote').textContent = pro ? t('edit.localNote') : '';
+  if (pro) renderEditPro(); else { fillSimple(); fillMoreInPro(); }
+}
+
+/** Switch views, the draft carried across; remembered for the next time. */
+function setEditView(v) {
+  if (!editDraft || (v !== 'simple' && v !== 'pro') || v === editView) return;
+  if (editView === 'simple') absorbSimple();
+  editView = v;
+  if (!editNew) { try { localStorage.setItem(EDIT_VIEW_KEY, v); } catch { /* private mode */ } }
+  showEditView();
+}
+
+/**
+ * What a save cannot send, the first thing found: a field the table says is
+ * wrong (a number, a range, JSON, the Encryption), an Encryption chosen but
+ * empty, a new server's address, port or credential. { id, tab, why } or null.
+ */
+function draftProblem() {
+  const F = sfTable();
+  const d = editDraft;
+  for (const fld of F.FIELDS) {
+    if (!fieldShown(fld)) continue;
+    const why = F.validate(fld, d[fld.id]);
+    if (why) return { id: fld.id, tab: fld.tab, why };
+  }
+  if (draftCtx().protocol === 'vless' && d._encOn && !String(d.encryption || '').trim()) return { id: 'encryption', tab: 'protocol', why: 'edit.err.encKey' };
+  // a WARP account is all three of its fields or none (the card's switch is the "none")
+  if (draftCtx().protocol === 'masque' && masqueWarpOn(d)) {
+    for (const id of WARP_FIELDS) if (!String(d[id] == null ? '' : d[id]).trim()) return { id, tab: 'protocol', why: 'edit.err.required' };
+  }
+  if (editNew) {
+    const need = ['address', 'port'].concat({ vless: ['uuid'], vmess: ['uuid'], trojan: ['password'], shadowsocks: ['password'], hysteria2: ['password'], wireguard: ['privateKey', 'publicKey'] }[d.protocol] || []);
+    for (const id of need) {
+      if (!String(d[id] == null ? '' : d[id]).trim()) return { id, tab: id === 'address' || id === 'port' ? 'basics' : 'protocol', why: 'edit.err.required' };
+    }
+  }
+  return null;
+}
+
+/** Say what a save refused, and show it: the Pro view opens its tab. */
+function showDraftProblem(p) {
+  const fld = sfTable().FIELDS.find((f) => f.id === p.id);
+  const label = fld ? fieldLabel(fld) : p.id;
+  editBad = { id: p.id, tab: p.tab };
+  const msg = p.why === 'edit.err.required' ? t(p.why).replace('{field}', label) : t('edit.err.in').replace('{field}', label).replace('{why}', t(p.why));
+  if (editView === 'simple' && !(fld && fld.simple)) { editView = 'pro'; }
+  if (editView === 'pro') { editTab = p.tab; showEditView(); } else renderSimpleExtras();
+  toast(msg, 'err');
+  const at = document.querySelector(`[data-field="${p.id}"]`);
+  if (at && at.scrollIntoView) at.scrollIntoView({ block: 'center' });
+}
+
+/** The fields a save sends: the whole draft, in the parser's names. */
+function draftFields() {
+  const f = Object.assign({}, editDraft);
+  // the form's own state (`_encOn`, MASQUE's `_warpOn` and what its switch put aside) is no field
+  for (const k of Object.keys(f)) if (k[0] === '_') delete f[k];
+  delete f.protocol;
+  f.serviceName = f.path;   // gRPC's service name is the path field
+  if (f.encryption === '' || f.encryption == null) f.encryption = 'none';
+  return f;
+}
+
+/** Add a server by hand: the Pro view on its Basics tab, the protocol picker first. */
+function openNewServer() {
+  state.editingId = null;
+  editOriginal = null;
+  editNew = true;
+  editClearPin = false;
+  editBad = null;
+  editDraft = newDraft('vless');
+  editTab = 'basics';
+  editView = 'pro';
+  setEditKind(false);
+  $('#edTitle').textContent = t('edit.newTitle');
+  show('#edView', false);
+  showEditView();
+  $('#editModal').hidden = false;
+}
+
+/** Save a server made from scratch (parser.createServer, in main or the router). */
+async function saveNewServer() {
+  const problem = draftProblem();
+  if (problem) return showDraftProblem(problem);
+  const fields = Object.assign(draftFields(), { protocol: editDraft.protocol });
+  const res = await window.api.createServer(fields);
+  if (!res || !res.ok) return toast((res && res.error) || 'error', 'err');
+  state.servers = res.servers;
+  renderServers(); renderPicker(); renderChains(); renderPool(); renderAdvanced();
+  closeEdit();
+  toast(t('t.serverCreated').replace('{name}', res.server.name), 'ok');
+}
+
+async function saveEdit() {
+  if (editNew) return saveNewServer();
   const id = state.editingId;
   if (!id || !editOriginal) return;
+  // a JSON server sends its mode and config, not the link form's fields
+  const isJson = editOriginal.source === 'json';
   const proto = editOriginal.protocol;
-  const fields = collectEditFields(editOriginal, editClearPin);
+  let fields;
+  if (isJson) fields = collectJsonFields();
+  else {
+    // the whole draft — the Simple form's inputs taken in first when that is the view open
+    if (editView === 'simple') absorbSimple();
+    const problem = draftProblem();
+    if (problem) return showDraftProblem(problem);
+    fields = draftFields();
+    if (editClearPin) fields.clearCertPin = true;
+  }
+  if (!fields) return;   // a JSON form has said why, under the editor
 
-  // the endpoint field must hold the PUBLIC host — the interface address
-  // pasted here is exactly how the record used to get corrupted
-  if (proto === 'wireguard' && (!String(fields.address).trim() || String(fields.address).includes('/'))) return toast(t('t.wgBadEndpoint'), 'err');
+  // the link form's own checks; its inputs are hidden (and stale) for a JSON server
+  if (!isJson) {
+    // the endpoint field must hold the PUBLIC host — the interface address
+    // pasted here is exactly how the record used to get corrupted
+    if (proto === 'wireguard' && (!String(fields.address).trim() || String(fields.address).includes('/'))) return toast(t('t.wgBadEndpoint'), 'err');
 
-  // finalmask goes to the core untouched, so catch bad JSON here rather than
-  // letting xray refuse the whole config at connect time
-  const fmText = $('#edFinalMask') ? $('#edFinalMask').value.trim() : '';
-  if (fmText) {
-    try { JSON.parse(fmText); }
-    catch { return toast(t('edit.finalMaskBad'), 'err'); }
+    // finalmask goes to the core untouched, so catch bad JSON here rather than
+    // letting xray refuse the whole config at connect time
+    const fmText = String(fields.finalMask || '').trim();
+    if (fmText) {
+      try { JSON.parse(fmText); }
+      catch { return toast(t('edit.finalMaskBad'), 'err'); }
+    }
+    // an ML-DSA-65 key is 1952 bytes as base64url (2603 characters); the parser
+    // leaves anything else out, so say so rather than drop it in silence
+    const pqvText = draftCtx().security === 'reality' ? String(fields.pqv || '').trim() : '';
+    if (pqvText && !/^[A-Za-z0-9_\-+/]{2603}={0,2}$/.test(pqvText)) return toast(t('edit.pqvBad'), 'err');
   }
 
   const res = await window.api.updateServer(id, fields);
   if (res.ok) {
     state.servers = res.servers;
+    // The service judges an edit against the plan it actually built and keeps
+    // it pending ('servers') until a reconnect: the lasting banner from its
+    // list, the toast from its verdict. A main that sends neither (older
+    // builds) leaves the banner alone, and the renderer reads the plan itself.
+    if (Array.isArray(res.pendingReconnect)) setPending(res.pendingReconnect);
+    const live = typeof res.live === 'boolean' ? res.live : serverInLivePlan(id);
     renderServers(); renderPicker(); renderChains(); renderPool(); renderAdvanced();
     closeEdit();
-    toast(t('t.serverUpdated'), 'ok');
+    // The edit is in the store, not in the running tunnel: say so, with the
+    // one click that applies it (the same leak-free rebuild as the Reconnect
+    // button) — a Disconnect + Connect would go direct in between.
+    if (live) toastAction(t('t.serverUpdatedLive'), t('btn.reconnect'), doReconnect);
+    else toast(t('t.serverUpdated'), 'ok');
+  } else if (isJson) {
+    // refused (bad JSON, no proxy outbound left…): the reason stays under the editor and the form stays open
+    showJsonError(res.error || '');
   } else {
-    toast(t('t.failed'), 'err');
+    // the parser's own reason; one that starts with a field's name (MASQUE's
+    // checks: "warpPrivateKey: not a P-256 private key") marks that field
+    const why = String((res && res.error) || '');
+    const m = /^(\w+)[:,\s]/.exec(why);
+    const fld = m && ((sfTable() || {}).FIELDS || []).find((f) => f.id === m[1]);
+    if (fld) {
+      editBad = { id: fld.id, tab: fld.tab };
+      if (editView === 'pro') { editTab = fld.tab; renderEditPro(); }
+    }
+    toast(why ? t('t.failed') + ' — ' + why : t('t.failed'), 'err');
   }
-};
+}
+$('#editSave').onclick = saveEdit;
 
 /* ----------------------------- WireGuard add ----------------------------- */
 $('#btnWgOpen').onclick = () => {
@@ -3226,6 +5582,319 @@ $('#btnWgAdd').onclick = async () => {
   toast(t('t.wgAdded'), 'ok');
 };
 
+/* ----------------------------- + WARP (MASQUE) ----------------------------- */
+// .superpowers/sdd/masque/design.md §5-6 and the approved sample: a WARP
+// account — registered here (warp.js, in main or on the router) or brought in
+// from usque or an Xray outbound — becomes one MASQUE server per HTTP version.
+// The dialog is drawn from `warpForm`; servers:addWarp does the work and does
+// not stream, so its steps read pending until it answers, then done.
+
+const WARP_SEEN_KEY = 'irnf.warpSeen';
+const WARP_TERMS_URL = 'https://www.cloudflare.com/application/terms/';
+/** Cloudflare's MASQUE edges (warp.js DEFAULT_ENDPOINTS): HTTP/3, then HTTP/2. */
+const WARP_EDGES = { v4: ['162.159.198.1', '162.159.198.2'], v6: ['2606:4700:103::1', '2606:4700:103::2'] };
+const WARP_IMPORT_PH = '{\n  "private_key": "MHcCAQEE…",\n  "endpoint_v4": "162.159.198.1", "endpoint_h2_v4": "162.159.198.2",\n  "endpoint_pub_key": "-----BEGIN PUBLIC KEY-----…",\n  "ipv4": "172.16.0.2", "ipv6": "2606:4700:110:…"\n}';
+/** The P-256 curve's OID (1.2.840.10045.3.1.7) in DER: a PKCS#8 or SEC1 key of that curve carries it. */
+const P256_OID = '\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07';
+let warpForm = null;   // the dialog: its choices, then phase 'running', then 'done' with the answer
+
+function warpFresh() {
+  return { way: 'new', route: 'direct', license: '', importText: '', http: 'both', endpoint: 'auto', address: '', cover: '', antiDpi: true, phase: 'form', error: '', res: null, args: null };
+}
+
+function warpShown() { const m = $('#warpModal'); return !!m && !m.hidden; }
+
+/** + WARP: the other add boxes close (one add form at a time), the dialog opens — on its last choices, unless it finished. */
+function openWarp() {
+  for (const id of ['#importBox', '#wgBox', '#proxyBox']) { const box = $(id); if (box) box.hidden = true; }
+  if (!warpForm || warpForm.phase === 'done') warpForm = warpFresh();
+  try { localStorage.setItem(WARP_SEEN_KEY, '1'); } catch { /* only costs the dot coming back */ }
+  $('#btnWarpOpen').classList.remove('is-new');
+  $('#warpModal').hidden = false;
+  renderWarp();
+}
+
+function closeWarp() { $('#warpModal').hidden = true; }
+
+/**
+ * servers:addWarp's arguments, from the dialog: a new account (how to reach
+ * the sign-up, a WARP+ key) or an imported one (the pasted text), then the
+ * servers — HTTP version, endpoint, cover domain, anti-DPI.
+ */
+function warpArgs(w) {
+  const a = { mode: w.way === 'import' ? 'import' : 'new' };
+  if (a.mode === 'import') a.importText = String(w.importText || '');
+  else {
+    a.via = w.route === 'proxy' ? 'proxy' : 'direct';
+    a.license = String(w.license || '').trim();
+  }
+  a.http = ['h3', 'h2', 'both'].includes(w.http) ? w.http : 'both';
+  a.endpoint = ['auto', 'v6', 'custom'].includes(w.endpoint) ? w.endpoint : 'auto';
+  if (a.endpoint === 'custom') a.address = String(w.address || '').trim();
+  a.cover = String(w.cover || '').trim();
+  a.antiDpi = w.antiDpi !== false;
+  return a;
+}
+
+/** A refusal in the window's words: `warp.err.<code>`, `{msg}` the detail it carries (Cloudflare's own, the reason). */
+function warpErrorText(res) {
+  const r = res || {};
+  const code = r.code && t('warp.err.' + r.code) !== 'warp.err.' + r.code ? r.code : 'failed';
+  const msg = String(r.detail || r.error || '').trim() || '—';
+  return t('warp.err.' + code).replace('{msg}', () => msg);
+}
+
+/** What went half right (`warp.warn.<code>`): shown with the servers made. */
+function warpWarningTexts(res) {
+  return ((res && res.warnings) || []).map((w) => {
+    const k = 'warp.warn.' + (w && w.code);
+    const msg = String((w && w.message) || '').trim() || '—';
+    return t(k) !== k ? t(k).replace('{msg}', () => msg) : msg;
+  });
+}
+
+/** A P-256 key, by a cheap look: its base64 (or PEM) holds the curve's OID. */
+function looksP256(key) {
+  const b64 = String(key == null ? '' : key).replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  if (!b64) return false;
+  try { return atob(b64).includes(P256_OID); } catch { return false; }
+}
+
+/**
+ * The account in a pasted text, read back cheaply (warp.js importWarp is the
+ * real check): usque's config.json, an Xray WARP outbound (alone, in a list or
+ * a whole config) or its warp object. null for nothing pasted.
+ */
+function warpReadImport(text) {
+  const s = String(text == null ? '' : text).trim();
+  if (!s) return null;
+  let j;
+  try { j = JSON.parse(s); } catch { return { notJson: true }; }
+  const plain = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  let key, pub, addrs;
+  if (plain(j) && (j.private_key != null || j['private-key'] != null)) {
+    key = j.private_key != null ? j.private_key : j['private-key'];
+    pub = j.endpoint_pub_key || j.public_key || j['public-key'];
+    addrs = [j.ipv4 || j.ip, j.ipv6];
+  } else {
+    const list = Array.isArray(j) ? j : plain(j) && Array.isArray(j.outbounds) ? j.outbounds : plain(j) && j.protocol ? [j] : [];
+    const ob = list.find((o) => plain(o) && o.protocol === 'masque' && plain(o.streamSettings) && plain(o.streamSettings.masqueSettings) && plain(o.streamSettings.masqueSettings.warp));
+    const w = ob ? ob.streamSettings.masqueSettings.warp : plain(j) && plain(j.warp) ? j.warp : plain(j) && j.privateKey != null ? j : null;
+    if (!w) return { noAccount: true };
+    key = w.privateKey;
+    pub = w.publicKey;
+    addrs = [].concat(w.address == null ? [] : w.address);
+  }
+  const has = (v) => String(v == null ? '' : v).trim() !== '';
+  return { key: has(key), p256: looksP256(key), pub: has(pub), addrs: addrs.filter(has).map((a) => String(a).trim()) };
+}
+
+/** The read-back chips under the pasted account. */
+function warpImportChips(text) {
+  const r = warpReadImport(text);
+  if (!r) return [];
+  if (r.notJson) return [edNode('span', { class: 'dim', text: t('warp.chipNotJson') })];
+  if (r.noAccount) return [edNode('span', { class: 'bad', text: t('warp.chipNoAccount') })];
+  return warpChips(r, true);
+}
+
+/** A step's number, in the page's digits. */
+function warpNum(n) { return window.i18n && window.i18n.lang === 'fa' ? String.fromCharCode(0x06F0 + n) : String(n); }
+
+/** One input of the dialog, as an editor field: its label and technical key, the input writing `warpForm[key]`, a hint. */
+function warpField(key, label, techKey, o) {
+  const id = 'warp-' + key;
+  const inp = edNode(o.area ? 'textarea' : 'input', {
+    class: o.area ? 'textarea ed-mono' : 'input', id, dir: 'ltr', spellcheck: 'false', autocomplete: 'off',
+    placeholder: o.ph || null, rows: o.area ? String(o.rows || 5) : null
+  });
+  inp.value = warpForm[key] || '';
+  inp.oninput = () => { warpForm[key] = inp.value; if (o.onInput) o.onInput(inp.value); };
+  return edNode('div', { class: 'ed-f' + (o.span ? ' span2' : '') }, [
+    edNode('label', { class: 'field-label', for: id }, [edNode('span', { text: t(label) }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: techKey })]),
+    inp, o.hint ? edNode('p', { class: 'hint', text: t(o.hint) }) : edNode('span')]);
+}
+
+/** A segmented choice of the dialog: a click sets `warpForm[key]` and draws it again. */
+function warpSeg(items, key) {
+  const box = edNode('div', { class: 'seg ed-seg-wide ui', role: 'radiogroup' });
+  for (const [id, label] of items) {
+    const on = warpForm[key] === id;
+    const b = edNode('button', { type: 'button', class: 'seg-btn' + (on ? ' active' : ''), role: 'radio', 'aria-checked': String(on), 'data-warp': key + ':' + id, text: label });
+    b.onclick = () => { warpForm[key] = id; renderWarp(); };
+    appendSome(box, b);
+  }
+  return box;
+}
+
+/** The form: step 1 the account (new or imported), step 2 how to connect — as the sample has them. */
+function warpFormNodes(w) {
+  const step = (n, key) => edNode('div', { class: 'warp-step-head' }, [edNode('span', { class: 'n', text: warpNum(n) }), t(key)]);
+  const one = edNode('div', { class: 'warp-step' }, [step(1, 'warp.step1'), warpSeg([['new', t('warp.wayNew')], ['import', t('warp.wayImport')]], 'way')]);
+  if (w.way === 'new') {
+    // through the app's own connection only while there is one (warp.js refuses it otherwise: notConnected)
+    const connected = !!state.connected;
+    if (!connected && w.route === 'proxy') w.route = 'direct';
+    const radio = (id, label, sub, off) => {
+      const inp = edNode('input', { type: 'radio', name: 'warpRoute', value: id, disabled: off });
+      inp.checked = w.route === id;
+      inp.onchange = () => { if (inp.checked) w.route = id; };
+      return edNode('label', { class: 'warp-radio' + (off ? ' off' : '') }, [inp, edNode('span', {}, [edNode('span', { text: label }), edNode('small', { text: sub })])]);
+    };
+    const terms = edNode('button', { type: 'button', class: 'ed-pro-link', text: t('warp.tosLink') });
+    terms.onclick = () => window.api.openExternal(WARP_TERMS_URL);
+    appendSome(one,
+      edNode('p', { class: 'hint' }, richLine(t('warp.newLede'))),
+      edNode('div', { class: 'warp-route', role: 'radiogroup' }, [
+        radio('direct', t('warp.routeDirect'), t('warp.routeDirectSub'), false),
+        radio('proxy', t('warp.routeProxy'), t(connected ? 'warp.routeProxySub' : 'warp.routeProxyOff'), !connected)]),
+      edNode('p', { class: 'hint' }, richLine(t('warp.tos'), { terms })),
+      edNode('div', { class: 'ed-grid' }, [warpField('license', 'warp.license', 'license', { ph: t('warp.licensePh'), hint: 'warp.licenseHint', span: true })]));
+  } else {
+    const chips = edNode('div', { class: 'ed-chips-read', 'aria-live': 'polite' });
+    const fill = (text) => { chips.textContent = ''; appendSome(chips, ...warpImportChips(text)); };
+    fill(w.importText);
+    appendSome(one,
+      edNode('div', { class: 'ed-grid' }, [warpField('importText', 'warp.importLabel', 'private_key · endpoint_pub_key · ipv4 · ipv6',
+        { area: true, rows: 5, ph: WARP_IMPORT_PH, hint: 'warp.importHint', span: true, onInput: fill })]),
+      chips);
+  }
+
+  const edges = w.endpoint === 'v6' ? WARP_EDGES.v6 : WARP_EDGES.v4;
+  const two = edNode('div', { class: 'warp-step' }, [step(2, 'warp.step2'),
+    httpCards(w.http, (id) => { w.http = id; renderWarp(); }, true),
+    edNode('div', { class: 'warp-ep' }, [
+      edNode('div', { class: 'field-label' }, [edNode('span', { text: t('warp.endpoint') }), ' ', edNode('span', { class: 'ed-key', dir: 'ltr', text: 'address:443' })]),
+      warpSeg([['auto', t('warp.epAuto')], ['v6', t('warp.epV6')], ['custom', t('warp.epCustom')]], 'endpoint'),
+      edNode('p', { class: 'hint' }, richLine(t(w.endpoint === 'v6' ? 'warp.epV6Hint' : 'warp.epAutoHint'), { h3: edges[0], h2: edges[1] }))])]);
+  if (w.endpoint === 'custom') {
+    appendSome(two, edNode('div', { class: 'ed-grid' }, [warpField('address', 'warp.address', 'address', { ph: WARP_EDGES.v4[1], hint: 'warp.addressHint', span: true })]));
+  }
+  const sw = edNode('input', { type: 'checkbox', id: 'warp-antiDpi' });
+  sw.checked = w.antiDpi !== false;
+  sw.onchange = () => { w.antiDpi = sw.checked; };
+  appendSome(two,
+    edNode('div', { class: 'ed-grid' }, [warpField('cover', 'warp.cover', 'serverName', { ph: t('warp.coverPh'), hint: 'warp.coverHint', span: true })]),
+    edNode('div', { class: 'ed-grid' }, [edNode('div', { class: 'ed-f span2' }, [
+      edNode('label', { class: 'ed-switch', for: 'warp-antiDpi' }, [
+        edNode('span', { class: 'switch-title' }, [edNode('span', { text: t('warp.antiDpi') }), edNode('span', { class: 'ed-key', dir: 'ltr', text: 'noise · fragment' })]),
+        edNode('span', { class: 'switch' }, [sw, edNode('span', { class: 'slider' })])]),
+      edNode('p', { class: 'hint', text: t('warp.antiDpiHint') })])]));
+
+  return [edNode('p', { class: 'warp-lede' }, richLine(t('warp.lede'))), one, two,
+    w.error ? edNode('p', { class: 'warp-error', role: 'alert', text: w.error }) : null];
+}
+
+/**
+ * The steps the call goes through — a new account's five (six with a WARP+
+ * key), an imported one's two — pending while it runs, done when it answers;
+ * a step Cloudflare left half done (a warning) says so.
+ */
+function warpProgressNodes(w) {
+  const a = w.args || warpArgs(w);
+  const res = w.phase === 'done' ? w.res : null;
+  const warned = new Set(((res && res.warnings) || []).map((x) => x && x.code));
+  const added = res && Array.isArray(res.added) ? res.added : null;
+  const steps = a.mode === 'import'
+    ? [['warp.pRead', 'usque · Xray']]
+    : [['warp.pKey', t('warp.pKeyAt'), 'ui'], ['warp.pReg', 'api.cloudflareclient.com'], ['warp.pEnroll', 'secp256r1'], ['warp.pEnable', 'warp_enabled', '', 'warpNotEnabled']]
+      .concat(a.license ? [['warp.pLicense', 'license', '', 'licenseFailed']] : []);
+  const two = added ? added.length > 1 : a.http === 'both';
+  steps.push([!added ? 'warp.pAdd' : two ? 'warp.pAddedTwo' : 'warp.pAddedOne',
+    added ? added.map((s) => s.name).join(' / ') : (two ? 'WARP · H3 / WARP · H2' : 'WARP · ' + String(a.http).toUpperCase())]);
+  const list = edNode('ul', { class: 'warp-progress', role: 'status', 'aria-busy': res ? 'false' : 'true' });
+  for (const [key, k, kcls, warn] of steps) {
+    const mark = !res ? edNode('span', { class: 'run', text: '◌' }) : warned.has(warn) ? edNode('span', { class: 'warn', text: '!' }) : edNode('span', { class: 'ok', text: '✓' });
+    // the technical part at the far end: the span keeps the page's direction (its margin is the line's), the value inside is left-to-right
+    appendSome(list, edNode('li', {}, [mark, ' ', t(key), edNode('span', { class: 'k' + (kcls ? ' ' + kcls : '') }, kcls ? k : [edNode('bdi', { dir: 'ltr', text: k })])]));
+  }
+  const out = [list];
+  if (res) {
+    out.push(edNode('p', { class: 'warp-lede' }, richLine(t(two ? 'warp.doneLede' : 'warp.doneLedeOne'))));
+    for (const text of warpWarningTexts(res)) out.push(edNode('p', { class: 'ed-warn', role: 'alert', text }));
+  }
+  return out;
+}
+
+/** The dialog's foot: Make (Add, for an import), Cancel and how many servers — or, when done, see them in the list. */
+function warpFootNodes(w) {
+  if (w.phase === 'done') {
+    const see = edNode('button', { type: 'button', class: 'btn primary', id: 'warpSee', text: t('warp.see') });
+    see.onclick = warpSeeInList;
+    const close = edNode('button', { type: 'button', class: 'btn ghost', text: t('tb.close') });
+    close.onclick = closeWarp;
+    return [see, close];
+  }
+  const running = w.phase === 'running';
+  const go = edNode('button', { type: 'button', class: 'btn primary', id: 'warpGo', disabled: running,
+    text: running ? t('warp.working') : t(w.way === 'import' ? 'warp.add' : 'warp.make') });
+  go.onclick = runWarp;
+  const cancel = edNode('button', { type: 'button', class: 'btn ghost', text: t('btn.cancel') });
+  cancel.onclick = closeWarp;
+  return [go, cancel, edNode('span', { class: 'ed-foot-note', text: t(w.http === 'both' ? 'warp.noteTwo' : 'warp.noteOne') })];
+}
+
+/** Draw the dialog from `warpForm`. */
+function renderWarp() {
+  const body = $('#warpBody');
+  const foot = $('#warpFoot');
+  if (!body || !foot || !warpForm) return;
+  body.textContent = '';
+  foot.textContent = '';
+  appendSome(body, ...(warpForm.phase === 'form' ? warpFormNodes(warpForm) : warpProgressNodes(warpForm)));
+  appendSome(foot, ...warpFootNodes(warpForm));
+}
+
+/**
+ * Make (or add): api.addWarp with the dialog's choices. A refusal goes back to
+ * the form with its reason; the servers made join the list at once. Closed
+ * meanwhile, the dialog says how it ended in a toast instead.
+ */
+async function runWarp() {
+  const w = warpForm;
+  if (!w || w.phase === 'running') return;
+  w.args = warpArgs(w);
+  w.phase = 'running';
+  w.error = '';
+  renderWarp();
+  let res;
+  try { res = await window.api.addWarp(w.args); } catch (e) { res = { ok: false, code: 'failed', error: (e && e.message) || String(e) }; }
+  if (!res || !res.ok) {
+    w.phase = 'form';
+    w.error = warpErrorText(res);
+    if (warpForm === w && warpShown()) renderWarp(); else toast(w.error, 'err');
+    return;
+  }
+  w.phase = 'done';
+  w.res = res;
+  if (Array.isArray(res.servers)) state.servers = res.servers;
+  const added = Array.isArray(res.added) ? res.added : [];
+  if (!state.selectedServerId && added[0]) state.selectedServerId = added[0].id;
+  renderServers(); renderPicker(); renderChains(); renderPool(); renderAdvanced();
+  if (warpForm === w && warpShown()) renderWarp();
+  else toast(t('t.warpAdded').replace('{names}', () => added.map((s) => s.name).join('، ')), 'ok');
+}
+
+/** Done: the list, its first new server selected and scrolled to (its group unfolded). */
+function warpSeeInList() {
+  const added = (warpForm && warpForm.res && warpForm.res.added) || [];
+  closeWarp();
+  showView('servers');
+  const first = added[0] && srvById(added[0].id);
+  if (!first) return;
+  const key = groupKey(first.subId);
+  if (foldedGroups.has(key)) { setGroupFolded(key, false); renderServers(); }
+  selectServer(first.id);
+  const card = $$('#serverList .server-card').find((c) => c.dataset.srvId === first.id);
+  if (card && card.scrollIntoView) card.scrollIntoView({ block: 'center' });
+}
+
+$('#btnWarpOpen').onclick = openWarp;
+$('#warpClose').onclick = closeWarp;
+$('#warpModal').onclick = (e) => { if (e.target === $('#warpModal')) closeWarp(); };
+// the dot on the button until the dialog has been opened once
+try { if (!localStorage.getItem(WARP_SEEN_KEY)) $('#btnWarpOpen').classList.add('is-new'); } catch { /* no dot without storage */ }
+
 /* ----------------------------- SOCKS / HTTP proxy add ----------------------------- */
 $('#btnProxyOpen').onclick = () => {
   const box = $('#proxyBox');
@@ -3286,10 +5955,15 @@ function renderChains() {
     chain.members = (chain.members || []).filter(srvById);
     const card = document.createElement('div');
     card.className = 'card chain-card';
+    card.dataset.chainId = chain.id;   // the routing page's flow tree opens a chain by it
 
     const tl = pingResultLabel((state.pings[chain.id] || {}).tcp);
     const rl = pingResultLabel((state.pings[chain.id] || {}).real);
     const ready = chain.members.length >= 2;
+    // its share link comes with routing profiles (the same back end writes both)
+    const share = Array.isArray(state.profiles)
+      ? `<button class="icon-btn ch-share" title="${escapeHtml(t('rp.copyLink'))}" aria-label="${escapeHtml(t('rp.copyLink'))}"${ready ? '' : ' disabled'}>🔗</button>`
+      : '';
 
     card.innerHTML = `
       <div class="chain-card-head">
@@ -3303,6 +5977,7 @@ function renderChains() {
         <div class="chain-card-actions">
           <button class="icon-btn ch-ping" title="ping">⚡</button>
           <button class="icon-btn ch-connect" title="connect"${ready ? '' : ' disabled'}>▶</button>
+          ${share}
           <button class="icon-btn ch-del" title="delete">🗑</button>
         </div>
       </div>
@@ -3324,7 +5999,9 @@ function renderChains() {
 
     // actions
     card.querySelector('.ch-ping').onclick = () => pingServer(chain.id);
-    card.querySelector('.ch-connect').onclick = () => { if (ready) connect(chain.id); };
+    connectGlyph(card.querySelector('.ch-connect')).onclick = () => { if (ready) connect(chain.id); };
+    const shareBtn = card.querySelector('.ch-share');
+    if (shareBtn) shareBtn.onclick = () => { if (ready) shareRouting('chain', chain.id); };
     card.querySelector('.ch-del').onclick = () => {
       state.chains = state.chains.filter(c => c.id !== chain.id);
       if (state.selectedServerId === chain.id) state.selectedServerId = null;
@@ -3456,6 +6133,7 @@ $('#btnAddPool').onclick = () => {
 };
 
 $('#btnPoolConnect').onclick = () => {
+  if (state.connecting) return cancelConnect();
   if (!poolReady()) return toast(t('pool.needOne'), 'err');
   connect(POOL_ID);
 };
@@ -3575,6 +6253,19 @@ function targetOptionList() {
   for (const c of state.chains) if (chainReady(c)) opts.push({ value: 'chain:' + c.id, label: '⛓ ' + c.name });
   opts.push({ value: 'direct', label: t('adv.direct') });
   opts.push({ value: 'block', label: t('adv.block') });
+  return opts;
+}
+
+/**
+ * A routing profile's target picker: "⚓ exit at the base" first while it has a
+ * base (or while `current` already is it — then said as broken), then every
+ * server, ready chain, direct and block.
+ */
+function profileTargetOptions(prof, current) {
+  const opts = targetOptionList();
+  if (!prof) return opts;
+  if (prof.base) opts.unshift({ value: TARGET_BASE, label: '⚓ ' + t('rp.exitAtBase').replace('{base}', () => refName(prof.base)) });
+  else if (current === TARGET_BASE) opts.unshift({ value: TARGET_BASE, label: '⚠ ' + t('rp.exitAtBaseNone') });
   return opts;
 }
 
@@ -3711,8 +6402,9 @@ function renderDefaultSuggest() {
   const defRow = body && body.querySelector('.adv-default');
   if (!defRow) return;
   body.querySelectorAll('.adv-suggest-default').forEach(n => n.remove());
-  const def = state.settings.routeDefault || (state.servers[0] && state.servers[0].id) || 'direct';
-  const el = wgSuggestEl(wgOfTarget(def), {});
+  const prof = Array.isArray(state.profiles) ? advDraft() : null;
+  const def = (prof ? prof.def : state.settings.routeDefault) || (state.servers[0] && state.servers[0].id) || 'direct';
+  const el = wgSuggestEl(wgOfTarget(prof ? atBase(def, prof) : def), {});
   if (!el) return;
   el.classList.add('adv-suggest-default');
   defRow.insertAdjacentElement('afterend', el);
@@ -3728,11 +6420,17 @@ function renderAdvanced() {
   optAdv.checked = !!state.settings.advancedRouting;
   if (body) body.hidden = !state.settings.advancedRouting;
 
+  // Routing profiles: the list, and the draft of the one being edited (its rule
+  // edits wait for Save, as today's did). null on a back end without them —
+  // then everything below is today's single advanced routing.
+  const prof = Array.isArray(state.profiles) ? advDraft() : null;
+  renderProfileBar();
+
   // "…and apply the routing mode too": show which mode that currently is, so
   // the switch is not a promise the user has to go and verify somewhere else.
   const useMode = $('#optAdvUseMode');
   if (useMode) {
-    useMode.checked = !!state.settings.advancedUseMode;
+    useMode.checked = prof ? !!prof.useMode : !!state.settings.advancedUseMode;
     const now = $('#advUseModeNow');
     if (now) {
       const mode = state.settings.routingMode || 'global';
@@ -3746,7 +6444,8 @@ function renderAdvanced() {
   const simple = $('#simpleRulesCard');
   if (simple) simple.hidden = !!state.settings.advancedRouting;
 
-  const rules = state.settings.routeRules || [];
+  // (profiles but none at all: the editor is hidden, and there is nothing to list)
+  const rules = prof ? prof.rules : Array.isArray(state.profiles) ? [] : (state.settings.routeRules || []);
   wrap.innerHTML = '';
   if (!rules.length) {
     wrap.innerHTML = `<div class="empty small">${escapeHtml(t('adv.empty'))}</div>`;
@@ -3756,6 +6455,12 @@ function renderAdvanced() {
     if (r.type === 'process') hasProc = true;
     const row = document.createElement('div');
     row.className = 'adv-rule';
+    row.dataset.idx = String(idx);   // the flow tree's rule nodes open their row by it
+    // a profile's proxy target can dial through a base: its "via" picker
+    const viaOn = !!prof && !takesNoVia(r.target);
+    const viaCell = viaOn
+      ? `<span class="adv-via"><span class="adv-via-label">${escapeHtml(t('rp.via'))}</span><span class="adv-via-mount"></span></span>`
+      : '';
     const typeOpts = RULE_TYPES.map(tp =>
       `<option value="${tp}"${tp === r.type ? ' selected' : ''}>${escapeHtml(t('adv.type.' + tp))}</option>`).join('');
     // process rules use a dropdown of running processes; ip/domain get a
@@ -3771,6 +6476,7 @@ function renderAdvanced() {
       ${valueCell}
       <span class="adv-arrow">→</span>
       <span class="adv-target-mount"></span>
+      ${viaCell}
       <button class="icon-btn adv-del" title="remove">🗑</button>`;
     row.querySelector('.adv-type').onchange = (e) => {
       rules[idx].type = e.target.value;
@@ -3778,24 +6484,40 @@ function renderAdvanced() {
       else renderAdvanced();
     };
     const valEl = row.querySelector('.adv-value');
-    if (r.type === 'process') valEl.onchange = (e) => { rules[idx].value = e.target.value; };
-    else valEl.oninput = (e) => { rules[idx].value = e.target.value; };
+    // the flow tree follows the value as it is typed (its rules are the draft)
+    if (r.type === 'process') valEl.onchange = (e) => { rules[idx].value = e.target.value; if (prof) renderFlowSoon(); };
+    else valEl.oninput = (e) => { rules[idx].value = e.target.value; if (prof) renderFlowSoon(); };
     const refresh = row.querySelector('.adv-proc-refresh');
     if (refresh) refresh.onclick = () => loadProcList();
     // searchable target dropdown (handles long config lists)
     row.querySelector('.adv-target-mount').appendChild(
       makeSearchSelect({
-        options: targetOptionList(), value: r.target,
+        options: profileTargetOptions(prof, r.target), value: r.target,
         // re-render so the AllowedIPs note follows the new target (the dropdown
         // has already closed itself by the time onChange runs)
         onChange: (v) => { rules[idx].target = v; renderAdvanced(); }
       })
     );
+    if (viaOn) {
+      row.querySelector('.adv-via-mount').appendChild(makeSearchSelect({
+        options: viaOptionList(prof, r.target), value: r.via || 'inherit',
+        onChange: (v) => { rules[idx].via = v; renderAdvanced(); }
+      }));
+    }
     row.querySelector('.adv-del').onclick = () => { rules.splice(idx, 1); renderAdvanced(); };
     wrap.appendChild(row);
+    // a target or a base that is gone: the rule says so, in the danger colour
+    const why = prof ? ruleProblem(r, prof) : '';
+    if (why) {
+      row.classList.add('danger');
+      const warn = document.createElement('div');
+      warn.className = 'adv-warn';
+      warn.textContent = '⚠ ' + t(why);
+      wrap.appendChild(warn);
+    }
     // when the target ends in a WireGuard, offer its ranges and say where its
     // internal names resolve
-    const sug = wgSuggestEl(wgOfTarget(r.target), {
+    const sug = wgSuggestEl(wgOfTarget(prof ? atBase(r.target, prof) : r.target), {
       value: r.value,
       onUse: (list) => { rules[idx].type = 'ip'; rules[idx].value = list; renderAdvanced(); }
     });
@@ -3803,14 +6525,21 @@ function renderAdvanced() {
   });
 
   // default target — searchable dropdown
-  const def = state.settings.routeDefault || (state.servers[0] && state.servers[0].id) || 'direct';
+  const def = (prof ? prof.def : state.settings.routeDefault) || (state.servers[0] && state.servers[0].id) || 'direct';
   defMount.innerHTML = '';
   advDefaultSel = makeSearchSelect({
-    options: targetOptionList(), value: def,
-    onChange: (v) => { state.settings.routeDefault = v; renderDefaultSuggest(); }
+    options: profileTargetOptions(prof, def), value: def,
+    onChange: (v) => {
+      if (prof) { prof.def = v; renderProfileExtras(); renderFlowTree(); }
+      else state.settings.routeDefault = v;
+      renderDefaultSuggest();
+    }
   });
   defMount.appendChild(advDefaultSel);
   renderDefaultSuggest();
+  // a profile's default via and its base sit next to the default target
+  renderProfileExtras();
+  renderFlowTree();
 
   // process-routing options panel (only when a process rule exists)
   const procOpts = $('#procOpts');
@@ -3824,11 +6553,14 @@ function renderAdvanced() {
 $('#optAdvanced').onchange = async () => {
   const on = $('#optAdvanced').checked;
   const extra = { advancedRouting: on };
+  const seed = (state.servers[0] && state.servers[0].id) || 'direct';
   // Seed a default target so the 🧭 entry is immediately usable on the home page.
-  if (on && !state.settings.routeDefault) {
-    extra.routeDefault = (state.servers[0] && state.servers[0].id) || 'direct';
-  }
+  if (on && !Array.isArray(state.profiles) && !state.settings.routeDefault) extra.routeDefault = seed;
   await saveSettings(extra);
+  // …with profiles: the first one, when none of them could be connected yet
+  if (on && Array.isArray(state.profiles) && state.profiles[0] && !state.profiles.some(profileReady)) {
+    await patchProfile(state.profiles[0].id, { def: seed });
+  }
   renderAdvanced();
   renderPicker();
   toast(on ? t('t.advOn') : t('t.advOff'), 'ok');
@@ -3836,15 +6568,19 @@ $('#optAdvanced').onchange = async () => {
 
 // Saved on its own rather than with the Save button: it changes nothing about
 // the rules, and leaving it pending would make the mode note lie about what the
-// next connect will do.
+// next connect will do. With profiles it is the edited profile's own.
 $('#optAdvUseMode').onchange = async () => {
-  await saveSettings({ advancedUseMode: $('#optAdvUseMode').checked });
+  const on = $('#optAdvUseMode').checked;
+  const prof = Array.isArray(state.profiles) ? advDraft() : null;
+  if (prof) await patchProfile(prof.id, { useMode: on });
+  else await saveSettings({ advancedUseMode: on });
   updateGuardRows();   // a country bypass under the rules is a direct route too
   renderAdvanced();
 };
 
 $('#btnAddRule').onclick = () => {
-  const rules = state.settings.routeRules || (state.settings.routeRules = []);
+  const prof = Array.isArray(state.profiles) ? advDraft() : null;
+  const rules = prof ? prof.rules : (state.settings.routeRules || (state.settings.routeRules = []));
   const firstTarget = (state.servers[0] && state.servers[0].id) || 'direct';
   rules.push({ type: 'ip', value: '', target: firstTarget });
   renderAdvanced();
@@ -3862,7 +6598,9 @@ $('#btnClearProcCache').onclick = async () => {
 // load the running-process list when opening Routing (for the process picker)
 const routingNav = document.querySelector('.nav-item[data-view="routing"]');
 if (routingNav) routingNav.addEventListener('click', () => {
-  if ((state.settings.routeRules || []).some(r => r && r.type === 'process')) loadProcList();
+  if (advPlans().some(p => (p.rules || []).some(r => r && r.type === 'process'))) loadProcList();
+  // the flow tree was drawn while the page was hidden: its lines need the real boxes
+  drawFlowSoon();
 });
 
 /**
@@ -3884,6 +6622,20 @@ async function warnAboutGeoCodes(rules) {
 }
 
 $('#btnSaveAdv').onclick = async () => {
+  // a routing profile: its draft becomes the saved profile (routing:setProfiles)
+  if (Array.isArray(state.profiles)) {
+    const rules = await saveProfileDraft();
+    if (!rules) return;
+    if ($('#optAdvanced').checked !== !!state.settings.advancedRouting) await saveSettings({ advancedRouting: $('#optAdvanced').checked });
+    updateGuardRows();
+    renderAdvanced();
+    renderPicker();
+    $('#advSavedHint').textContent = t('saved');
+    setTimeout(() => ($('#advSavedHint').textContent = ''), 1800);
+    toast(t('t.advSaved') + ' (' + rules.length + ')', 'ok');
+    await warnAboutGeoCodes(rules);
+    return;
+  }
   // collect from current state (kept in sync by the row handlers) + default select
   const rules = (state.settings.routeRules || [])
     .map(r => ({ type: r.type, value: (r.value || '').trim(), target: r.target }))
@@ -3903,6 +6655,1031 @@ $('#btnSaveAdv').onclick = async () => {
   toast(t('t.advSaved') + ' (' + rules.length + ')', 'ok');
   await warnAboutGeoCodes(rules);
 };
+
+/* ----------------------------- routing profiles ----------------------------- */
+// Several advanced routings ("profiles"), each with its own rules, default and
+// an optional base that its proxy targets dial through. The list is the main
+// process's (routing:profiles). On a back end without it state.profiles stays
+// null, and every function here leaves today's single advanced routing as it was.
+
+/** The profile a selection connects: '__advanced__' = the first, '__advanced__:<id>' = that one; null otherwise or without profiles. */
+function profileOfSel(id) {
+  if (!Array.isArray(state.profiles) || id == null) return null;
+  if (id === ADV_ID) return state.profiles[0] || null;
+  const s = String(id);
+  if (!s.startsWith(ADV_ID + ':')) return null;
+  const pid = s.slice(ADV_ID.length + 1);
+  return state.profiles.find(p => p.id === pid) || null;
+}
+
+/** A profile the home picker offers: it has rules or a default. */
+function profileReady(p) { return !!p && ((p.rules || []).length > 0 || !!p.def); }
+
+/** The name an advanced-routing selection goes by: its profile's, else "Advanced routing". */
+function advSelName(id) {
+  const p = profileOfSel(id);
+  return (p && p.name) || t('picker.advanced');
+}
+
+/** Everything advanced routing holds: the profiles, or today's settings as one. */
+function advPlans() {
+  if (Array.isArray(state.profiles)) return state.profiles;
+  const s = state.settings || {};
+  return [{ rules: s.routeRules || [], def: s.routeDefault, useMode: !!s.advancedUseMode }];
+}
+
+/** A target that ends where it is: direct, block (or none at all). */
+function terminalTarget(tg) { return !tg || tg === 'direct' || tg === 'block'; }
+
+/** A target that never rides on a base: direct, block, none — and the base itself ("exit at the base"). */
+function takesNoVia(tg) { return terminalTarget(tg) || tg === TARGET_BASE; }
+
+/** What a target dials: "exit at the base" is the profile's base (null without one); anything else is itself. */
+function atBase(tg, prof) { return tg === TARGET_BASE ? ((prof && prof.base) || null) : tg; }
+
+/**
+ * A profile as the renderer keeps it: { id, name, rules, def, defVia, useMode,
+ * base } (anything else the back end sent rides along untouched). A via is
+ * kept only where it means something — on a proxy target, and not 'inherit',
+ * which is what a missing one says — so a saved profile and its draft compare
+ * equal however either was written.
+ */
+function normalizeUiProfile(p) {
+  const src = (p && typeof p === 'object') ? p : {};
+  const rules = (Array.isArray(src.rules) ? src.rules : []).filter(r => r && typeof r === 'object').map((r) => {
+    const out = { type: r.type, value: r.value == null ? '' : String(r.value), target: r.target ? String(r.target) : '' };
+    if (!takesNoVia(out.target) && r.via && r.via !== 'inherit') out.via = String(r.via);
+    return out;
+  });
+  const def = src.def ? String(src.def) : '';
+  return Object.assign({}, src, {
+    id: String(src.id || ''),
+    name: String(src.name || ''),
+    rules,
+    def,
+    defVia: !takesNoVia(def) && src.defVia && src.defVia !== 'inherit' ? String(src.defVia) : 'inherit',
+    useMode: !!src.useMode,
+    base: src.base ? String(src.base) : null
+  });
+}
+
+/**
+ * The profiles, from init's data when main sends them there, else asked for.
+ * null when the back end has none: the bridge is missing, or its handler is
+ * (Electron's "No handler registered", the service's "unknown channel").
+ */
+async function loadRoutingProfiles(data) {
+  if (data && Array.isArray(data.routingProfiles)) return data.routingProfiles.map(normalizeUiProfile);
+  if (!window.api || typeof window.api.routingProfiles !== 'function') return null;
+  try {
+    const res = await window.api.routingProfiles();
+    const list = Array.isArray(res) ? res : (res && res.profiles);
+    return Array.isArray(list) ? list.map(normalizeUiProfile) : null;
+  } catch { return null; }
+}
+
+function newProfileId() { return 'rp-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+/** `name`, or "name (2)", "name (3)"… — the first that no other profile (but `exceptId`) goes by. */
+function uniqueProfileName(name, exceptId) {
+  const want = String(name || '').trim() || t('picker.advanced');
+  const taken = new Set((state.profiles || []).filter(p => p.id !== exceptId).map(p => p.name));
+  if (!taken.has(want)) return want;
+  const stem = want.replace(/ \(\d+\)$/, '');
+  for (let n = 2; ; n++) {
+    const next = `${stem} (${n})`;
+    if (!taken.has(next)) return next;
+  }
+}
+
+/* The draft: the profile being edited. Its rules, default, default via and
+   base wait for Save, as today's rule edits do; its name and "apply the
+   routing mode too" are saved the moment they change. */
+let rpDraft = null;
+
+/** The draft of the profile the routing page edits (the first when none is chosen); null without profiles. */
+function advDraft() {
+  if (!Array.isArray(state.profiles)) return null;
+  let p = state.profiles.find(x => x.id === state.profileSel);
+  if (!p) { p = state.profiles[0] || null; state.profileSel = p ? p.id : null; }
+  if (!p) { rpDraft = null; return null; }
+  if (!rpDraft || rpDraft.id !== p.id) rpDraft = normalizeUiProfile(JSON.parse(JSON.stringify(p)));
+  return rpDraft;
+}
+
+/** What Save writes of a profile. */
+function draftKey(p) {
+  const n = normalizeUiProfile(p);
+  return JSON.stringify([n.rules, n.def, n.defVia, n.base]);
+}
+
+/** Whether the draft holds edits that are not saved. */
+function draftDirty() {
+  if (!rpDraft || !Array.isArray(state.profiles)) return false;
+  const saved = state.profiles.find(p => p.id === rpDraft.id);
+  return !!saved && draftKey(rpDraft) !== draftKey(saved);
+}
+
+/** Leave the draft: at once when nothing in it is unsaved, else only once the user says so. */
+function confirmDiscardDraft() {
+  return !draftDirty() || window.confirm(t('rp.discard'));
+}
+
+/**
+ * The base a rule's target dials through — the default's too, as { target:
+ * def, via: defVia }: its own via, else ('inherit') the profile's base. None
+ * for 'none', for direct and block, and for a target that IS that base
+ * ("exit at the base", or the base's own server or chain).
+ */
+function ruleVia(r, prof) {
+  const target = r && r.target;
+  if (takesNoVia(target)) return null;
+  const v = r.via;
+  const via = !v || v === 'inherit' ? ((prof && prof.base) || null) : (v === 'none' ? null : v);
+  return via && via !== target ? via : null;
+}
+
+/**
+ * Why a target or a base cannot be dialled — an i18n key, '' when it can: a
+ * server gone, a chain gone or short; "exit at the base" of a profile (`prof`)
+ * without a base, or whose base is gone.
+ */
+function refProblem(ref, prof) {
+  if (ref === TARGET_BASE) {
+    const base = prof && prof.base;
+    return !base ? 'rp.why.noBase' : refProblem(base) ? 'rp.why.baseGone' : '';
+  }
+  if (terminalTarget(ref)) return '';
+  if (String(ref).startsWith('chain:')) return chainReady(chainById(String(ref).slice(6))) ? '' : 'rp.why.chainGone';
+  return srvById(ref) ? '' : 'rp.why.serverGone';
+}
+
+/** What is wrong with one rule of a profile ('' when nothing): its target, else the base it dials through. */
+function ruleProblem(r, prof) {
+  const own = refProblem(r && r.target, prof);
+  if (own) return own;
+  const via = ruleVia(r, prof);
+  return via && refProblem(via) ? 'rp.why.baseGone' : '';
+}
+
+/** Whether a profile could not be connected as it stands: a rule, its default or its base points at nothing. */
+function profileBroken(p) {
+  if (!p) return false;
+  if ((p.rules || []).some(r => r && String(r.value || '').trim() && ruleProblem(r, p))) return true;
+  const def = p.def || (state.servers[0] && state.servers[0].id) || 'direct';
+  return !!ruleProblem({ target: def, via: p.defVia }, p) || !!(p.base && refProblem(p.base));
+}
+
+/** The name of a server or chain reference, plain ('—' when it is gone). "Exit at the base" needs its profile (`prof`). */
+function refName(ref, prof) {
+  if (ref === TARGET_BASE) return prof && prof.base ? refName(prof.base) : '—';
+  if (String(ref).startsWith('chain:')) {
+    const c = chainById(String(ref).slice(6));
+    return c ? c.name : '—';
+  }
+  const s = srvById(ref);
+  return s ? s.name : '—';
+}
+
+/**
+ * [{value,label}] for a via picker: the profile's base (inherit, named), none,
+ * then every server and ready chain but the target itself — and the current
+ * choice when it is gone, so the picker shows it rather than a blank.
+ */
+function viaOptionList(prof, target, current) {
+  const base = prof && prof.base;
+  const opts = [
+    { value: 'inherit', label: base ? t('rp.viaInherit').replace('{base}', () => targetLabel(base)) : t('rp.viaInheritNone') },
+    { value: 'none', label: t('rp.viaNone') }
+  ];
+  for (const o of poolTargetOptions()) if (o.value !== target) opts.push(o);
+  if (current && !opts.some(o => o.value === current)) opts.push({ value: current, label: '⚠ ' + targetLabel(current) });
+  return opts;
+}
+
+/** [{value,label}] for the base picker: none, then every server and ready chain (and a gone current one). */
+function baseOptionList(current) {
+  const opts = [{ value: '', label: t('rp.baseNone') }, ...poolTargetOptions()];
+  if (current && !opts.some(o => o.value === current)) opts.push({ value: current, label: '⚠ ' + targetLabel(current) });
+  return opts;
+}
+
+/**
+ * Write the list (routing:setProfiles) and take the back end's answer as the
+ * truth. `opts.select` moves the editor to that profile, `opts.resetDraft`
+ * drops the draft (it is what was just saved). An edit of the profile that is
+ * up is saved, not live: main says so in pendingReconnect, and a key that is
+ * new there brings the same offer to reconnect a settings save does.
+ */
+async function persistProfiles(list, opts = {}) {
+  let res = null;
+  try { res = await window.api.setRoutingProfiles(list); }
+  catch (e) { res = { ok: false, error: (e && e.message) || String(e) }; }
+  if (!res || res.ok === false) {
+    toast(t('t.failed') + (res && res.error ? ': ' + res.error : ''), 'err');
+    return false;
+  }
+  const before = (state.pendingReconnect || []).slice();
+  state.profiles = (Array.isArray(res.profiles) ? res.profiles : list).map(normalizeUiProfile);
+  if (opts.select) state.profileSel = opts.select;
+  if (opts.resetDraft) rpDraft = null;
+  if (Array.isArray(res.pendingReconnect)) setPending(res.pendingReconnect);
+  afterProfilesChanged();
+  if (state.connected && (state.pendingReconnect || []).some(k => !before.includes(k))) await promptApplySettings();
+  return true;
+}
+
+/** Everything drawn from the profiles: the routing page, the picker, the home path and the guard note. */
+function afterProfilesChanged() {
+  renderAdvanced();
+  renderPicker();
+  refreshConnLabels();
+  updateGuardRows();
+}
+
+/** Change fields of a saved profile at once (its name, useMode or default), and the draft's with it. */
+async function patchProfile(id, patch) {
+  if (!Array.isArray(state.profiles)) return false;
+  const list = state.profiles.map(p => (p.id === id ? normalizeUiProfile(Object.assign({}, p, patch)) : p));
+  if (rpDraft && rpDraft.id === id) Object.assign(rpDraft, patch);
+  const ok = await persistProfiles(list);
+  if (!ok && rpDraft && rpDraft.id === id) {
+    const saved = state.profiles.find(p => p.id === id);
+    if (saved) for (const k of Object.keys(patch)) rpDraft[k] = saved[k];
+    renderAdvanced();
+  }
+  return ok;
+}
+
+/** Save: the draft's rules (the empty ones dropped), default, default via and base. Resolves to the saved rules, or null. */
+async function saveProfileDraft() {
+  const d = Array.isArray(state.profiles) ? advDraft() : null;
+  if (!d) return null;
+  const rules = d.rules
+    .map(r => Object.assign({ type: r.type, value: String(r.value || '').trim(), target: r.target }, r.via ? { via: r.via } : {}))
+    .filter(r => r.value && r.target);
+  const def = (advDefaultSel && advDefaultSel.getValue()) || d.def;
+  const useMode = $('#optAdvUseMode') ? !!$('#optAdvUseMode').checked : !!d.useMode;
+  const next = normalizeUiProfile(Object.assign({}, d, { rules, def, useMode }));
+  const list = state.profiles.map(p => (p.id === d.id ? next : p));
+  return (await persistProfiles(list, { resetDraft: true })) ? next.rules : null;
+}
+
+async function addProfile() {
+  if (!Array.isArray(state.profiles) || !confirmDiscardDraft()) return;
+  const p = normalizeUiProfile({
+    id: newProfileId(),
+    name: uniqueProfileName(t('rp.newName').replace('{n}', state.profiles.length + 1)),
+    rules: [], def: (state.servers[0] && state.servers[0].id) || 'direct', defVia: 'inherit', useMode: false, base: null
+  });
+  await persistProfiles([...state.profiles, p], { select: p.id, resetDraft: true });
+}
+
+async function renameProfile(id, name) {
+  const p = (state.profiles || []).find(x => x.id === id);
+  const clean = String(name || '').trim();
+  if (!p || !clean || clean === p.name) { renderProfileBar(); return; }
+  await patchProfile(id, { name: uniqueProfileName(clean, id) });
+  // the field still has focus, so the redraw left it alone: show the name it got ("Work (2)")
+  const saved = (state.profiles || []).find(x => x.id === id);
+  const field = $('#rpName');
+  if (saved && field && state.profileSel === id) field.value = saved.name;
+}
+
+/** A copy of the saved profile, named "<name> (2)", right after it — and edited next. */
+async function duplicateProfile(id) {
+  const p = (state.profiles || []).find(x => x.id === id);
+  if (!p || !confirmDiscardDraft()) return;
+  const copy = normalizeUiProfile(Object.assign(JSON.parse(JSON.stringify(p)), { id: newProfileId(), name: uniqueProfileName(p.name) }));
+  const list = state.profiles.slice();
+  list.splice(list.indexOf(p) + 1, 0, copy);
+  await persistProfiles(list, { select: copy.id, resetDraft: true });
+}
+
+async function deleteProfile(id) {
+  const p = (state.profiles || []).find(x => x.id === id);
+  if (!p) return;
+  if (state.profiles.length <= 1) { toast(t('rp.lastOne'), 'warn'); return; }
+  if (!window.confirm(t('rp.confirmDelete').replace('{name}', () => p.name))) return;
+  const list = state.profiles.filter(x => x.id !== id);
+  await persistProfiles(list, { select: list[0].id, resetDraft: true });
+}
+
+/** The default profile is the first: what plain '__advanced__' (LuCI, an older selection) connects. */
+async function makeDefaultProfile(id) {
+  const p = (state.profiles || []).find(x => x.id === id);
+  if (!p || state.profiles[0] === p) return;
+  await persistProfiles([p, ...state.profiles.filter(x => x !== p)]);
+}
+
+function selectProfileForEdit(id) {
+  if (id === state.profileSel || !confirmDiscardDraft()) return;
+  state.profileSel = id;
+  rpDraft = null;
+  renderAdvanced();
+}
+
+/** A <span> of `cls` holding `text`, appended to `parent`. */
+function spanIn(parent, cls, text) {
+  const s = document.createElement('span');
+  s.className = cls;
+  s.textContent = text;
+  parent.appendChild(s);
+  return s;
+}
+
+/** The profile list (tabs: ★ the default, ● the one up, the danger colour for one that points at nothing) and the edited one's head. */
+function renderProfileBar() {
+  const bar = $('#rpBar');
+  const list = $('#rpList');
+  const head = $('#rpHead');
+  if (!bar || !list || !head) return;
+  const on = Array.isArray(state.profiles);
+  const prof = on ? advDraft() : null;
+  bar.hidden = !on;
+  head.hidden = !prof;
+  const empty = $('#rpEmpty');
+  if (empty) empty.hidden = !on || !!prof;
+  const editor = $('#advEditor');
+  if (editor) editor.hidden = on && !prof;
+  list.innerHTML = '';
+  if (!on) return;
+  list.setAttribute('aria-label', t('rp.listLabel'));
+  state.profiles.forEach((p, i) => {
+    const active = !!prof && p.id === prof.id;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'rp-tab' + (active ? ' active' : '') + (profileBroken(p) ? ' danger' : '');
+    b.dataset.id = p.id;
+    b.setAttribute('role', 'tab');
+    b.setAttribute('aria-selected', active ? 'true' : 'false');
+    spanIn(b, 'rp-tab-ico', '🧭');
+    spanIn(b, 'rp-tab-name', p.name || t('picker.advanced'));
+    if (i === 0) spanIn(b, 'rp-tab-def', '★').title = t('rp.isDefault');
+    if (profileLive(p.id)) spanIn(b, 'rp-tab-live', '●').title = t('rp.flowLive');
+    b.onclick = () => selectProfileForEdit(p.id);
+    list.appendChild(b);
+  });
+  if (!prof) return;
+  const saved = state.profiles.find(p => p.id === prof.id) || prof;
+  const nameIn = $('#rpName');
+  if (nameIn && document.activeElement !== nameIn) nameIn.value = saved.name;
+  const isDefault = state.profiles[0] === saved;
+  $('#rpDefBadge').hidden = !isDefault;
+  $('#btnRpDefault').hidden = isDefault;
+  for (const [sel, key] of [['#btnRpDup', 'rp.duplicate'], ['#btnRpShare', 'rp.copyLink'], ['#btnRpDel', 'rp.delete']]) {
+    const el = $(sel);
+    el.title = t(key);
+    el.setAttribute('aria-label', t(key));
+  }
+  const del = $('#btnRpDel');
+  del.disabled = state.profiles.length <= 1;
+  if (del.disabled) del.title = t('rp.lastOne');
+}
+
+/** Next to the default target: its via picker (a proxy default only) and the profile's base picker. */
+function renderProfileExtras() {
+  const viaWrap = $('#advDefVia');
+  const viaMount = $('#advDefViaMount');
+  const baseRow = $('#advBaseRow');
+  const baseMount = $('#advBaseMount');
+  if (!viaWrap || !viaMount || !baseRow || !baseMount) return;
+  const prof = Array.isArray(state.profiles) ? advDraft() : null;
+  viaMount.innerHTML = '';
+  baseMount.innerHTML = '';
+  baseRow.hidden = !prof;
+  const def = prof ? ((advDefaultSel && advDefaultSel.getValue()) || prof.def) : '';
+  viaWrap.hidden = !prof || takesNoVia(def);
+  const why = $('#advBaseWhy');
+  if (!prof) { if (why) why.hidden = true; return; }
+  if (!takesNoVia(def)) {
+    viaMount.appendChild(makeSearchSelect({
+      options: viaOptionList(prof, def, prof.defVia), value: prof.defVia || 'inherit',
+      onChange: (v) => { prof.defVia = v; renderFlowTree(); }
+    }));
+  }
+  baseMount.appendChild(makeSearchSelect({
+    options: baseOptionList(prof.base), value: prof.base || '',
+    // every "inherit" label and every rule's danger note follow the base
+    onChange: (v) => { prof.base = v || null; renderAdvanced(); }
+  }));
+  const k = prof.base ? refProblem(prof.base) : '';
+  if (why) {
+    why.hidden = !k;
+    why.textContent = k ? '⚠ ' + t('rp.why.baseGone') : '';
+  }
+}
+
+/* ------------------------- the flow tree (rules → bases → targets) ------------------------- */
+
+/** The glyph of a rule type in the flow tree. */
+function ruleTypeIcon(type) {
+  return type === 'ip' ? '📍' : type === 'port' ? '🔌' : type === 'process' ? '⚙' : '🌐';
+}
+
+/** A group's values, short: the first two, how many more, and all of them (the tooltip). */
+function ruleSummary(items) {
+  const all = [];
+  for (const it of items || []) {
+    for (const v of String((it && it.value) || '').split(',')) {
+      const s = v.trim();
+      if (s) all.push(s);
+    }
+  }
+  return { text: all.slice(0, 2).join(', '), more: Math.max(0, all.length - 2), full: all.join(', ') };
+}
+
+/**
+ * The rules the app lays around a profile's own (configBuilder, advanced
+ * plan), in the order the core matches them: ads → block before the user's
+ * rules (while ad blocking is on); after them the local network → direct
+ * (always), then the routing mode's country → direct when the profile
+ * applies the mode ("Iran direct"). `at`: 'before' | 'after' the user's rules.
+ */
+function appRouteRules(prof) {
+  const s = state.settings || {};
+  const out = [];
+  // without the geo files the core has no geo rule at all (configBuilder's `geo`)
+  const geo = geoReady();
+  if (s.blockAds && geo) out.push({ sys: 'ads', at: 'before', target: 'block' });
+  out.push({ sys: 'lan', at: 'after', target: 'direct' });
+  const mode = s.routingMode || 'global';
+  if (geo && prof && prof.useMode && (mode === 'bypass-ir' || mode === 'bypass-cn')) out.push({ sys: mode === 'bypass-ir' ? 'ir' : 'cn', at: 'after', target: 'direct' });
+  return out;
+}
+
+/** Are the geo files there (the geosite/geoip rules exist only with them)? Not known yet: yes. */
+function geoReady() {
+  const a = state.assets;
+  return !a || !!(a.geoip && a.geosite);
+}
+
+/** An app rule's glyph and words: [icon, label key, note key]. */
+function appRuleWords(sys) {
+  return sys === 'ads' ? ['🚫', 'rp.sys.ads', 'rp.sys.adsNote']
+    : sys === 'lan' ? ['🏠', 'rp.sys.lan', 'rp.sys.lanNote']
+    : sys === 'ir' ? ['🇮🇷', 'rp.sys.ir', 'rp.sys.modeNote']
+    : ['🇨🇳', 'rp.sys.cn', 'rp.sys.modeNote'];
+}
+
+/**
+ * A profile's flow, as data. Left to right (RTL mirrors it), the way traffic
+ * goes — from here, through a base, to where it leaves:
+ *   groups  — the rules in the order the core matches them: the app's own
+ *             (ads before the user's; the local network and the routing
+ *             mode's country after), the user's (consecutive ones to the same
+ *             target and base as one node), then the default as "everything
+ *             else";
+ *   bases   — each drawn once, between the rules and the targets: every rule
+ *             through it points at it, and it points on at each target;
+ *   targets — one node per target and base it dials through (a server used
+ *             both directly and via a base is two: two outbounds). "Exit at
+ *             the base" is the base's own exit (kind 'exit').
+ * Edges run rule → base → target, or rule → target without a base; direct and
+ * block end where they are. A target or base that is gone carries `why` (an
+ * i18n key) and its edges are danger. `tags` are the outbounds whose live
+ * counters a node shows.
+ */
+function flowModel(prof) {
+  const groups = [], targets = [], bases = [], edges = [];
+  const tIndex = {}, bIndex = {}, drawn = new Set();
+  const edge = (from, to, danger) => {
+    const k = from + '\u0000' + to;
+    if (drawn.has(k)) return;
+    drawn.add(k);
+    edges.push({ from, to, danger: !!danger });
+  };
+  const baseNode = (ref, first) => {
+    const key = 'b:' + ref;
+    if (!bIndex[key]) {
+      bIndex[key] = { key, kind: 'base', ref, why: refProblem(ref) ? 'rp.why.baseGone' : '', tags: [baseTagFor(ref)], first, into: 0 };
+      bases.push(bIndex[key]);
+    }
+    return bIndex[key];
+  };
+  const targetNode = (ref, via, first) => {
+    const key = 't:' + ref + (via ? '@' + via : '');
+    if (!tIndex[key]) {
+      const exit = ref === TARGET_BASE;
+      const base = exit ? (prof.base || null) : via;
+      const kind = exit ? 'exit' : ref === 'direct' || ref === 'block' ? ref : (String(ref).startsWith('chain:') ? 'chain' : 'server');
+      // "exit at the base" is the base's own outbound, dialled directly
+      const tags = exit ? (base ? [outboundTagFor(base)] : []) : [via ? viaTagFor(ref, via) : outboundTagFor(ref)];
+      tIndex[key] = { key, kind, ref, via: base, why: refProblem(ref, prof), tags, first };
+      targets.push(tIndex[key]);
+      if (base) {
+        const b = baseNode(base, first);
+        b.into++;
+        edge(b.key, key, !!b.why || !!tIndex[key].why);
+      }
+    }
+    return tIndex[key];
+  };
+  // a rule's line enters at the base it rides on, else at its target
+  const ruleEdge = (g, tn) => edge(g.key, tn.via ? 'b:' + tn.via : tn.key, !!tn.why || (!!tn.via && !!bIndex['b:' + tn.via].why));
+  const appRule = (r) => {
+    const tn = targetNode(r.target, null, null);
+    const g = { key: 'sys-' + r.sys, kind: 'rule', sys: r.sys, isDefault: false, idxs: [], items: [], target: r.target, via: null, to: tn.key };
+    groups.push(g);
+    ruleEdge(g, tn);
+  };
+  const app = appRouteRules(prof);
+  app.filter(r => r.at === 'before').forEach(appRule);
+  (prof.rules || []).forEach((r, idx) => {
+    // a row still being written (no value yet) does nothing — Save drops it
+    if (!r || !r.target || !String(r.value || '').trim()) return;
+    const via = ruleVia(r, prof);
+    const last = groups[groups.length - 1];
+    if (last && !last.sys && last.target === r.target && last.via === via && last.idxs[last.idxs.length - 1] === idx - 1) {
+      last.idxs.push(idx);
+      last.items.push({ type: r.type, value: r.value });
+      return;
+    }
+    const tn = targetNode(r.target, via, idx);
+    const g = { key: 'g' + idx, kind: 'rule', isDefault: false, idxs: [idx], items: [{ type: r.type, value: r.value }], target: r.target, via, to: tn.key };
+    groups.push(g);
+    ruleEdge(g, tn);
+  });
+  app.filter(r => r.at === 'after').forEach(appRule);
+  // what the builder takes when no default is set: the first server, else direct
+  const def = prof.def || (state.servers[0] && state.servers[0].id) || 'direct';
+  const dv = ruleVia({ target: def, via: prof.defVia }, prof);
+  const dt = targetNode(def, dv, 'def');
+  const dg = { key: 'def', kind: 'rule', isDefault: true, idxs: [], items: [], target: def, via: dv, to: dt.key };
+  groups.push(dg);
+  ruleEdge(dg, dt);
+  return { profileId: prof.id, groups, targets, bases, edges };
+}
+
+let rfModel = null;   // the flow tree on screen (its edges are drawn from it)
+
+/** A node of the flow tree: a real button (keyboard-reachable), keyed for its edges. */
+function flowButton(cls, key) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'rf-node ' + cls;
+  b.dataset.key = key;
+  return b;
+}
+
+/** Where a rule leads, in words: "<base> → <target>" ("exit at the base": "<base> → out from there"). */
+function flowRuleTo(g, prof) {
+  if (g.target === TARGET_BASE) {
+    return prof && prof.base ? '⚓ ' + refName(prof.base) + ' ' + flowArrow() + ' ' + t('rp.exitHere') : t('rp.exitAtBaseNone');
+  }
+  const to = g.target === 'direct' ? t('adv.direct') : g.target === 'block' ? t('adv.block') : refName(g.target);
+  return g.via ? '⚓ ' + refName(g.via) + ' ' + flowArrow() + ' ' + to : to;
+}
+
+function flowRuleNode(g, prof) {
+  const b = flowButton('rf-rule' + (g.isDefault ? ' rf-default' : '') + (g.sys ? ' rf-app' : ''), g.key);
+  const to = flowRuleTo(g, prof);
+  if (g.sys) {
+    const [icon, label, note] = appRuleWords(g.sys);
+    spanIn(b, 'rf-ico', icon);
+    spanIn(b, 'rf-label', t(label));
+    // where it comes from, on its own line: the label keeps the room it has
+    spanIn(b, 'rf-sub', t(note));
+    b.title = t(label) + ' → ' + to + ' — ' + t(note);
+  } else if (g.isDefault) {
+    spanIn(b, 'rf-ico', '↓');
+    spanIn(b, 'rf-label', t('rp.everythingElse'));
+    b.title = t('rp.everythingElse') + ' → ' + to;
+  } else {
+    const nums = g.idxs.map(i => String(i + 1).padStart(2, '0'));
+    spanIn(b, 'rf-idx', nums.length > 1 ? nums[0] + '–' + nums[nums.length - 1] : nums[0]);
+    spanIn(b, 'rf-ico', [...new Set(g.items.map(it => it.type))].map(ruleTypeIcon).join(''));
+    const sum = ruleSummary(g.items);
+    spanIn(b, 'rf-label', sum.text || '—').dir = 'ltr';
+    if (sum.more) spanIn(b, 'rf-more', '+' + sum.more);
+    b.title = sum.full + ' → ' + to;
+  }
+  // the narrow (stacked) layout has no lines: this says where the rule goes instead
+  spanIn(b, 'rf-to', flowArrow() + ' ' + to);
+  b.setAttribute('aria-label', b.title);
+  b.onclick = () => flowNodeClick(g);
+  return b;
+}
+
+/** A base or a target node: what it is, the base it is reached through, why it is broken, its live speed. */
+function flowRefNode(n) {
+  const isBase = n.kind === 'base';
+  const terminal = n.kind === 'direct' || n.kind === 'block';
+  const cls = isBase ? 'rf-base' : 'rf-target to-' + (terminal ? n.kind : n.kind === 'exit' ? 'exit' : 'proxy');
+  const b = flowButton(cls + (n.why ? ' danger' : ''), n.key);
+  const icon = isBase ? '⚓' : n.kind === 'exit' ? '🌐' : n.kind === 'direct' ? '↗' : n.kind === 'block' ? '⛔' : n.kind === 'chain' ? '⛓' : '🛡';
+  const label = n.kind === 'direct' ? t('adv.direct') : n.kind === 'block' ? t('adv.block')
+    : n.kind === 'exit' ? t('rp.exitHere') : refName(n.ref);
+  spanIn(b, 'rf-ico', icon);
+  spanIn(b, 'rf-label', label);
+  const parts = [label];
+  if (isBase) {
+    spanIn(b, 'rf-tag', t('rp.base'));
+    parts.push(t('rp.base'));
+  } else if (n.via) {
+    const via = (n.kind === 'exit' ? t('rp.fromBase') : t('rp.viaBase')).replace('{base}', () => refName(n.via));
+    spanIn(b, 'rf-sub', via);
+    parts.push(via);
+  }
+  if (n.why) {
+    spanIn(b, 'rf-why', '⚠ ' + t(n.why));
+    parts.push(t(n.why));
+  }
+  // block carries nothing worth counting
+  if (n.kind !== 'block' && n.tags.length) spanIn(b, 'rf-traffic', '').dataset.tags = n.tags.join(',');
+  b.title = parts.join(' — ');
+  b.setAttribute('aria-label', b.title);
+  b.onclick = () => flowNodeClick(n);
+  return b;
+}
+
+/** Draw the flow tree of the profile being edited — its draft, so an edit shows before it is saved. */
+function renderFlowTree() {
+  const wrap = $('#rpFlowWrap');
+  const host = $('#rpFlow');
+  if (!wrap || !host) return;
+  const prof = Array.isArray(state.profiles) ? advDraft() : null;
+  wrap.hidden = !prof;
+  host.innerHTML = '';
+  rfModel = prof ? flowModel(prof) : null;
+  if (!rfModel) return;
+  const grid = document.createElement('div');
+  grid.className = 'rf' + (rfModel.bases.length ? '' : ' no-bases');
+  const column = (cls, label) => {
+    const box = document.createElement('div');
+    box.className = 'rf-colwrap';
+    spanIn(box, 'rf-head', label);
+    const col = document.createElement('div');
+    col.className = 'rf-col ' + cls;
+    col.setAttribute('role', 'group');
+    col.setAttribute('aria-label', label);
+    box.appendChild(col);
+    grid.appendChild(box);
+    return col;
+  };
+  // in the order traffic takes them: the rule, the base it rides on, where it leaves
+  const rulesCol = column('rf-rules', t('rp.colRules'));
+  for (const g of rfModel.groups) rulesCol.appendChild(flowRuleNode(g, prof));
+  if (rfModel.bases.length) {
+    const basesCol = column('rf-bases', t('rp.colBases'));
+    for (const n of rfModel.bases) basesCol.appendChild(flowRefNode(n));
+  }
+  const targetsCol = column('rf-targets', t('rp.colTargets'));
+  for (const n of rfModel.targets) targetsCol.appendChild(flowRefNode(n));
+  // the lines: one SVG under the nodes, drawn once the boxes are laid out
+  const layer = document.createElement('div');
+  layer.className = 'rf-edges';
+  layer.setAttribute('aria-hidden', 'true');
+  grid.appendChild(layer);
+  host.appendChild(grid);
+  applyFlowTraffic(lastPerOutbound);
+  drawFlowSoon();
+}
+
+/**
+ * A click on a node opens what it stands for: a rule its row in the editor,
+ * the default its row; a server its edit form, a chain its card. Direct,
+ * block and anything gone have no editor — the rule that uses them opens, and
+ * a gone base its picker. The app's own rules open their switch (ads, the
+ * routing mode); "exit at the base" opens the base picker.
+ */
+function flowNodeClick(n) {
+  if (n.kind === 'rule' && n.sys) {
+    const ads = $('#optBlockAds');
+    if (n.sys === 'ads') return flashInto(ads && ads.closest ? ads.closest('.switch-row') : null);
+    if (n.sys === 'ir' || n.sys === 'cn') return flashInto($('#routingSeg'));
+    return undefined;
+  }
+  if (n.kind === 'rule') return focusAdvRow(n.isDefault ? null : n.idxs[0]);
+  if (n.kind === 'exit') return flashInto($('#advBaseRow'), '.ss-current');
+  const ref = n.ref;
+  if (!n.why && String(ref).startsWith('chain:')) return openChainCard(String(ref).slice(6));
+  if (!n.why && !terminalTarget(ref)) return openEdit(ref);
+  if (n.kind === 'base') return flashInto($('#advBaseRow'), '.ss-current');
+  return focusAdvRow(n.first === 'def' || n.first == null ? null : n.first);
+}
+
+/** Scroll to an element, light it up for a moment and focus `focusSel` inside it. */
+function flashInto(el, focusSel) {
+  if (!el) return;
+  if (el.scrollIntoView) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1600);
+  const f = focusSel && el.querySelector ? el.querySelector(focusSel) : null;
+  if (f && f.focus) f.focus({ preventScroll: true });
+}
+
+/** A rule's row in the editor (idx null: the default's). */
+function focusAdvRow(idx) {
+  let el = null;
+  if (idx == null) el = $('#advBody') ? $('#advBody').querySelector('.adv-default') : null;
+  else el = $$('#advRules .adv-rule').find(r => r.dataset.idx === String(idx)) || null;
+  flashInto(el, '.adv-value, .ss-current');
+}
+
+/** A chain's card on the chains page. */
+function openChainCard(cid) {
+  showView('chain');
+  flashInto($$('#chainsWrap .chain-card').find(c => c.dataset.chainId === cid) || null, '.chain-name');
+}
+
+/**
+ * Each edge as an SVG path, from the boxes of its two nodes (`rects` by key,
+ * `box` the tree's own): the source's far side to the target's near side — in
+ * RTL the far side is the left — as an S-curve between the columns.
+ *
+ * `avoid`: boxes a line must not run through (the bases, for a rule that goes
+ * straight to its target past their column). A line whose curve would cross
+ * one bends around it instead: through the nearest clear height of that
+ * column — above it, below it, or a gap between two — level there, so it reads
+ * as passing by rather than going in. Without `avoid`, the curves of before.
+ */
+function flowEdgePaths(edges, rects, box, rtl, avoid) {
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const PAD = 12;   // the clearance a line keeps from a box it passes
+  const blocks = (avoid || []).map(r => ({ l: r.left - box.left - PAD, r: r.right - box.left + PAD, t: r.top - box.top - PAD, b: r.bottom - box.top + PAD }));
+  const out = [];
+  for (const e of edges || []) {
+    const a = rects[e.from], b = rects[e.to];
+    if (!a || !b) continue;
+    const x1 = (rtl ? a.left : a.right) - box.left;
+    const y1 = a.top + a.height / 2 - box.top;
+    const x2 = (rtl ? b.right : b.left) - box.left;
+    const y2 = b.top + b.height / 2 - box.top;
+    const c = (x2 - x1) / 2;
+    const curve = `M${r1(x1)} ${r1(y1)} C${r1(x1 + c)} ${r1(y1)} ${r1(x2 - c)} ${r1(y2)} ${r1(x2)} ${r1(y2)}`;
+    // the boxes strictly between the two ends (never the ones it starts or ends at)
+    const lo = Math.min(x1, x2), hi = Math.max(x1, x2);
+    const between = blocks.filter(o => o.l > lo && o.r < hi);
+    let d = curve;
+    if (between.length) {
+      const at = (t) => {
+        const u = 1 - t;
+        return {
+          x: u * u * u * x1 + 3 * u * u * t * (x1 + c) + 3 * u * t * t * (x2 - c) + t * t * t * x2,
+          y: u * u * u * y1 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y2
+        };
+      };
+      let hit = false;
+      for (let i = 1; i < 32 && !hit; i++) {
+        const p = at(i / 32);
+        hit = between.some(o => p.x > o.l && p.x < o.r && p.y > o.t && p.y < o.b);
+      }
+      if (hit) {
+        // the clear heights of that column: above the first box, below the last, a gap wide enough between two
+        const col = between.slice().sort((p, q) => p.t - q.t);
+        const xw = col.reduce((s, o) => s + (o.l + o.r) / 2, 0) / col.length;
+        const ys = [col[0].t, col[col.length - 1].b];
+        for (let i = 1; i < col.length; i++) if (col[i].t - col[i - 1].b >= 4) ys.push((col[i].t + col[i - 1].b) / 2);
+        const straight = y1 + (y2 - y1) * (xw - x1) / ((x2 - x1) || 1);
+        const yw = ys.reduce((best, y) => (Math.abs(y - straight) < Math.abs(best - straight) ? y : best), ys[0]);
+        // level across the whole column — in before its first box, out after its last — never cutting a corner
+        const L = Math.min(...col.map(o => o.l)), R = Math.max(...col.map(o => o.r));
+        const wa = x1 < x2 ? L : R, wb = x1 < x2 ? R : L;
+        const c1 = (wa - x1) / 2, c2 = (x2 - wb) / 2;
+        d = `M${r1(x1)} ${r1(y1)} C${r1(x1 + c1)} ${r1(y1)} ${r1(wa - c1)} ${r1(yw)} ${r1(wa)} ${r1(yw)}` +
+          ` L${r1(wb)} ${r1(yw)} C${r1(wb + c2)} ${r1(yw)} ${r1(x2 - c2)} ${r1(y2)} ${r1(x2)} ${r1(y2)}`;
+      }
+    }
+    out.push({ from: e.from, to: e.to, danger: !!e.danger, d });
+  }
+  return out;
+}
+
+/** Draw the tree's lines from where its nodes landed. Nothing while it is hidden — the ResizeObserver draws it when it shows. */
+function drawFlowEdges() {
+  const host = $('#rpFlow');
+  const grid = host && host.querySelector ? host.querySelector('.rf') : null;
+  const layer = grid ? grid.querySelector('.rf-edges') : null;
+  if (!layer || !rfModel || typeof grid.getBoundingClientRect !== 'function') return;
+  const box = grid.getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  const rects = {};
+  for (const n of grid.querySelectorAll('.rf-node')) rects[n.dataset.key] = n.getBoundingClientRect();
+  const rtl = getComputedStyle(grid).direction === 'rtl';
+  const w = Math.ceil(box.width), h = Math.ceil(box.height);
+  // everything below is a literal or a number: the boxes' coordinates
+  const head = '<path d="M0 0 L8 4 L0 8 z"/></marker>';
+  const markers = '<marker id="rfArrow" class="rf-mark" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">' + head +
+    '<marker id="rfArrowBad" class="rf-mark bad" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">' + head;
+  layer.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" focusable="false"><defs>${markers}</defs>` +
+    flowEdgePaths(rfModel.edges, rects, box, rtl, [...grid.querySelectorAll('.rf-base')].map(n => n.getBoundingClientRect()))
+      .map(line => `<path class="rf-edge${line.danger ? ' danger' : ''}" d="${line.d}" marker-end="url(#${line.danger ? 'rfArrowBad' : 'rfArrow'})"/>`).join('') +
+    '</svg>';
+}
+
+let rfDrawPending = false;
+/** Draw the lines on the next frame (once, however many renders asked). */
+function drawFlowSoon() {
+  if (rfDrawPending) return;
+  rfDrawPending = true;
+  const run = () => { rfDrawPending = false; drawFlowEdges(); };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+  else setTimeout(run, 0);
+}
+
+let rfRenderTimer = null;
+/** Redraw the tree a moment after the last keystroke in a rule's value. */
+function renderFlowSoon() {
+  clearTimeout(rfRenderTimer);
+  rfRenderTimer = setTimeout(renderFlowTree, 150);
+}
+// the window, the column or the page resizing moves every node: the lines follow
+if (typeof ResizeObserver !== 'undefined' && $('#rpFlow')) new ResizeObserver(() => drawFlowSoon()).observe($('#rpFlow'));
+
+/** Whether profile `id` is the one connected right now. */
+function profileLive(id) {
+  if (!state.connected || !id) return false;
+  const p = profileOfSel(state.activeServerId);
+  return !!p && p.id === id;
+}
+
+/**
+ * Each branch's live speed in the flow tree, from the core's per-outbound
+ * counters (a target through a base is 'out-…@<base>', a base 'base-…') —
+ * only while the profile on screen is the one up. Text only, like the home path.
+ */
+function applyFlowTraffic(per) {
+  const host = $('#rpFlow');
+  if (!host || typeof host.querySelectorAll !== 'function') return;
+  const live = !!rfModel && profileLive(rfModel.profileId);
+  const grid = host.querySelector('.rf');
+  if (grid) grid.classList.toggle('live', live);
+  const badge = $('#rpFlowLive');
+  if (badge) badge.hidden = !live;
+  for (const el of host.querySelectorAll('.rf-traffic')) {
+    const v = live && per ? per[String(el.dataset.tags || '').split(',')[0]] : null;
+    el.textContent = v ? `↓${fmtSpeed(v.downSpeed)} ↑${fmtSpeed(v.upSpeed)}` : '';
+    el.title = v ? `↓${fmtBytes(v.down)} ↑${fmtBytes(v.up)}` : '';
+  }
+}
+
+$('#btnRpAdd').onclick = () => addProfile();
+$('#btnRpDup').onclick = () => duplicateProfile(state.profileSel);
+$('#btnRpDel').onclick = () => deleteProfile(state.profileSel);
+$('#btnRpDefault').onclick = () => makeDefaultProfile(state.profileSel);
+$('#btnRpShare').onclick = () => shareRouting('profile', state.profileSel);
+$('#rpName').onchange = () => renameProfile(state.profileSel, $('#rpName').value);
+
+/* ------------------------- share links (irnetfree://routing/…) ------------------------- */
+
+/** A share link is QR-coded when its text is ≤ 1,700 bytes (the JSON QR's limit, for the same 320px box; the link is ASCII). */
+function shareQrFits(link) { return String(link || '').length <= QR_JSON_MAX_BYTES; }
+
+/**
+ * "Copy link" of a profile or a chain: main builds the link (it carries every
+ * server it needs, in full); the dialog says so before the Copy button.
+ */
+async function shareRouting(kind, id) {
+  const call = kind === 'chain' ? window.api.shareChain : window.api.shareRoutingProfile;
+  if (!id || typeof call !== 'function') return toast(t('t.failed'), 'err');
+  // the link is built from what is saved
+  if (kind !== 'chain' && rpDraft && rpDraft.id === id && draftDirty()) toast(t('rp.shareSaved'), 'warn');
+  let res = null;
+  try { res = await call(id); } catch (e) { res = { ok: false, error: (e && e.message) || String(e) }; }
+  if (!res || !res.ok || !res.link) return toast(t('t.failed') + (res && res.error ? ': ' + res.error : ''), 'err');
+  openShareModal(kind, res);
+}
+
+/** The share dialog: the warning, a QR when the link fits one, the link and its Copy. Returns whether a QR was drawn. */
+function openShareModal(kind, res) {
+  const link = String(res.link);
+  const n = Array.isArray(res.servers) ? res.servers.length : (Number(res.servers) || 0);
+  $('#rpShareTitle').textContent = t(kind === 'chain' ? 'rp.shareChainTitle' : 'rp.shareTitle');
+  $('#rpShareWarn').textContent = '⚠ ' + t('rp.shareWarn').replace('{n}', n);
+  const box = $('#rpShareQr');
+  box.innerHTML = '';
+  let drawn = false;
+  if (shareQrFits(link) && typeof qrcode === 'function') {
+    try {
+      const qr = qrcode(0, 'L'); qr.addData(link); qr.make();
+      box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 16, scalable: true });
+      drawn = true;
+    } catch { drawn = false; }
+  }
+  if (!drawn) box.innerHTML = `<p class="hint rp-share-big">${escapeHtml(t('qr.tooBig'))}</p>`;
+  $('#rpShareLink').value = link;
+  $('#rpShareModal').hidden = false;
+  return drawn;
+}
+$('#rpShareClose').onclick = () => { $('#rpShareModal').hidden = true; };
+$('#rpShareModal').onclick = (e) => { if (e.target === $('#rpShareModal')) $('#rpShareModal').hidden = true; };
+$('#rpShareCopy').onclick = () => { copyText($('#rpShareLink').value); toast(t('t.copied'), 'ok'); };
+
+/* the import: preview first, nothing written before Import */
+let rpImportText = '';
+
+/** A count in a summary: an array's length or a number. */
+function importCount(v) { return Array.isArray(v) ? v.length : (Number(v) || 0); }
+
+/** The names in a summary list (strings, or { name|key, error }); [] for a bare count. */
+function importNames(v) {
+  if (!Array.isArray(v)) return [];
+  return v.map((x) => {
+    if (typeof x === 'string') return x;
+    if (!x || typeof x !== 'object') return '';
+    return [x.name || x.key || '', x.error || x.reason || ''].filter(Boolean).join(': ');
+  }).filter(Boolean);
+}
+
+/** Ask main what a pasted link holds, and show it. Resolves to whether the preview opened. */
+async function openRoutingImport(text) {
+  const link = String(text || '').trim().split(/\s+/)[0];
+  const fail = (why) => { toast(t('rp.importFailed').replace('{reason}', () => why || '—'), 'err'); return false; };
+  if (!window.api || typeof window.api.routingImportPreview !== 'function') return fail('');
+  let res = null;
+  try { res = await window.api.routingImportPreview(link); } catch (e) { res = { ok: false, error: (e && e.message) || String(e) }; }
+  if (!res || !res.ok || !res.summary) return fail(res && res.error);
+  rpImportText = link;
+  renderImportSummary(res.summary);
+  $('#rpImportGo').disabled = false;
+  $('#rpImportModal').hidden = false;
+  return true;
+}
+
+/** The preview: what it is and its name, its rules and chains, the servers already here, the new ones and what could not be read. */
+function renderImportSummary(sum) {
+  const box = $('#rpImportSum');
+  box.innerHTML = '';
+  const row = (key, value, names, cls) => {
+    const r = document.createElement('div');
+    r.className = 'rp-im-row' + (cls ? ' ' + cls : '');
+    spanIn(r, 'rp-im-k', t(key));
+    spanIn(r, 'rp-im-v', value);
+    if (names && names.length) {
+      const l = document.createElement('div');
+      l.className = 'rp-im-names';
+      for (const n of names) {
+        const b = document.createElement('bdi');
+        b.textContent = n;
+        l.appendChild(b);
+      }
+      r.appendChild(l);
+    }
+    box.appendChild(r);
+  };
+  const chain = sum.kind === 'chain';
+  row('rp.imKind', t(chain ? 'rp.imKindChain' : 'rp.imKindProfile'));
+  if (sum.name) row('rp.imName', String(sum.name));
+  if (!chain) row('rp.imRules', String(importCount(sum.rules)));
+  row('rp.imChains', String(importCount(sum.chains)), importNames(sum.chains));
+  row('rp.imExisting', String(importCount(sum.serversExisting)), importNames(sum.serversExisting));
+  row('rp.imNew', String(importCount(sum.serversNew)), importNames(sum.serversNew));
+  if (importCount(sum.unreadable)) row('rp.imUnreadable', String(importCount(sum.unreadable)), importNames(sum.unreadable), 'danger');
+}
+
+function closeRoutingImport() {
+  $('#rpImportModal').hidden = true;
+  rpImportText = '';
+}
+
+/** Import: main writes it all; the lists come back and every page that draws them is redrawn. */
+async function runRoutingImport() {
+  if (!rpImportText) return false;
+  const go = $('#rpImportGo');
+  go.disabled = true;
+  let res = null;
+  try { res = await window.api.routingImport(rpImportText); } catch (e) { res = { ok: false, error: (e && e.message) || String(e) }; }
+  go.disabled = false;
+  if (!res || !res.ok) {
+    toast(t('rp.importFailed').replace('{reason}', () => (res && res.error) || '—'), 'err');
+    return false;
+  }
+  closeRoutingImport();
+  await refreshAfterImport(res);
+  const a = res.added || {};
+  let msg = t('rp.imported').replace('{servers}', importCount(a.servers)).replace('{chains}', importCount(a.chains)).replace('{profiles}', importCount(a.profiles));
+  if (res.profileId && !state.settings.advancedRouting) msg += ' — ' + t('rp.importedOff');
+  toast(msg, 'ok', 5000);
+  return true;
+}
+
+/** The servers, chains and profiles after an import: from its answer where it carries them, else asked for. */
+async function refreshAfterImport(res) {
+  try { state.servers = Array.isArray(res.servers) ? res.servers : await window.api.listServers(); } catch { /* the lists stay as they were */ }
+  try {
+    const chains = Array.isArray(res.chains) ? res.chains : await window.api.listChains();
+    if (Array.isArray(chains)) {
+      state.chains = chains.map(c => ({ id: c.id, name: c.name || 'Chain', members: (c.members || []).filter(id => state.servers.some(s => s.id === id)) }));
+    }
+  } catch { /* as above */ }
+  const profiles = Array.isArray(res.profiles) ? res.profiles.map(normalizeUiProfile) : await loadRoutingProfiles(null);
+  if (profiles) state.profiles = profiles;
+  // the imported profile is edited next — unless that would drop unsaved edits
+  if (res.profileId && Array.isArray(state.profiles) && state.profiles.some(p => p.id === res.profileId) && !draftDirty()) {
+    state.profileSel = res.profileId;
+    rpDraft = null;
+  }
+  if (!state.selectedServerId && state.servers.length) state.selectedServerId = state.servers[0].id;
+  renderServers(); renderPicker(); renderChains(); renderPool(); renderAdvanced();
+  refreshConnLabels();
+  if (res.profileId) showView('routing');
+  else if (res.chainId) showView('chain');
+}
+$('#rpImportGo').onclick = () => runRoutingImport();
+$('#rpImportCancel').onclick = closeRoutingImport;
+$('#rpImportClose').onclick = closeRoutingImport;
+$('#rpImportModal').onclick = (e) => { if (e.target === $('#rpImportModal')) closeRoutingImport(); };
 
 /* ----------------------------- live traffic stats ----------------------------- */
 // Lifetime totals arrive every few seconds — the per-second figures ride the
@@ -3932,10 +7709,12 @@ window.api.onStats((s) => {
   // write per second onto a node the path already built — the diagram itself is
   // never rebuilt here.
   const cap = $('#pathCapIn');
-  if (cap) cap.textContent = `↓${fmtSpeed(s.downSpeed)}  ↑${fmtSpeed(s.upSpeed)}`;
+  if (cap) cap.textContent = `↓${fmtSpeed(s.downSpeed)}\n↑${fmtSpeed(s.upSpeed)}`;
   // and each hop's own figures, so the path answers "how much went through
   // THIS config" instead of showing one total for everything at once
   if (s.per) applyPathTraffic(s.per);
+  // …and each branch of the routing page's flow tree, while its profile is the one up
+  if (s.per) applyFlowTraffic(s.per);
 });
 
 function resetTraffic() {
@@ -3950,12 +7729,24 @@ function resetTraffic() {
   drawSpark();
 }
 function setModeWidget() {
+  const card = $('#modeCard');
+  if (state.flavor === 'openwrt') {
+    // A router has one mode — the whole network through the tunnel — so the
+    // card names it and never offers Proxy ("Proxy" there meant a LAN going
+    // direct while the UI said connected). It is not a dead control either:
+    // its tooltip is the gateway's own explanation and a click opens the one
+    // router choice, which devices go direct (openModeModal).
+    $('#modeIco').textContent = '🛡';
+    $('#modeLabel').textContent = t('mode.router');
+    $('#modeSub').textContent = t('mode.routerSub');
+    if (card) card.title = t('gw.insHint');
+    return;
+  }
   // Reflect the CHOSEN mode (so users see/can change it before connecting).
   const wantTun = !!state.settings.tunMode;
   $('#modeIco').textContent = wantTun ? '🛡' : '⚡';
   $('#modeLabel').textContent = wantTun ? t('mode.tun') : t('mode.proxy');
   $('#modeSub').textContent = wantTun ? t('mode.tunSub') : t('mode.proxySub');
-  const card = $('#modeCard');
   if (card) card.title = t('mode.pick');
 }
 
@@ -3980,7 +7771,12 @@ function renderModeOptions() {
   else if (state.settings.tunMode && !state.elevated) note.textContent = t('tun.needAdmin');
   else note.textContent = '';
 }
-function openModeModal() { renderModeOptions(); $('#modeModal').hidden = false; }
+function openModeModal() {
+  // one mode on a router, nothing to pick: the card opens the device list instead (setModeWidget)
+  if (state.flavor === 'openwrt') { openSettingAt('#gwRow'); return; }
+  renderModeOptions();
+  $('#modeModal').hidden = false;
+}
 function closeModeModal() { $('#modeModal').hidden = true; }
 $('#modeCard').onclick = openModeModal;
 // straight to the place the missing backend is downloaded from
