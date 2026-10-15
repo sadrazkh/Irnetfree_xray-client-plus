@@ -172,7 +172,8 @@ function createXServer(ctx, deps = {}) {
       const a = arg && typeof arg === 'object' ? arg : {};
       const { inbound } = find(getModel(), a.inboundId);
       if (!inbound) return { ok: false, error: 'inbound not found' };
-      const r = await run('netsh', firewallArgs(FIREWALL_PREFIX + inbound.tag, inbound.port, !!a.allow));
+      // ctx.runAdmin: the app runs without administrator rights and asks for them for this one command (src/main/plus/elevate.js)
+      const r = await (ctx.runAdmin || run)('netsh', firewallArgs(FIREWALL_PREFIX + inbound.tag, inbound.port, !!a.allow));
       if (r.err) return { ok: false, error: (r.stderr || r.stdout || r.err.message || String(r.err)).trim() };
       ctx.log(`Server: firewall rule ${a.allow ? 'added' : 'removed'} for ${inbound.tag} (tcp ${inbound.port})`, 'info');
       return { ok: true };

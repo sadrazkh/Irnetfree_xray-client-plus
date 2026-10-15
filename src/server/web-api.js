@@ -1,193 +1,49 @@
 'use strict';
 /**
- * Browser-side replacement for the Electron preload bridge. Exposes the SAME
- * `window.api` surface the renderer expects, but backed by HTTP (/rpc) + SSE
- * (/events) instead of ipcRenderer. Loaded before i18n.js/app.js.
+ * plus: `window.api` in a browser, for the headless server — the same methods
+ * the Electron preload exposes, from the same map (server.js prepends it as
+ * window.__PLUS_API__), over POST /rpc and the /events stream. The token from
+ * the address (?token=…) is kept for the session so a reload keeps working.
  */
 (function () {
-  // token (if any) travels in the page URL: http://host:port/?token=XXX
-  const TOKEN = new URLSearchParams(location.search).get('token') || '';
-  const authQS = TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : '';
+  const map = window.__PLUS_API__ || { INVOKE: {}, EVENTS: {}, WINDOW: {} };
+  let token = '';
+  try {
+    token = new URLSearchParams(location.search).get('token') || sessionStorage.getItem('irnf-plus-token') || '';
+    if (token) sessionStorage.setItem('irnf-plus-token', token);
+  } catch { /* storage off: the address keeps it */ }
+
+  const argOf = (kind, args) => {
+    if (kind === 'none') return undefined;
+    if (kind === 'versions') return Object.assign({}, args[1], { component: args[0] });
+    if (kind === 'install') return { component: args[0], tag: args[1] };
+    return args[0];
+  };
 
   async function invoke(channel, arg) {
-    const res = await fetch('/rpc' + authQS, {
-      method: 'POST',
-      headers: Object.assign({ 'Content-Type': 'application/json' }, TOKEN ? { 'x-irnetfree-token': TOKEN } : {}),
-      body: JSON.stringify({ channel, arg })
+    const res = await fetch('rpc' + (token ? '?token=' + encodeURIComponent(token) : ''), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channel, arg })
     });
-    let data;
-    try { data = await res.json(); } catch { throw new Error('bad response (' + res.status + ')'); }
-    if (data && data.error) throw new Error(data.error);
-    return data ? data.result : null;
+    const body = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
+    if (body.error) throw new Error(body.error);
+    return body.result;
   }
-  // fire-and-forget (window controls etc. — no-ops on the server)
-  const sendOnly = (channel, arg) => { invoke(channel, arg).catch(() => {}); };
 
-  /* ----------------------------- events (SSE) ----------------------------- */
-  const handlers = {};                 // channel -> [cb, …]
-  const on = (channel, cb) => { (handlers[channel] = handlers[channel] || []).push(cb); };
-
-  function connectEvents() {
-    const es = new EventSource('/events' + authQS);
+  const listeners = {};
+  function connect() {
+    const es = new EventSource('events' + (token ? '?token=' + encodeURIComponent(token) : ''));
     es.onmessage = (ev) => {
-      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      const cbs = handlers[msg.channel];
-      if (cbs) for (const cb of cbs) { try { cb(msg.payload); } catch (e) { console.error(e); } }
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      for (const cb of listeners[msg.channel] || []) { try { cb(msg.payload); } catch (e) { console.error(e); } }
     };
-    es.onerror = () => { /* EventSource auto-reconnects */ };
   }
-  if (typeof EventSource !== 'undefined') connectEvents();
 
-  window.api = {
-    // init / data
-    init: () => invoke('app:init'),
-
-    // servers
-    importServers: (text) => invoke('servers:import', text),
-    addServer: (link) => invoke('servers:add', link),
-    addWireguard: (fields) => invoke('servers:addWireguard', fields),
-    addProxy: (fields) => invoke('servers:addProxy', fields),
-    createServer: (fields) => invoke('servers:create', fields),
-    addWarp: (args) => invoke('servers:addWarp', args),
-    pickWireguardConf: () => invoke('wg:pickConf'),
-    parseWireguardConf: (text) => invoke('wg:parseConf', text),
-    updateServer: (id, fields) => invoke('servers:update', { id, fields }),
-    deleteServer: (id) => invoke('servers:delete', id),
-    clearServers: () => invoke('servers:clear'),
-    listServers: () => invoke('servers:list'),
-    serverLink: (id) => invoke('servers:link', id),
-    setSelection: (id) => invoke('selection:set', id),
-
-    // chains
-    getChain: () => invoke('chain:get'),
-    setChain: (ids) => invoke('chain:set', ids),
-    listChains: () => invoke('chains:list'),
-    setChains: (chains) => invoke('chains:set', chains),
-
-    // proxy pool
-    listPool: () => invoke('pool:list'),
-    setPool: (entries) => invoke('pool:set', entries),
-
-    // routing profiles (several advanced routings, a base per target) and their share links
-    routingProfiles: () => invoke('routing:profiles'),
-    setRoutingProfiles: (profiles) => invoke('routing:setProfiles', profiles),
-    shareRoutingProfile: (id) => invoke('routing:shareProfile', id),
-    shareChain: (id) => invoke('routing:shareChain', id),
-    routingImportPreview: (text) => invoke('routing:importPreview', text),
-    routingImport: (text) => invoke('routing:import', text),
-
-    // subscriptions
-    listSubs: () => invoke('subs:list'),
-    addSub: (url, name) => invoke('subs:add', { url, name }),
-    refreshSub: (id) => invoke('subs:refresh', id),
-    refreshAllSubs: () => invoke('subs:refreshAll'),
-    removeSub: (id) => invoke('subs:remove', id),
-    setSubAutoUpdate: (id, enabled) => invoke('subs:autoUpdate', { id, enabled }),
-
-    // connection
-    connect: (id) => invoke('connect', id),
-    disconnect: () => invoke('disconnect'),
-
-    // settings
-    getSettings: () => invoke('settings:get'),
-    setSettings: (partial) => invoke('settings:set', partial),
-    pendingReconnect: () => invoke('settings:pending'),
-    checkGeoRules: (rules) => invoke('routing:checkGeo', rules),
-    applySettings: () => invoke('settings:apply'),
-
-    connectionDiagnostics: (probe) => invoke('diagnostics:connection', probe),
-    repairNetwork: () => invoke('network:repair'),
-    nativeService: (command) => invoke('native:service', command),
-    // diagnostics
-    pingTcp: (id) => invoke('ping:tcp', id),
-    pingReal: (id) => invoke('ping:real', id),
-    pingRealMany: (ids) => invoke('ping:realMany', ids),
-    pingUpload: (id) => invoke('ping:upload', id),
-    checkIp: (viaProxy) => invoke('ip:check', viaProxy),
-
-    // xray binary / assets
-    locateXray: () => invoke('xray:locate'),
-    openDataDir: () => invoke('open:dataDir'),
-    xrayVersion: (engineId) => invoke('xray:version', engineId),
-    checkUpdate: () => invoke('app:checkUpdate'),
-    downloadUpdate: (info) => invoke('app:downloadUpdate', info),
-    assetsStatus: () => invoke('assets:status'),
-    downloadAsset: (component) => invoke('assets:download', component),
-    removeAssets: () => invoke('assets:remove'),
-    // the version picker: a core's releases ({ prerelease, force }), and one installed by its tag
-    coreVersions: (component, opts) => invoke('cores:versions', Object.assign({}, opts, { component })),
-    installCoreVersion: (component, tag) => invoke('cores:install', { component, tag }),
-
-    // process routing
-    listProcesses: () => invoke('proc:list'),
-    clearProcCache: () => invoke('proc:clearCache'),
-
-    // elevated relaunch (desktop-only)
-    relaunchAdmin: () => invoke('app:relaunchAdmin'),
-
-    // LAN + kill switch
-    lanInfo: () => invoke('net:lanInfo'),
-    lanDevices: () => invoke('net:lanDevices'),
-    disarmKillSwitch: () => invoke('killswitch:disarm'),
-    reconnect: () => invoke('vpn:reconnect'),
-    releaseGuard: () => invoke('guard:release'),
-    killSwitchStatus: () => invoke('killswitch:status'),
-
-    // the OS/browser says an adapter came back — the service re-checks the tunnel
-    netOnline: () => sendOnly('net:online'),
-
-    // window controls — no-ops on the server, kept for API parity
-    minimize: () => sendOnly('win:minimize'),
-    maximize: () => sendOnly('win:maximize'),
-    hide: () => sendOnly('win:hide'),
-    close: () => sendOnly('win:close'),
-    quit: () => sendOnly('app:quit'),
-    openExternal: (url) => { try { window.open(url, '_blank', 'noopener'); } catch {} },
-
-    // plus: the Server tab (src/main/xserver)
-    xserverGet: () => invoke('xserver:get'),
-    xserverSet: (model) => invoke('xserver:set', model),
-    xserverStart: () => invoke('xserver:start'),
-    xserverStop: () => invoke('xserver:stop'),
-    xserverRestart: () => invoke('xserver:restart'),
-    xserverStatus: () => invoke('xserver:status'),
-    xserverLog: () => invoke('xserver:log'),
-    xserverGenKeys: () => invoke('xserver:genKeys'),
-    xserverGenId: (kind) => invoke('xserver:genId', kind),
-    xserverClientLink: (req) => invoke('xserver:clientLink', req),
-    xserverPreview: () => invoke('xserver:preview'),
-    xserverOtherSide: () => invoke('xserver:otherSide'),
-    xserverFirewall: (req) => invoke('xserver:firewall', req),
-    xserverWizard: (req) => invoke('xserver:wizard', req),
-    xserverCoreInfo: (req) => invoke('xserver:coreInfo', req),
-    onXServerStatus: (cb) => on('xserver-status', cb),
-    onXServerLog: (cb) => on('xserver-log', cb),
-    // plus: the IP-scan tab (src/main/scan)
-    scanStart: (req) => invoke('scan:start', req),
-    scanStop: () => invoke('scan:stop'),
-    scanRetest: (req) => invoke('scan:retest', req),
-    scanPresets: () => invoke('scan:presets'),
-    scanApply: (req) => invoke('scan:apply', req),
-    scanExport: (req) => invoke('scan:export', req),
-    scanForget: () => invoke('scan:forget'),
-    onScanProgress: (cb) => on('scan-progress', cb),
-
-    // events
-    onLog: (cb) => on('log', cb),
-    onStatus: (cb) => on('status', cb),
-    onXrayStatus: (cb) => on('xray-status', cb),
-    onStats: (cb) => on('stats', cb),
-    onUsage: (cb) => on('usage', cb),
-    getUsage: () => invoke('usage:get'),
-    clearUsage: (id) => invoke('usage:clear', id == null ? null : id),
-    exportBackup: () => invoke('backup:export'),
-    importBackup: (text) => invoke('backup:import', text),
-    onSubsUpdated: (cb) => on('subs-updated', cb),
-    onAssetProgress: (cb) => on('asset-progress', cb),
-    onKillSwitch: (cb) => on('killswitch', cb),
-    onSystemTheme: (cb) => on('system-theme', cb),
-    onStoreError: (cb) => on('store-error', cb),
-    // the connection as one fact — the first event of every events (re)connect
-    onConnSnapshot: (cb) => on('conn:snapshot', cb)
-  };
+  const api = { headless: true };
+  for (const [name, [channel, kind]] of Object.entries(map.INVOKE)) api[name] = (...args) => invoke(channel, argOf(kind, args));
+  for (const [name, channel] of Object.entries(map.EVENTS)) api[name] = (cb) => { (listeners[channel] = listeners[channel] || []).push(cb); };
+  for (const name of Object.keys(map.WINDOW)) api[name] = async () => {};
+  api.openExternal = async (url) => { if (/^https?:\/\//i.test(String(url || ''))) window.open(String(url), '_blank', 'noopener'); };
+  window.api = api;
+  connect();
 })();

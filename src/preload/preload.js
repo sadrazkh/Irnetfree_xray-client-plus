@@ -1,165 +1,20 @@
 'use strict';
+/**
+ * plus: the page's `window.api` in the Electron window — built from the one
+ * map both front ends share (src/main/plus/apiMap.js).
+ */
 const { contextBridge, ipcRenderer } = require('electron');
+const { INVOKE, EVENTS, WINDOW, argOf } = require('../main/plus/apiMap');
 
-contextBridge.exposeInMainWorld('api', {
-  // init / data
-  init: () => ipcRenderer.invoke('app:init'),
+const api = { headless: false };
+for (const [name, [channel, kind]] of Object.entries(INVOKE)) {
+  api[name] = (...args) => ipcRenderer.invoke(channel, argOf(kind, args));
+}
+for (const [name, channel] of Object.entries(EVENTS)) {
+  api[name] = (cb) => { ipcRenderer.on(channel, (e, d) => cb(d)); };
+}
+for (const [name, channel] of Object.entries(WINDOW)) {
+  api[name] = (arg) => ipcRenderer.invoke(channel, arg);
+}
 
-  // servers
-  importServers: (text) => ipcRenderer.invoke('servers:import', text),
-  addServer: (link) => ipcRenderer.invoke('servers:add', link),
-  addWireguard: (fields) => ipcRenderer.invoke('servers:addWireguard', fields),
-  addProxy: (fields) => ipcRenderer.invoke('servers:addProxy', fields),
-  createServer: (fields) => ipcRenderer.invoke('servers:create', fields),
-  // + WARP: { mode, license, via, importText, http, endpoint, address, cover, antiDpi } → { ok, servers, added, account, warnings } | { ok: false, code, error }
-  addWarp: (args) => ipcRenderer.invoke('servers:addWarp', args),
-  pickWireguardConf: () => ipcRenderer.invoke('wg:pickConf'),
-  parseWireguardConf: (text) => ipcRenderer.invoke('wg:parseConf', text),
-  updateServer: (id, fields) => ipcRenderer.invoke('servers:update', { id, fields }),
-  deleteServer: (id) => ipcRenderer.invoke('servers:delete', id),
-  clearServers: () => ipcRenderer.invoke('servers:clear'),
-  listServers: () => ipcRenderer.invoke('servers:list'),
-  serverLink: (id) => ipcRenderer.invoke('servers:link', id),
-  // the picker's choice, kept across restarts (see main.js setSelection)
-  setSelection: (id) => ipcRenderer.invoke('selection:set', id),
-
-  // proxy chain (legacy single chain)
-  getChain: () => ipcRenderer.invoke('chain:get'),
-  setChain: (ids) => ipcRenderer.invoke('chain:set', ids),
-
-  // named proxy chains (first-class configs)
-  listChains: () => ipcRenderer.invoke('chains:list'),
-  setChains: (chains) => ipcRenderer.invoke('chains:set', chains),
-
-  // proxy pool (multi-config: several exits on several local ports at once)
-  listPool: () => ipcRenderer.invoke('pool:list'),
-  setPool: (entries) => ipcRenderer.invoke('pool:set', entries),
-
-  // routing profiles (several advanced routings, a base per target) and their share links
-  routingProfiles: () => ipcRenderer.invoke('routing:profiles'),
-  setRoutingProfiles: (profiles) => ipcRenderer.invoke('routing:setProfiles', profiles),
-  shareRoutingProfile: (id) => ipcRenderer.invoke('routing:shareProfile', id),
-  shareChain: (id) => ipcRenderer.invoke('routing:shareChain', id),
-  routingImportPreview: (text) => ipcRenderer.invoke('routing:importPreview', text),
-  routingImport: (text) => ipcRenderer.invoke('routing:import', text),
-
-  // subscriptions
-  listSubs: () => ipcRenderer.invoke('subs:list'),
-  addSub: (url, name) => ipcRenderer.invoke('subs:add', { url, name }),
-  refreshSub: (id) => ipcRenderer.invoke('subs:refresh', id),
-  refreshAllSubs: () => ipcRenderer.invoke('subs:refreshAll'),
-  removeSub: (id) => ipcRenderer.invoke('subs:remove', id),
-  setSubAutoUpdate: (id, enabled) => ipcRenderer.invoke('subs:autoUpdate', { id, enabled }),
-
-  // connection
-  connect: (id) => ipcRenderer.invoke('connect', id),
-  disconnect: () => ipcRenderer.invoke('disconnect'),
-
-  // settings — setSettings resolves to { settings, pendingReconnect: [keys] };
-  // applySettings tears the tunnel down and rebuilds it so those keys take effect.
-  getSettings: () => ipcRenderer.invoke('settings:get'),
-  setSettings: (partial) => ipcRenderer.invoke('settings:set', partial),
-  pendingReconnect: () => ipcRenderer.invoke('settings:pending'),
-  checkGeoRules: (rules) => ipcRenderer.invoke('routing:checkGeo', rules),
-  applySettings: () => ipcRenderer.invoke('settings:apply'),
-
-  connectionDiagnostics: (probe) => ipcRenderer.invoke('diagnostics:connection', probe),
-  repairNetwork: () => ipcRenderer.invoke('network:repair'),
-  nativeService: (command) => ipcRenderer.invoke('native:service', command),
-  // diagnostics
-  pingTcp: (id) => ipcRenderer.invoke('ping:tcp', id),
-  pingReal: (id) => ipcRenderer.invoke('ping:real', id),
-  pingRealMany: (ids) => ipcRenderer.invoke('ping:realMany', ids),
-  pingUpload: (id) => ipcRenderer.invoke('ping:upload', id),
-  checkIp: (viaProxy) => ipcRenderer.invoke('ip:check', viaProxy),
-
-  // xray binary
-  locateXray: () => ipcRenderer.invoke('xray:locate'),
-  openDataDir: () => ipcRenderer.invoke('open:dataDir'),
-  xrayVersion: (engineId) => ipcRenderer.invoke('xray:version', engineId),
-
-  // app version / update check
-  checkUpdate: () => ipcRenderer.invoke('app:checkUpdate'),
-  downloadUpdate: (info) => ipcRenderer.invoke('app:downloadUpdate', info),
-
-  // process-based routing
-  listProcesses: () => ipcRenderer.invoke('proc:list'),
-  clearProcCache: () => ipcRenderer.invoke('proc:clearCache'),
-
-  // relaunch elevated (Windows) for TUN mode
-  relaunchAdmin: () => ipcRenderer.invoke('app:relaunchAdmin'),
-  // Windows: does the logon task start another copy? (a read) / point it at this one (the banner's button)
-  autostartCheck: () => ipcRenderer.invoke('autostart:check'),
-  autostartRepoint: () => ipcRenderer.invoke('autostart:repoint'),
-
-  // runtime components (download / integrate / update / remove)
-  assetsStatus: () => ipcRenderer.invoke('assets:status'),
-  downloadAsset: (component) => ipcRenderer.invoke('assets:download', component),
-  removeAssets: () => ipcRenderer.invoke('assets:remove'),
-  // the version picker: a core's releases ({ prerelease, force }), and one installed by its tag
-  coreVersions: (component, opts) => ipcRenderer.invoke('cores:versions', Object.assign({}, opts, { component })),
-  installCoreVersion: (component, tag) => ipcRenderer.invoke('cores:install', { component, tag }),
-
-  // LAN sharing info + kill switch
-  lanInfo: () => ipcRenderer.invoke('net:lanInfo'),
-  disarmKillSwitch: () => ipcRenderer.invoke('killswitch:disarm'),
-  reconnect: () => ipcRenderer.invoke('vpn:reconnect'),
-  releaseGuard: () => ipcRenderer.invoke('guard:release'),
-  killSwitchStatus: () => ipcRenderer.invoke('killswitch:status'),
-
-  // the OS/browser says an adapter came back — main re-checks the tunnel at once
-  netOnline: () => ipcRenderer.send('net:online'),
-
-  // window
-  minimize: () => ipcRenderer.send('win:minimize'),
-  maximize: () => ipcRenderer.send('win:maximize'),
-  hide: () => ipcRenderer.send('win:hide'),
-  close: () => ipcRenderer.send('win:close'),
-  quit: () => ipcRenderer.send('app:quit'),
-  openExternal: (url) => ipcRenderer.send('open:external', url),
-
-  // plus: the Server tab (src/main/xserver)
-  xserverGet: () => ipcRenderer.invoke('xserver:get'),
-  xserverSet: (model) => ipcRenderer.invoke('xserver:set', model),
-  xserverStart: () => ipcRenderer.invoke('xserver:start'),
-  xserverStop: () => ipcRenderer.invoke('xserver:stop'),
-  xserverRestart: () => ipcRenderer.invoke('xserver:restart'),
-  xserverStatus: () => ipcRenderer.invoke('xserver:status'),
-  xserverLog: () => ipcRenderer.invoke('xserver:log'),
-  xserverGenKeys: () => ipcRenderer.invoke('xserver:genKeys'),
-  xserverGenId: (kind) => ipcRenderer.invoke('xserver:genId', kind),
-  xserverClientLink: (req) => ipcRenderer.invoke('xserver:clientLink', req),
-  xserverPreview: () => ipcRenderer.invoke('xserver:preview'),
-  xserverOtherSide: () => ipcRenderer.invoke('xserver:otherSide'),
-  xserverFirewall: (req) => ipcRenderer.invoke('xserver:firewall', req),
-  xserverWizard: (req) => ipcRenderer.invoke('xserver:wizard', req),
-  xserverCoreInfo: (req) => ipcRenderer.invoke('xserver:coreInfo', req),
-  onXServerStatus: (cb) => ipcRenderer.on('xserver-status', (e, d) => cb(d)),
-  onXServerLog: (cb) => ipcRenderer.on('xserver-log', (e, d) => cb(d)),
-  // plus: the IP-scan tab (src/main/scan)
-  scanStart: (req) => ipcRenderer.invoke('scan:start', req),
-  scanStop: () => ipcRenderer.invoke('scan:stop'),
-  scanRetest: (req) => ipcRenderer.invoke('scan:retest', req),
-  scanPresets: () => ipcRenderer.invoke('scan:presets'),
-  scanApply: (req) => ipcRenderer.invoke('scan:apply', req),
-  scanExport: (req) => ipcRenderer.invoke('scan:export', req),
-  scanForget: () => ipcRenderer.invoke('scan:forget'),
-  onScanProgress: (cb) => ipcRenderer.on('scan-progress', (e, d) => cb(d)),
-
-  // events
-  onLog: (cb) => ipcRenderer.on('log', (e, d) => cb(d)),
-  onStatus: (cb) => ipcRenderer.on('status', (e, d) => cb(d)),
-  onXrayStatus: (cb) => ipcRenderer.on('xray-status', (e, d) => cb(d)),
-  onStats: (cb) => ipcRenderer.on('stats', (e, d) => cb(d)),
-  onUsage: (cb) => ipcRenderer.on('usage', (e, d) => cb(d)),
-  getUsage: () => ipcRenderer.invoke('usage:get'),
-  clearUsage: (id) => ipcRenderer.invoke('usage:clear', id == null ? null : id),
-  exportBackup: () => ipcRenderer.invoke('backup:export'),
-  importBackup: (text) => ipcRenderer.invoke('backup:import', text),
-  onSubsUpdated: (cb) => ipcRenderer.on('subs-updated', (e, d) => cb(d)),
-  onAssetProgress: (cb) => ipcRenderer.on('asset-progress', (e, d) => cb(d)),
-  onKillSwitch: (cb) => ipcRenderer.on('killswitch', (e, d) => cb(d)),
-  onSystemTheme: (cb) => ipcRenderer.on('system-theme', (e, d) => cb(d)),
-  // saved data could not be read, or could not be written to disk
-  onStoreError: (cb) => ipcRenderer.on('store-error', (e, d) => cb(d))
-});
+contextBridge.exposeInMainWorld('api', api);

@@ -16,7 +16,7 @@ name: Dev build (rolling)
 #
 # Windows only on a push (it is the platform the owner runs, and a private
 # repository's Actions minutes are finite). Use "Run workflow" on the Actions
-# tab with "all platforms" to also build macOS, Linux and the APK.
+# tab with "all platforms" to also build macOS and Linux.
 
 on:
   push:

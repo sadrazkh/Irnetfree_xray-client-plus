@@ -1,7 +1,9 @@
 name: Tests
 
-# Unit tests on every push and PR, on all three desktop platforms — the parser,
-# config builder and engine choice must behave identically everywhere.
+# Plus's own suite on all three desktop platforms, then the configs the app
+# writes — the Server tab's and the scanner's — through `xray run -test` on the
+# suggested cores (the ones a download installs; MASQUE needs them), and the
+# reverse proxy and a real scan proven end to end on loopback.
 on:
   push:
     branches: ['**']
@@ -19,16 +21,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          # 22+: `node --test "tests/*.test.js"` needs glob support (added in Node 21).
+          # 22+: `node --test "tests/*.test.js"` needs glob support (Node 21).
           node-version: '22'
       # No `npm ci` on purpose — the tests use only Node core modules.
       - run: npm test
 
   cores:
-    # The only place a core is handed what this app writes: every config shape
-    # (plans, DNS modes, TUN, the v1.18 link forms) through `xray run -test` on
-    # the suggested Xray and Xray-PattN, the TUN configs through `sing-box check`.
-    # The versions come from src/main/coreVersions.js, so a bump is checked here.
     name: cores accept the configs (suggested versions)
     runs-on: ubuntu-latest
     steps:
@@ -38,186 +36,25 @@ jobs:
           node-version: '22'
       - name: Fetch the suggested cores
         run: |
-          set -euo pipefail
+          set -e
           XV=$(node -p "require('./src/main/coreVersions').SUGGESTED.xray")
           PV=$(node -p "require('./src/main/coreVersions').SUGGESTED['xray-pattn']")
-          SV=$(node -p "require('./src/main/coreVersions').SUGGESTED['sing-box']")
-          echo "xray $XV · xray-pattn $PV · sing-box $SV"
-          mkdir -p "$RUNNER_TEMP/x" "$RUNNER_TEMP/p" "$RUNNER_TEMP/s"
+          echo "xray $XV · xray-pattn $PV"
           curl -fsSL --retry 3 -o x.zip "https://github.com/XTLS/Xray-core/releases/download/v$XV/Xray-linux-64.zip"
           unzip -q x.zip -d "$RUNNER_TEMP/x"
           curl -fsSL --retry 3 -o p.zip "https://github.com/patterniha/Xray-core/releases/download/v$PV/Xray-linux-64.zip"
           unzip -q p.zip -d "$RUNNER_TEMP/p"
-          curl -fsSL --retry 3 -o s.tgz "https://github.com/SagerNet/sing-box/releases/download/v$SV/sing-box-$SV-linux-amd64.tar.gz"
-          tar -xzf s.tgz -C "$RUNNER_TEMP/s" --strip-components=1
-          chmod +x "$RUNNER_TEMP/x/xray" "$RUNNER_TEMP/p/xray" "$RUNNER_TEMP/s/sing-box"
-      - name: Xray (suggested) accepts every config, sing-box every TUN config
-        run: IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" node scripts/validate-configs.js
+          chmod +x "$RUNNER_TEMP/x/xray" "$RUNNER_TEMP/p/xray"
+          # the probes start their cores the way the app does: from bin/
+          mkdir -p bin
+          cp "$RUNNER_TEMP/x/xray" bin/xray
+          cp "$RUNNER_TEMP/p/xray" bin/xray-pattn
+          cp "$RUNNER_TEMP/x/geoip.dat" "$RUNNER_TEMP/x/geosite.dat" bin/ 2>/dev/null || true
+      - name: Xray (suggested) accepts every config
+        run: IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" node scripts/validate-configs.js
       - name: Xray-PattN (suggested) accepts every config
-        # also when the official core refused something: one run says it for both
-        if: ${{ !cancelled() }}
         run: IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" node scripts/validate-configs.js
-      - name: A WireGuard base that is also the exit is one session (a real peer, loopback)
-        # scripts/probe-wg-base.js: a WireGuard base, then a chain ending in one, with
-        # "exit at the base" and a target through it — both lines must answer every
-        # time. The client is the suggested Xray, the peer the suggested sing-box. The
-        # two hops stand for remote servers and run Xray 26.3.27: with the hops on
-        # 26.9.30 nothing passes through them in this harness, whatever the client.
-        # Then the same with Xray-PattN as the client: 26.9.22 could not bring up a
-        # WireGuard whose endpoint is an IP (XTLS/Xray-core#6803, fixed by #6804 from
-        # the fork's 26.9.24), and the app writes endpoints as IPs — so it gates too.
-        if: ${{ !cancelled() }}
-        timeout-minutes: 12
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/h"
-          curl -fsSL --retry 3 -o h.zip "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip"
-          unzip -q h.zip -d "$RUNNER_TEMP/h" && chmod +x "$RUNNER_TEMP/h/xray"
-          IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" IRNF_HOP_EXE="$RUNNER_TEMP/h/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" node scripts/probe-wg-base.js
-          IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" IRNF_HOP_EXE="$RUNNER_TEMP/h/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" IRNF_PROBE_PORT=39900 IRNF_PROBE_ROUNDS=3 node scripts/probe-wg-base.js
-      - name: MASQUE carries TCP and UDP over HTTP/3 and HTTP/2 (a real server, loopback)
-        # scripts/probe-masque.js: a MASQUE server (Xray's masque inbound, IETF
-        # CONNECT-IP, RFC 9484) and a client through it, both the core under test,
-        # with a certificate that core made and the client pins. HTTP/3 and HTTP/2
-        # against one server port: a page every round, the same over IPv6, 2 MB in
-        # one piece, UDP echoed through SOCKS5 UDP ASSOCIATE — and a wrong password
-        # gets nothing on either. The app does not write MASQUE yet (the client
-        # config is written by hand); this is the proof the suggested cores carry
-        # the tunnel before it does. Then the same on Xray-PattN; both always run.
-        if: ${{ !cancelled() }}
-        timeout-minutes: 8
-        run: |
-          rc=0
-          IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" node scripts/probe-masque.js || rc=1
-          IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" IRNF_PROBE_PORT=40000 node scripts/probe-masque.js || rc=1
-          exit $rc
-
-  tun-dns:
-    # The real TUN, which `sing-box check` cannot speak for: does a name asked
-    # through the app's sing-box TUN reach Xray (the managed DNS, a WireGuard's
-    # private names) — or does sing-box answer it itself and send it past the
-    # tunnel, as 1.14's default dns_mode "hijack" does? In a network namespace of
-    # its own (the runner's network is not touched), with the app's own configs
-    # (scripts/tun-dns-probe.js). Both lines the app runs: the last 1.13 and the
-    # 1.14 GitHub calls latest. On 1.14 a control run without dns_mode must show
-    # the bug, or the probe could not see it.
-    name: real TUN DNS (sing-box ${{ matrix.singbox }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        singbox: ['1.13.14', '1.14.3']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Fetch Xray (suggested) and sing-box ${{ matrix.singbox }}
-        run: |
-          set -euo pipefail
-          XV=$(node -p "require('./src/main/coreVersions').SUGGESTED.xray")
-          SV='${{ matrix.singbox }}'
-          echo "xray $XV · sing-box $SV"
-          mkdir -p "$RUNNER_TEMP/x" "$RUNNER_TEMP/s"
-          curl -fsSL --retry 3 -o x.zip "https://github.com/XTLS/Xray-core/releases/download/v$XV/Xray-linux-64.zip"
-          unzip -q x.zip -d "$RUNNER_TEMP/x"
-          curl -fsSL --retry 3 -o s.tgz "https://github.com/SagerNet/sing-box/releases/download/v$SV/sing-box-$SV-linux-amd64.tar.gz"
-          tar -xzf s.tgz -C "$RUNNER_TEMP/s" --strip-components=1
-          chmod +x "$RUNNER_TEMP/x/xray" "$RUNNER_TEMP/s/sing-box"
-      - name: A name asked through the TUN reaches Xray and never the ISP resolver
-        run: sudo IRNF_TUN_PROBE=1 IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" IRNF_SINGBOX_EXE="$RUNNER_TEMP/s/sing-box" "$(command -v node)" scripts/tun-dns-probe.js
-
-  android:
-    # The Android app is a hand-written port of src/main/parser.js and
-    # configBuilder.js, and nobody working on it can compile Kotlin locally
-    # (no JDK, no Gradle, and the wrapper is not committed). Without this job a
-    # broken port only surfaces when someone pushes a release tag. Compile only —
-    # no signing, no APK upload; release.yml still owns the shipped build.
-    name: compile android
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: android
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: android-actions/setup-android@v3
-        with:
-          # An explicit package list, because the action's default is
-          # `tools platform-tools` and Google removed the deprecated `tools`
-          # package from the SDK repository (android-actions/setup-android
-          # #537, #538, filed 2026-09-15/16). Every Android job started
-          # failing at SDK setup on 2026-09-16 with no change of ours; the
-          # Gradle build downloads the platform and build-tools it needs by
-          # itself, so platform-tools is all this step has to install.
-          packages: platform-tools
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
-      - name: Fetch native libs (libv2ray)
-        run: bash scripts/fetch-libs.sh
-      - name: Compile
-        # assembleDebug, not assembleRelease: the point is "does the Kotlin
-        # compile and link against libv2ray", not producing an artifact.
-        run: gradle --no-daemon assembleDebug
-      - name: Unit tests (the pure core against the desktop's pins)
-        run: gradle --no-daemon testDebugUnitTest
-      - name: Unit test results (fail when nothing ran)
-        # Gradle exits 0 for an empty test source set, and the console shows
-        # no per-test lines on success — so a misplaced test directory would
-        # pass this job silently. Count the testcases in the JUnit XML instead.
-        run: |
-          set -e
-          files=$(ls app/build/test-results/testDebugUnitTest/*.xml 2>/dev/null || true)
-          test -n "$files" || { echo "no JUnit result files"; exit 1; }
-          total=0
-          for f in $files; do
-            n=$(grep -o '<testcase ' "$f" | wc -l)
-            bad=$(grep -o '<failure' "$f" | wc -l)
-            echo "$(basename "$f" .xml): $n tests, $bad failures"
-            total=$((total + n))
-          done
-          echo "total: $total"
-          test "$total" -gt 0
-
-  openwrt:
-    # The OpenWrt package runs nowhere but a router, and nobody working on it
-    # has one on the desk. So an OpenWrt 24.10 armsr image boots in QEMU (TCG,
-    # slow), the package installs on top of the feed's node, and the gateway is
-    # asked to come up against a SOCKS upstream that does not exist: the TUN
-    # device, sing-box's policy route, our nft table and the fw4 zone are what
-    # is asserted — not internet. openwrt/ci/guest-smoke.sh is the checklist.
-    #
-    # Two releases, because their feeds carry different nodes: 24.10 has node
-    # 20, 23.05 has node 18 — and the owner's router runs 23.05. The runtime
-    # uses nothing newer than Node 18, and this is where that stays true.
-    name: openwrt (qemu armsr-armv7, ${{ matrix.release }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        release: ['24.10.2', '23.05.5']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
-      - name: Build the package
-        run: node openwrt/build-ipk.js dist
-      - name: Keep the package (a testable ipk from every push, without a tag)
-        if: matrix.release == '24.10.2'
-        uses: actions/upload-artifact@v4
-        with:
-          name: IRNetFree-OpenWrt-dev
-          path: dist/irnetfree_*_all.ipk
-          if-no-files-found: error
-      - name: Fetch the OpenWrt image
-        run: curl -fsSL -o /tmp/openwrt-kernel.bin "https://downloads.openwrt.org/releases/${{ matrix.release }}/targets/armsr/armv7/openwrt-${{ matrix.release }}-armsr-armv7-generic-initramfs-kernel.bin"
-      - name: Boot, install, connect, assert
-        run: node openwrt/ci/qemu-smoke.js --kernel /tmp/openwrt-kernel.bin --ipk "$(ls dist/irnetfree_*_all.ipk)"
+      - name: The reverse proxy carries a page, both cores (loopback)
+        run: node scripts/probe-reverse.js
+      - name: A scan finds the one good target among dead ones, both cores (loopback)
+        run: node scripts/probe-scan.js

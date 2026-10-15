@@ -92,8 +92,65 @@
   white-space: normal;
   line-height: 1.35;
 }
-/* the batch size is the one knob almost nobody should touch: label beside it, not above */
-.scan-adv { align-items: center; margin-block-start: 14px; }
+/* v3: everything but the preset, the concurrency, the cores and the tests sits
+   under Advanced, closed by default */
+.scan-more { margin-block-start: 14px; }
+.scan-more > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink3);
+  margin-block-end: 10px;
+}
+.scan-more > summary:hover { color: var(--ink2); }
+.scan-conc-row { align-items: center; margin-block-start: 6px; }
+
+/* ----------------------------- what the config allows ----------------------------- */
+
+.scan-facts, .scan-notes {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.scan-facts li, .scan-notes li {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink3);
+  padding-inline-start: 12px;
+  position: relative;
+}
+.scan-facts li::before, .scan-notes li::before {
+  content: '';
+  position: absolute;
+  inset-inline-start: 0;
+  inset-block-start: .65em;
+  inline-size: 5px;
+  block-size: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.scan-facts li:first-child { color: var(--ink); font-weight: 600; font-family: var(--mono); }
+.scan-notes li.warn { color: var(--warn); }
+.scan-notes li.warn::before { background: var(--warn); }
+
+/* ----------------------------- targets ----------------------------- */
+
+.scan-presets { align-items: center; margin-block-end: 8px; }
+.scan-ports { flex: 1 1 200px; min-inline-size: 0; }
+.scan-snis { min-block-size: 64px; }
+.scan-snis:disabled { opacity: .5; cursor: not-allowed; }
+
+/* the SNI column shows only when a row carries one */
+.scan-no-sni .scan-c-sni { display: none; }
+.scan-c-sni {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  white-space: nowrap;
+}
 
 /* ----------------------------- run row and stage strip ----------------------------- */
 

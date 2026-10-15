@@ -35,7 +35,14 @@
  */
 const crypto = require('crypto');
 const { parseLink, buildShareLink, buildStreamSettings } = require('../parser');
-const { cloneOut, applyFragments, PRIVATE_IPS } = require('../configBuilder');
+const { buildMultiTestConfig } = require('../configBuilder');
+
+/** What `geoip:private` means when geoip.dat is not there — configBuilder's own list. */
+const PRIVATE_IPS = [
+  '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16',
+  '172.16.0.0/12', '192.168.0.0/16', '224.0.0.0/4', '240.0.0.0/4',
+  '::1/128', 'fc00::/7', 'fe80::/10'
+];
 
 const SCHEMA = 2;
 const PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks'];
@@ -693,22 +700,47 @@ function flatVless(settings, reverseTag) {
 }
 
 /**
- * One model outbound as the config carries it; null when it cannot be built
- * (validation is what reports that). `bridging`: the model has a reverse
- * outbound, so every freedom exit opts in to carrying what the portal hands
- * back — from 26.9 on the core refuses those destinations otherwise
- * ("proxy/freedom: blocked target", then a penalty on the source). The
- * block rules still come first in routing. Older cores ignore the field.
+ * The model's exits through a stored config or a link, built by upstream's own
+ * builder — the certificate pins, a JSON config's helper outbounds and the
+ * anti-DPI dialers exactly as a connect would carry them. buildMultiTestConfig
+ * tags them `test-out-<i>`; each is renamed to its model tag, and the helpers
+ * it dials through come back beside it. Its socks inbounds and its `direct` are
+ * not wanted here.
  */
-function serverOutbound(ob, servers, bridging) {
-  if (ob.kind === 'freedom') return { tag: ob.tag, protocol: 'freedom', settings: bridging ? { finalRules: [{ action: 'allow' }] } : {} };
-  if (ob.kind === 'blackhole') return { tag: ob.tag, protocol: 'blackhole', settings: { response: { type: 'http' } } };
+function compileExits(list) {
+  const mains = new Array(list.length).fill(null), helpers = [];
+  if (!list.length) return { mains, helpers };
+  const cfg = buildMultiTestConfig(list.map(x => x.target), list.map((x, i) => 1024 + i));
+  for (const o of cfg.outbounds) {
+    const m = /^test-out-(\d+)$/.exec(String(o.tag || ''));
+    if (m && list[+m[1]]) { o.tag = list[+m[1]].ob.tag; mains[+m[1]] = o; } else if (o.tag !== 'direct') helpers.push(o);
+  }
+  return { mains, helpers };
+}
+
+/**
+ * A model exit through a stored config or a link: `{ ob, target }`, or null
+ * when it cannot be built (validation is what reports that).
+ */
+function exitOf(ob, servers) {
+  if (ob.kind !== 'server' && ob.kind !== 'link') return null;
   const target = outboundTarget(ob, servers);
   if (!target || !target.outbound) return null;
   if (ob.reverseTag && !isVless(target)) return null;
-  const out = cloneOut(target.outbound, ob.tag, target);
-  if (ob.reverseTag) out.settings = flatVless(out.settings, ob.reverseTag);
-  return out;
+  return { ob, target };
+}
+
+/**
+ * A freedom or blackhole outbound of the model. `bridging`: the model has a
+ * reverse outbound, so every freedom exit opts in to carrying what the portal
+ * hands back — from 26.9 on the core refuses those destinations otherwise
+ * ("proxy/freedom: blocked target", then a penalty on the source). The block
+ * rules still come first in routing. Older cores ignore the field.
+ */
+function localOutbound(ob, bridging) {
+  if (ob.kind === 'freedom') return { tag: ob.tag, protocol: 'freedom', settings: bridging ? { finalRules: [{ action: 'allow' }] } : {} };
+  if (ob.kind === 'blackhole') return { tag: ob.tag, protocol: 'blackhole', settings: { response: { type: 'http' } } };
+  return null;
 }
 
 /**
@@ -751,12 +783,20 @@ function buildServerConfig(model, opts) {
 
   const inbounds = m.inbounds.filter(i => i.enabled).map(serverInbound);
   const bridging = m.outbounds.some(ob => ob.enabled && !!ob.reverseTag);
+  const exits = m.outbounds.filter(ob => ob.enabled).map(ob => exitOf(ob, servers)).filter(Boolean);
+  const { mains, helpers } = compileExits(exits);
+  const compiled = new Map(exits.map((x, i) => [x.ob, mains[i]]));
   const outbounds = [];
   for (const ob of m.outbounds) {
     if (!ob.enabled) continue;
-    const built = serverOutbound(ob, servers, bridging);
+    let built = localOutbound(ob, bridging);
+    if (!built && compiled.get(ob)) {
+      built = compiled.get(ob);
+      if (ob.reverseTag) built.settings = flatVless(built.settings, ob.reverseTag);
+    }
     if (built) outbounds.push(built);
   }
+  outbounds.push(...helpers);
   const rules = m.routing.rules.filter(r => r.enabled).map(r => serverRule(r, geo)).filter(Boolean);
 
   return {
@@ -768,7 +808,7 @@ function buildServerConfig(model, opts) {
       system: { statsInboundUplink: true, statsInboundDownlink: true, statsOutboundUplink: true, statsOutboundDownlink: true }
     },
     inbounds,
-    outbounds: applyFragments(outbounds),
+    outbounds,
     routing: { domainStrategy: m.routing.domainStrategy, rules }
   };
 }
@@ -1035,7 +1075,7 @@ function wizardBridge(model, args) {
 }
 
 module.exports = {
-  SCHEMA, DEFAULT_MODEL,
+  SCHEMA, DEFAULT_MODEL, PRIVATE_IPS,
   PROTOCOLS, NETWORKS, SECURITIES, SS_METHODS, OUTBOUND_KINDS, RULE_PRESETS,
   normalizeModel, migrateModel,
   newInbound, newClient, newOutbound, newRule, presetRule,
