@@ -3,521 +3,282 @@
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;" />
-  <title>IRNetFree</title>
-  <!-- Split by surface so different screens can be worked on independently.
-       Order matters: styles.css owns the tokens and the shell, the screen
-       sheets build on them, and skins.css re-declares tokens last. -->
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self';" />
+  <title>IRNetFree Plus</title>
+  <!-- IRNetFree Plus v3: the tools only (Scan, Server, Configs, Settings, Log).
+       The five stylesheets before plus/ are upstream's, synced verbatim
+       (upstream-sync.json): tokens, components, the core picker, the skins. -->
   <link rel="stylesheet" href="styles.css" />
   <link rel="stylesheet" href="home.css" />
   <link rel="stylesheet" href="lists.css" />
-  <link rel="stylesheet" href="routing.css" />
   <link rel="stylesheet" href="settings.css" />
   <link rel="stylesheet" href="skins.css" />
-  <link rel="stylesheet" href="plus/shell.css" /><!-- plus -->
-  <link rel="stylesheet" href="plus/xserver.css" /><!-- plus -->
-  <link rel="stylesheet" href="plus/scan.css" /><!-- plus -->
-  <!-- Applies the remembered theme before the first paint, so a light-theme user
-       does not see a dark flash while app:init is still in flight. -->
+  <link rel="stylesheet" href="plus/shell.css" />
+  <link rel="stylesheet" href="plus/xserver.css" />
+  <link rel="stylesheet" href="plus/scan.css" />
   <script src="theme-boot.js"></script>
-  <link rel="stylesheet" href="diagnostics.css">
 </head>
 <body>
-  <!-- custom titlebar -->
   <header class="titlebar conn-off" id="titlebar">
     <div class="tb-left">
-      <!-- the logo with the app's version under it (app:init → #tbVersion) -->
       <span class="tb-brand">
         <span class="tb-logo-wrap">
-          <img class="tb-logo" src="../../assets/icon.png" alt="IRNetFree" />
+          <img class="tb-logo" src="../../assets/icon.png" alt="IRNetFree Plus" />
           <span class="tb-logo-badge"></span>
         </span>
-        <span class="tb-ver" id="tbVersion" dir="ltr" data-i18n-title="about.version"></span>
+        <span class="tb-ver" id="tbVersion" dir="ltr" data-i18n-title="app.version"></span>
       </span>
-      <span class="tb-title">IR<b>NETFREE</b> <span class="tb-plus">PLUS</span></span> <!-- plus -->
+      <span class="tb-title">IR<b>NETFREE</b> <span class="tb-plus">PLUS</span></span>
     </div>
     <span class="tb-sep"></span>
-    <!-- state · uptime, both monospaced so the digits do not jump each second -->
+    <!-- what runs: the local server, a scan -->
     <div class="tb-status">
       <span class="tb-dot"></span>
-      <span class="tb-state" id="tbState" data-i18n="tb.offline">OFFLINE</span>
-      <span class="tb-uptime" id="tbUptime"></span>
+      <span class="tb-state" id="tbState" data-i18n="app.idle">IDLE</span>
     </div>
     <div class="tb-drag"></div>
     <div class="tb-right">
-      <button class="tb-mode" id="btnUiMode" data-i18n-title="ui.modeHint">MODE: ADVANCED</button>
-      <button class="tb-btn lang-btn" id="btnLang" title="Language">EN</button>
-      <button class="tb-btn" id="btnMin" data-i18n-title="tb.min">&#x2013;</button>
-      <button class="tb-btn" id="btnMax" data-i18n-title="tb.max">&#x25A1;</button>
-      <button class="tb-btn tb-close" id="btnClose" data-i18n-title="tb.close">&#x2715;</button>
+      <button class="tb-btn lang-btn" id="btnLang" type="button" title="Language">EN</button>
+      <button class="tb-btn" id="btnMin" type="button" data-i18n-title="tb.min">&#x2013;</button>
+      <button class="tb-btn" id="btnMax" type="button" data-i18n-title="tb.max">&#x25A1;</button>
+      <button class="tb-btn tb-close" id="btnClose" type="button" data-i18n-title="tb.close">&#x2715;</button>
     </div>
   </header>
 
   <div class="layout">
-    <!-- sidebar -->
-    <!-- icon rail: the label stays in the DOM for i18n and screen readers, and
-         is repeated as a tooltip, so a 64px column keeps its meaning -->
     <nav class="sidebar">
-      <button class="nav-item active" data-view="home" data-i18n-title="nav.home">
-        <span class="nav-ico">⏻</span><span data-i18n="nav.home">اتصال</span>
+      <button class="nav-item active" type="button" data-view="scan" data-i18n-title="nav.scan">
+        <span class="nav-ico">📡</span><span data-i18n="nav.scan">اسکن</span>
       </button>
-      <button class="nav-item" data-view="servers" data-i18n-title="nav.servers">
-        <span class="nav-ico">🗂</span><span data-i18n="nav.servers">سرورها</span>
-      </button>
-      <button class="nav-item" data-view="subs" data-i18n-title="nav.subs">
-        <span class="nav-ico">🔗</span><span data-i18n="nav.subs">ساب‌ها</span>
-      </button>
-      <button class="nav-item pro-only" data-view="chain" data-i18n-title="nav.chain">
-        <span class="nav-ico">⛓</span><span data-i18n="nav.chain">زنجیره</span>
-      </button>
-      <button class="nav-item pro-only" data-view="pool" data-i18n-title="nav.pool">
-        <span class="nav-ico">🧩</span><span data-i18n="nav.pool">استخر پروکسی</span>
-      </button>
-      <button class="nav-item" data-view="routing" data-i18n-title="nav.routing">
-        <span class="nav-ico">🧭</span><span data-i18n="nav.routing">روتینگ</span>
-      </button>
-      <button class="nav-item pro-only" data-view="xserver" data-i18n-title="nav.xserver"><!-- plus -->
+      <button class="nav-item" type="button" data-view="xserver" data-i18n-title="nav.xserver">
         <span class="nav-ico">🖧</span><span data-i18n="nav.xserver">سرور</span>
       </button>
-      <button class="nav-item" data-view="scan" data-i18n-title="nav.scan"><!-- plus -->
-        <span class="nav-ico">📡</span><span data-i18n="nav.scan">اسکن IP</span>
+      <button class="nav-item" type="button" data-view="configs" data-i18n-title="nav.configs">
+        <span class="nav-ico">🗂</span><span data-i18n="nav.configs">کانفیگ‌ها</span>
       </button>
-      <button class="nav-item pro-only" data-view="logs" data-i18n-title="nav.logs">
-        <span class="nav-ico">📜</span><span data-i18n="nav.logs">لاگ‌ها</span>
+      <button class="nav-item" type="button" data-view="logs" data-i18n-title="nav.logs">
+        <span class="nav-ico">📜</span><span data-i18n="nav.logs">لاگ</span>
       </button>
       <div class="sidebar-spacer"></div>
-      <button class="nav-item" data-view="settings" data-i18n-title="nav.settings">
+      <button class="nav-item" type="button" data-view="settings" data-i18n-title="nav.settings">
         <span class="nav-ico">⚙</span><span data-i18n="nav.settings">تنظیمات</span>
       </button>
-      <div class="conn-pill" id="connPill"><span class="dot"></span><span id="connPillText" data-i18n="pill.disconnected">قطع</span></div>
     </nav>
 
-    <!-- main content -->
     <main class="content">
+      <!-- SCAN (src/renderer/plus/scan.js; spec 2026-10-15 §4) -->
+      <section class="view active" id="view-scan">
+        <div class="view-head"><h2 data-i18n="scan.title">اسکن</h2></div>
+        <p class="hint" data-i18n="scan.intro"></p>
 
-      <!-- HOME / CONNECT -->
-      <section class="view active" id="view-home">
-        <div class="connect-hero">
-
-          <!-- where traffic actually goes. Built once per connect / routing
-               change, never on a stats tick — see renderTrafficPath(). -->
-          <div class="sec">
-            <span class="sec-label" data-i18n="path.title">مسیر ترافیک</span>
+        <div class="scan-forms">
+          <!-- 1. the config: a stored one, or a link / JSON pasted here -->
+          <div class="card scan-card">
+            <div class="sec"><span class="sec-label" data-i18n="scan.config">کانفیگ</span></div>
+            <div class="seg scan-seg" id="scanSourceSeg">
+              <button type="button" class="seg-btn active" data-src="server" data-i18n="scan.srcServer">از کانفیگ‌ها</button>
+              <button type="button" class="seg-btn" data-src="link" data-i18n="scan.srcLink">جای‌گذاری لینک</button>
+            </div>
+            <div class="scan-src" id="scanSrcServer">
+              <!-- the searchable picker mounts here; the <select> stays the value holder, out of sight -->
+              <div class="scan-mount" id="scanSourceMount"></div>
+              <select id="scanSource" class="select vis-hidden" tabindex="-1" aria-hidden="true"></select>
+            </div>
+            <div class="scan-src" id="scanSrcLink" hidden>
+              <textarea id="scanLink" class="textarea" rows="3" dir="ltr" spellcheck="false" data-i18n-ph="scan.linkPh"></textarea>
+            </div>
+            <!-- what this config allows: filled by scan:suggest (UDP → no TCP test, ECH, whether an SNI can change, the preset that fits) -->
+            <ul class="scan-facts" id="scanFacts"></ul>
           </div>
-          <div class="path-panel" id="trafficPath"></div>
 
-          <!-- which config, and its ping -->
-          <div class="picker" id="serverPicker">
-            <button class="picker-current" id="pickerBtn">
-              <span class="proto-badge" id="pickerProto" hidden></span>
-              <span class="picker-name" id="pickerName" data-i18n="picker.choose">سرور را انتخاب کن</span>
-              <span class="picker-ping" id="pickerPing"></span>
-              <span class="picker-caret">▾</span>
-            </button>
-            <div class="picker-menu" id="pickerMenu" hidden></div>
-          </div>
-
-          <div class="connect-row">
-            <div class="connect-panel">
-              <!-- while a connect is in flight this is its Cancel (app.js connect()):
-                   the word shows under the icon, the tooltip and aria-label say it too -->
-              <button class="power-btn" id="powerBtn" aria-label="connect">
-                <svg viewBox="0 0 24 24" class="power-ico"><path d="M12 3v9" /><path d="M7 6.5a8 8 0 1 0 10 0" /></svg>
-                <span class="power-cancel" data-i18n="power.cancel">لغو</span>
-              </button>
-              <div class="connect-state" id="connState" data-i18n="state.disconnected">قطع شده</div>
-              <div class="connect-meta" id="connMeta"></div>
-              <!-- what the live connection did not do (proxy only, the leak guard): app.js renderConnIssues -->
-              <div class="conn-issues" id="connIssues" role="status" hidden></div>
-              <div class="connect-server" id="connServer" data-i18n="conn.noServer">سروری انتخاب نشده</div>
-              <div class="connect-geo" id="connGeo" hidden>
-                <span class="geo-flag" id="geoFlag"></span>
-                <span class="geo-text" id="geoText"></span>
+          <!-- 2. what to test: addresses × ports × SNIs -->
+          <div class="card scan-card">
+            <div class="sec"><span class="sec-label" data-i18n="scan.targets">چه چیزی تست شود</span></div>
+            <label class="field-label" for="scanIps" data-i18n="scan.addrs">آدرس‌ها</label>
+            <div class="row-gap scan-presets" id="scanAddrPresets">
+              <button type="button" class="btn ghost small" data-preset="suggest" id="btnScanSuggest" data-i18n="scan.p.suggest">پیشنهادی</button>
+              <button type="button" class="btn ghost small" data-preset="cf" data-i18n="scan.p.cf">کلودفلر</button>
+              <button type="button" class="btn ghost small" data-preset="warp-masque" data-i18n="scan.p.warpMasque">WARP MASQUE</button>
+              <button type="button" class="btn ghost small" data-preset="warp-wg" data-i18n="scan.p.warpWg">WARP وایرگارد</button>
+              <button type="button" class="btn ghost small" id="btnScanFile" data-i18n="scan.file">از فایل</button>
+              <input type="file" id="scanFile" accept=".txt,.csv,.log,text/plain" class="vis-hidden" tabindex="-1" aria-hidden="true" />
+            </div>
+            <textarea id="scanIps" class="textarea scan-ips" rows="6" dir="ltr" spellcheck="false" data-i18n-ph="scan.ipsPh"></textarea>
+            <div class="row-gap scan-ip-actions">
+              <div class="seg scan-pick" id="scanPickSeg">
+                <button type="button" class="seg-btn active" data-pick="all" data-i18n="scan.pick.all">همهٔ آدرس‌ها</button>
+                <button type="button" class="seg-btn" data-pick="random" data-i18n="scan.pick.random">تصادفی از هر رنج</button>
               </div>
+              <span class="scan-count" id="scanCount"></span>
+            </div>
+            <div class="row-gap scan-pick-opts" id="scanPickOpts" hidden>
+              <label class="field-label scan-inline-label" for="scanPerRange" data-i18n="scan.perRange">از هر رنج</label>
+              <input type="number" id="scanPerRange" class="input scan-num" dir="ltr" min="1" max="5000" value="20" data-i18n-title="scan.perRangeHint" />
+              <label class="scan-check"><input type="checkbox" id="scanFresh" checked /><span class="scan-check-label" data-i18n="scan.fresh">فقط آدرس‌های تست‌نشده</span></label>
+              <button type="button" class="btn ghost small" id="btnScanForget" data-i18n="scan.forget">فراموش کردن تاریخچه</button>
+              <span class="scan-count" id="scanTested" hidden></span>
             </div>
 
-            <div class="readouts">
-              <div class="stat-row">
-                <div class="stat-card readout rd-down">
-                  <div class="stat-label" data-i18n="stat.down">دانلود</div>
-                  <div><span class="stat-value traffic-speed" id="downSpeed">0 B/s</span>
-                    <span class="rd-sub traffic-total" id="downTotal">0 B</span></div>
-                </div>
-                <div class="stat-card readout rd-up">
-                  <div class="stat-label" data-i18n="stat.up">آپلود</div>
-                  <div><span class="stat-value traffic-speed" id="upSpeed">0 B/s</span>
-                    <span class="rd-sub traffic-total" id="upTotal">0 B</span></div>
-                </div>
-                <div class="stat-card readout">
-                  <div class="stat-label" data-i18n="stat.tcp">پینگ TCP</div>
-                  <div class="stat-value rd-val" id="statTcp">—</div>
-                </div>
-                <div class="stat-card readout">
-                  <div class="stat-label" data-i18n="stat.real">تأخیر واقعی</div>
-                  <div class="stat-value rd-val" id="statReal">—</div>
-                </div>
-                <div class="stat-card readout">
-                  <div class="stat-label" data-i18n="stat.ip">IP خروجی</div>
-                  <div class="stat-value rd-val" id="statIp">—</div>
-                </div>
-              </div>
-              <!-- the last sixty seconds of speed, two lines, one canvas — no DOM per tick -->
-              <figure class="traffic-chart" aria-labelledby="trafficChartTitle">
-                <figcaption class="traffic-chart-head"><span id="trafficChartTitle" data-i18n="chart.title"></span><span class="chart-legend"><span class="chart-down" data-i18n="stat.down"></span><span class="chart-up" data-i18n="stat.up"></span></span></figcaption>
-                <div class="traffic-chart-plot"><span id="chartScale" class="chart-scale" dir="ltr">1 KB/s</span><canvas id="speedSpark" class="spark" width="360" height="112" aria-hidden="true"></canvas></div>
-                <div class="chart-axis"><span data-i18n="chart.history"></span><span data-i18n="chart.now"></span></div>
-              </figure>
-              <div class="traffic-row" id="trafficRow">
-                <button class="traffic-card mode-card readout" id="modeCard" title="">
-                  <span class="traffic-ico mode" id="modeIco">⚡</span>
-                  <div class="stat-label traffic-speed" id="modeLabel" data-i18n="mode.proxy">پروکسی</div>
-                  <div class="rd-val traffic-total" id="modeSub" data-i18n="mode.proxySub">SOCKS/HTTP</div>
-                  <span class="mode-card-caret">⇄</span>
-                </button>
-              </div>
-
-              <!-- session usage totals -->
-              <div class="session-card" id="sessionCard">
-                <div class="session-title" data-i18n="session.title">مصرف این نشست</div>
-                <div class="session-grid">
-                  <div><div class="session-label" data-i18n="session.down">دانلود کل</div><div class="session-val" id="sessDown">0 B</div></div>
-                  <div><div class="session-label" data-i18n="session.up">آپلود کل</div><div class="session-val" id="sessUp">0 B</div></div>
-                  <div><div class="session-label" data-i18n="session.sum">مجموع</div><div class="session-val sum" id="sessSum">0 B</div></div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- the tail of the core's own log, for the people who want to see it -->
-          <div class="sec pro-only">
-            <span class="sec-label" data-i18n="path.live">لاگ زنده</span>
-          </div>
-          <div class="home-log pro-only" id="homeLog"></div>
-
-          <div class="hero-actions">
-            <button class="btn ghost" id="btnReconnect" data-i18n="btn.reconnect" hidden>اتصال مجدد</button>
-            <button class="btn ghost" id="btnQuickPing" data-i18n="btn.quickPing">تست پینگ</button>
-            <button class="btn ghost" id="btnDiagnostics" data-i18n="btn.diagnostics">عیب‌یابی</button>
-            <button class="btn ghost" id="btnCheckIp" data-i18n="btn.checkIp">بررسی IP</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- SERVERS -->
-      <section class="view" id="view-servers">
-        <div class="view-head">
-          <h2 data-i18n="servers.title">سرورها</h2>
-          <div class="head-actions">
-            <button class="btn ghost" id="btnPingAll" data-i18n="btn.pingAll">تست همه</button>
-            <button class="btn ghost" id="btnClearUsage" data-i18n="btn.clearUsage">پاک‌کردن مصرف</button>
-            <button class="btn ghost" id="btnClearServers" data-i18n="btn.clearAll">حذف همه</button>
-            <button class="btn ghost" id="btnWgOpen" data-i18n="btn.addWg">+ WireGuard</button>
-            <button class="btn ghost" id="btnWarpOpen" data-i18n="btn.addWarp">+ WARP</button>
-            <button class="btn ghost" id="btnProxyOpen" data-i18n="btn.addProxy">+ SOCKS/HTTP</button>
-            <button class="btn ghost" id="btnManualOpen" data-i18n="btn.addManual">+ دستی</button>
-            <button class="btn primary" id="btnAddOpen" data-i18n="btn.add">+ افزودن</button>
-          </div>
-        </div>
-
-        <div class="import-box" id="importBox" hidden>
-          <textarea id="importText" class="textarea" rows="4" data-i18n-ph="import.ph"></textarea>
-          <div class="import-actions">
-            <button class="btn primary" id="btnImport" data-i18n="btn.import">وارد کردن</button>
-            <button class="btn ghost" id="btnImportCancel" data-i18n="btn.cancel">انصراف</button>
-            <span class="import-hint" id="importHint"></span>
-          </div>
-        </div>
-
-        <!-- WireGuard manual add -->
-        <div class="import-box" id="wgBox" hidden>
-          <div class="wg-title" data-i18n="wg.title">افزودن WireGuard</div>
-          <div class="row-gap u-mbe-12">
-            <button class="btn ghost" id="btnWgPickConf" data-i18n="wg.pickConf">انتخاب فایل .conf</button>
-            <span class="import-hint" id="wgConfHint"></span>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.name">نام</label>
-              <input type="text" id="wgName" class="input" data-i18n-ph="wg.namePh" /></div>
-            <div><label class="field-label" data-i18n="wg.endpoint">Endpoint (host:port)</label>
-              <input type="text" id="wgEndpoint" class="input" placeholder="example.com:51820" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.privateKey">Private Key</label>
-              <input type="text" id="wgPrivate" class="input" dir="ltr" /></div>
-            <div><label class="field-label" data-i18n="wg.publicKey">Peer Public Key</label>
-              <input type="text" id="wgPublic" class="input" dir="ltr" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.address">Address (محلی /32)</label>
-              <input type="text" id="wgAddress" class="input" dir="ltr" placeholder="10.0.0.2/32" /></div>
-            <div><label class="field-label" data-i18n="wg.allowed">Allowed IPs</label>
-              <input type="text" id="wgAllowed" class="input" dir="ltr" placeholder="0.0.0.0/0, ::/0" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.psk">Pre-shared Key (اختیاری)</label>
-              <input type="text" id="wgPsk" class="input" dir="ltr" /></div>
-            <div><label class="field-label" data-i18n="wg.mtu">MTU</label>
-              <input type="number" id="wgMtu" class="input" value="1420" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.reserved">Reserved (اختیاری، مثل 0,0,0)</label>
-              <input type="text" id="wgReserved" class="input" dir="ltr" placeholder="0,0,0" /></div>
-            <div><label class="field-label" data-i18n="wg.dns">DNS</label>
-              <input type="text" id="wgDns" class="input" dir="ltr" placeholder="192.168.60.1, tes.systems" /></div>
-          </div>
-          <p class="hint" data-i18n="wg.addrHint">«Address» باید آدرس محلی خودت در کانفیگ WireGuard باشد و حتماً /32 (مثل 10.8.0.2/32). برای دسترسی به رنج دیتابیس، رنج را در «Allowed IPs» بگذار (مثل 192.168.60.0/24) یا 0.0.0.0/0 را نگه دار.</p>
-          <p class="hint" data-i18n="wg.dnsHint">اگر کانفیگ شرکتی خط DNS دارد همان را بگذار (مثل 192.168.60.1). دامنه‌های جست‌وجو را هم می‌توانی با کاما اضافه کنی (tes.systems) تا نام‌های داخلی مستقیم از همین DNS پرسیده شوند.</p>
-          <div class="import-actions">
-            <button class="btn primary" id="btnWgAdd" data-i18n="btn.addWgGo">افزودن</button>
-            <button class="btn ghost" id="btnWgCancel" data-i18n="btn.cancel">انصراف</button>
-            <span class="import-hint" id="wgHint"></span>
-          </div>
-        </div>
-
-        <!-- SOCKS / HTTP proxy manual add -->
-        <div class="import-box" id="proxyBox" hidden>
-          <div class="wg-title" data-i18n="proxy.title">افزودن پروکسی SOCKS / HTTP</div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="proxy.type">نوع</label>
-              <select id="pxType" class="select">
-                <option value="socks">SOCKS5</option>
-                <option value="http">HTTP</option>
-              </select></div>
-            <div><label class="field-label" data-i18n="proxy.name">نام</label>
-              <input type="text" id="pxName" class="input" data-i18n-ph="wg.namePh" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="proxy.host">آدرس (host)</label>
-              <input type="text" id="pxHost" class="input" dir="ltr" placeholder="127.0.0.1" /></div>
-            <div><label class="field-label" data-i18n="proxy.port">پورت</label>
-              <input type="number" id="pxPort" class="input" dir="ltr" placeholder="1080" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="proxy.user">نام کاربری (اختیاری)</label>
-              <input type="text" id="pxUser" class="input" dir="ltr" /></div>
-            <div><label class="field-label" data-i18n="proxy.pass">رمز عبور (اختیاری)</label>
-              <input type="text" id="pxPass" class="input" dir="ltr" /></div>
-          </div>
-          <p class="hint" data-i18n="proxy.hint">می‌توانی لینک <code>socks://</code> را هم مستقیم در «افزودن» جای‌گذاری کنی.</p>
-          <div class="import-actions">
-            <button class="btn primary" id="btnProxyAdd" data-i18n="btn.addProxyGo">افزودن</button>
-            <button class="btn ghost" id="btnProxyCancel" data-i18n="btn.cancel">انصراف</button>
-            <span class="import-hint" id="proxyHint"></span>
-          </div>
-        </div>
-
-        <div class="server-list" id="serverList"></div>
-        <div class="empty" id="serverEmpty" data-i18n="servers.empty">هنوز سروری اضافه نشده. روی «افزودن» بزن.</div>
-      </section>
-
-      <!-- SUBSCRIPTIONS -->
-      <section class="view" id="view-subs">
-        <div class="view-head">
-          <h2 data-i18n="subs.title">ساب‌اسکریپشن‌ها</h2>
-          <div class="head-actions">
-            <button class="btn ghost" id="btnRefreshAll" data-i18n="btn.refreshAll">به‌روزرسانی همه</button>
-            <button class="btn primary" id="btnSubAddOpen" data-i18n="btn.addSub">+ افزودن ساب</button>
-          </div>
-        </div>
-
-        <div class="import-box" id="subAddBox" hidden>
-          <input type="text" id="subUrl" class="input" data-i18n-ph="sub.urlPh" />
-          <input type="text" id="subName" class="input u-mbs-10" data-i18n-ph="sub.namePh" />
-          <div class="import-actions">
-            <button class="btn primary" id="btnSubAdd" data-i18n="btn.addFetch">افزودن و دریافت</button>
-            <button class="btn ghost" id="btnSubAddCancel" data-i18n="btn.cancel">انصراف</button>
-            <span class="import-hint" id="subAddHint"></span>
-          </div>
-        </div>
-
-        <div class="card auto-update-card">
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="autoupdate.title">به‌روزرسانی خودکار</div>
-              <div class="switch-sub" data-i18n="autoupdate.sub">ساب‌ها در فاصله‌ی مشخص خودکار تازه می‌شن</div></div>
-            <label class="switch"><input type="checkbox" id="optAutoUpdate" /><span class="slider"></span></label>
-          </div>
-          <div class="inline-field">
-            <label class="field-label" data-i18n="interval.label">فاصله (دقیقه)</label>
-            <input type="number" id="autoInterval" class="input small" min="5" value="60" />
-          </div>
-        </div>
-
-        <div class="sub-list" id="subList"></div>
-        <div class="empty" id="subEmpty" data-i18n="subs.empty">هنوز ساب‌اسکریپشنی اضافه نشده.</div>
-      </section>
-
-      <!-- CHAIN -->
-      <section class="view" id="view-chain">
-        <div class="view-head">
-          <h2 data-i18n="chain.title">زنجیره پروکسی</h2>
-          <div class="head-actions">
-            <button class="btn primary" id="btnAddChain" data-i18n="chain.new">+ زنجیره جدید</button>
-          </div>
-        </div>
-
-        <p class="hint" data-i18n="chain.intro">هر زنجیره مثل یک کانفیگ ساخته می‌شود: یک نام بده، چند سرور را به‌ترتیب بچین، و از صفحهٔ «اتصال» یا در «روتینگ ویژه» مثل یک کانفیگ ازش استفاده کن.</p>
-        <p class="hint" data-i18n="chain.wgHint">برای دسترسی به دیتابیس وقتی WireGuard مستقیم کار نمی‌کند: یک کانفیگ را اول بگذار و WireGuard را آخرِ زنجیره؛ سپس در «روتینگ ویژه» رنج IP دیتابیس را به این زنجیره بفرست.</p>
-
-        <div id="chainsWrap"></div>
-        <div class="empty" id="chainsEmpty" data-i18n="chain.noneYet">هنوز زنجیره‌ای ساخته نشده. روی «زنجیره جدید» بزن.</div>
-      </section>
-
-      <!-- PROXY POOL (multi-config) -->
-      <section class="view" id="view-pool">
-        <div class="view-head">
-          <h2 data-i18n="pool.title">استخر پروکسی</h2>
-          <div class="head-actions">
-            <button class="btn ghost" id="btnPoolConnect" data-i18n="pool.connect">اتصال استخر</button>
-            <button class="btn primary" id="btnAddPool" data-i18n="pool.new">+ پروکسی جدید</button>
-          </div>
-        </div>
-
-        <p class="hint" data-i18n="pool.intro">چند کانفیگ/زنجیره/ساکس را هم‌زمان اجرا کن؛ هر کدام روی پورت محلی خودش (مثلاً 60001، 60002 و …). برنامه‌ها را به پورت دلخواه وصل کن تا از خروجی همان کانفیگ عبور کنند.</p>
-        <p class="hint" data-i18n="pool.primaryHint">پروکسی سیستمی و حالت TUN از «اولین پروکسیِ فعال» به‌عنوان خروجیِ اصلی استفاده می‌کنند؛ بقیه پورت‌ها به‌صورت خروجی‌های اضافه در دسترس‌اند. با هر دو حالت پروکسی و TUN کار می‌کند.</p>
-
-        <div id="poolWrap"></div>
-        <div class="empty" id="poolEmpty" data-i18n="pool.noneYet">هنوز پروکسی‌ای در استخر نیست. روی «پروکسی جدید» بزن.</div>
-      </section>
-
-      <!-- ROUTING -->
-      <section class="view" id="view-routing">
-        <div class="view-head"><h2 data-i18n="routing.title">روتینگ</h2></div>
-
-        <!-- BASE: the preset every custom rule stacks on top of -->
-        <div class="base-strip">
-          <span class="base-label" data-i18n="routing.base">پایه</span>
-          <div class="seg" id="routingSeg">
-            <button data-mode="global" class="seg-btn active" data-i18n="routing.global">گلوبال (همه از پروکسی)</button>
-            <button data-mode="bypass-ir" class="seg-btn" data-i18n="routing.bypassIr">دور زدن ایران</button>
-            <button data-mode="bypass-cn" class="seg-btn" data-i18n="routing.bypassCn">دور زدن چین</button>
-            <button data-mode="direct" class="seg-btn" data-i18n="routing.direct">مستقیم</button>
-          </div>
-          <span class="base-note" data-i18n="routing.baseNote">قانون‌های سفارشی روی این پایه سوار می‌شوند</span>
-        </div>
-        <p class="hint" data-i18n="routing.hint">در حالت «دور زدن ایران»، ترافیک داخلی مستقیم می‌ره و بقیه از پروکسی.</p>
-        <p class="hint geo-note" id="routingGeoNote" data-i18n="routing.geoNote"></p>
-
-        <div class="routing-cols">
-        <div class="routing-main">
-
-        <!-- Advanced graphical routing -->
-        <div class="card">
-          <div class="switch-row">
-            <div>
-              <div class="switch-title" data-i18n="adv.title">روتینگ پیشرفته (گرافیکی)</div>
-              <div class="switch-sub" data-i18n="adv.sub">هر دسته از ترافیک را به یک کانفیگ یا زنجیرهٔ دلخواه بفرست</div>
-            </div>
-            <label class="switch"><input type="checkbox" id="optAdvanced" /><span class="slider"></span></label>
-          </div>
-
-          <div id="advBody">
-            <!-- Routing profiles: several advanced routings, the list and then the one being
-                 edited. Hidden on a back end without them (today's single advanced routing). -->
-            <div class="rp-bar" id="rpBar" hidden>
-              <div class="rp-list" id="rpList" role="tablist"></div>
-              <button type="button" class="btn ghost rp-add" id="btnRpAdd" data-i18n="rp.add">+ روتینگ جدید</button>
-            </div>
-            <div class="empty small" id="rpEmpty" data-i18n="rp.none" hidden>هنوز روتینگی نیست. «روتینگ جدید» را بزن.</div>
-            <div class="rp-head" id="rpHead" hidden>
-              <input class="input rp-name" id="rpName" dir="auto" maxlength="60" data-i18n-ph="rp.rename" data-i18n-title="rp.rename" />
-              <span class="rp-def-badge" id="rpDefBadge" data-i18n="rp.isDefault" data-i18n-title="rp.defaultHint" hidden>★ پیش‌فرض</span>
-              <button type="button" class="btn ghost rp-make-def" id="btnRpDefault" data-i18n="rp.setDefault" data-i18n-title="rp.defaultHint">★ پیش‌فرض شود</button>
-              <div class="rp-actions">
-                <button type="button" class="icon-btn" id="btnRpDup" data-i18n-title="rp.duplicate">⧉</button>
-                <button type="button" class="icon-btn" id="btnRpShare" data-i18n-title="rp.copyLink">🔗</button>
-                <button type="button" class="icon-btn" id="btnRpDel" data-i18n-title="rp.delete">🗑</button>
-              </div>
-            </div>
-            <!-- the flow tree of the profile being edited: rules → targets → bases -->
-            <div class="rp-flow-wrap" id="rpFlowWrap" hidden>
-              <div class="rp-flow-head">
-                <span class="rp-flow-title" data-i18n="rp.flowTitle">مسیر ترافیک در این روتینگ</span>
-                <span class="rp-flow-live" id="rpFlowLive" data-i18n="rp.flowLive" hidden>● زنده</span>
-              </div>
-              <div class="rp-flow" id="rpFlow"></div>
+            <label class="field-label scan-sub-label" for="scanPorts" data-i18n="scan.ports">پورت‌ها</label>
+            <div class="row-gap scan-presets">
+              <input type="text" id="scanPorts" class="input scan-ports" dir="ltr" spellcheck="false" data-i18n-ph="scan.portsPh" />
+              <button type="button" class="btn ghost small" data-ports="cf-tls-ports" data-i18n="scan.p.cfTls">پورت‌های TLS کلودفلر</button>
+              <button type="button" class="btn ghost small" data-ports="warp-wg" data-i18n="scan.p.warpPorts">پورت‌های WARP</button>
             </div>
 
-            <div id="advEditor">
-            <p class="hint" data-i18n="adv.hint">قانون‌ها از بالا به پایین بررسی می‌شوند؛ هر درخواست با اولین قانونِ منطبق هدایت می‌شود.</p>
+            <label class="field-label scan-sub-label" for="scanSnis" data-i18n="scan.snis">SNIها</label>
+            <textarea id="scanSnis" class="textarea scan-snis" rows="3" dir="ltr" spellcheck="false" data-i18n-ph="scan.snisPh"></textarea>
+            <p class="hint" id="scanSniHint" data-i18n="scan.snisHint"></p>
+          </div>
 
-            <div class="adv-rules" id="advRules"></div>
-            <button class="btn ghost adv-add" id="btnAddRule" data-i18n="adv.addRule">+ افزودن قانون</button>
-
-            <div class="adv-default">
-              <span class="adv-def-label" data-i18n="adv.default">بقیهٔ ترافیک از:</span>
-              <span id="advDefaultMount" class="adv-target-mount"></span>
-              <span class="adv-via" id="advDefVia" hidden>
-                <span class="adv-via-label" data-i18n="rp.via">از طریق</span>
-                <span id="advDefViaMount" class="adv-via-mount"></span>
-              </span>
+          <!-- 3. how: one preset, how many at once, which cores, what to measure; the rest under Advanced -->
+          <div class="card scan-card">
+            <div class="sec"><span class="sec-label" data-i18n="scan.how">چطور</span></div>
+            <label class="field-label" data-i18n="scan.preset">پیش‌تنظیم</label>
+            <div class="seg scan-preset" id="scanPreset">
+              <button type="button" class="seg-btn" data-preset="fast" data-i18n="scan.preset.fast">سریع</button>
+              <button type="button" class="seg-btn" data-preset="balanced" data-i18n="scan.preset.balanced">متعادل</button>
+              <button type="button" class="seg-btn" data-preset="accurate" data-i18n="scan.preset.accurate">دقیق</button>
             </div>
-            <!-- the profile's base: every proxy target dials through it unless its rule says otherwise -->
-            <div class="adv-base" id="advBaseRow" hidden>
-              <span class="adv-base-label" data-i18n="rp.base">پایه</span>
-              <span id="advBaseMount" class="adv-target-mount"></span>
-              <span class="adv-base-hint" data-i18n="rp.baseHint">هر مقصد پروکسی این روتینگ از طریق پایه وصل می‌شود، مگر قانونش چیز دیگری بگوید.</span>
-              <span class="adv-warn" id="advBaseWhy" hidden></span>
+            <div class="row-gap scan-conc-row">
+              <label class="field-label scan-inline-label" for="scanConc" data-i18n="scan.conc">چند تا هم‌زمان</label>
+              <input type="number" id="scanConc" class="input scan-num" dir="ltr" min="1" max="64" data-i18n-title="scan.concHint" />
             </div>
+            <label class="field-label scan-sub-label" data-i18n="scan.engines">هسته‌ها</label>
+            <div class="scan-checks" id="scanEngines"></div>
+            <label class="field-label scan-sub-label" data-i18n="scan.testsPick">چه چیزی اندازه گرفته شود</label>
+            <div class="scan-checks" id="scanTests"></div>
 
-            <!-- also apply the simple routing mode (bypass Iran/China) under the rules -->
-            <div class="switch-row">
-              <div>
-                <div class="switch-title" data-i18n="adv.useMode.title">حالت روتینگ ساده هم اعمال شود</div>
-                <div class="switch-sub" data-i18n="adv.useMode.sub">همان حالتی که بالای همین صفحه انتخاب کرده‌ای</div>
-              </div>
-              <label class="switch"><input type="checkbox" id="optAdvUseMode" /><span class="slider"></span></label>
-            </div>
-            <p class="hint" id="advUseModeHint" data-i18n="adv.useMode.hint">قانون‌های خودت همیشه اول بررسی می‌شوند؛ این گزینه فقط زیرِ آن‌ها اضافه می‌شود.</p>
-            <p class="hint" id="advUseModeNow" hidden></p>
-
-            <!-- process-routing options (only relevant when a process rule exists) -->
-            <div class="proc-opts" id="procOpts" hidden>
-              <div class="switch-row">
+            <details class="scan-more" id="scanAdvanced">
+              <summary data-i18n="scan.advanced">پیشرفته</summary>
+              <div class="scan-limits">
                 <div>
-                  <div class="switch-title" data-i18n="proc.watch.title">به‌روز نگه‌داشتن مسیر پروسه‌ها</div>
-                  <div class="switch-sub" data-i18n="proc.watch.sub">وقتی پروسه به مقصد جدیدی وصل شود، مسیرها به‌روز می‌شوند (هسته کوتاه ری‌لود می‌شود)</div>
+                  <label class="field-label" for="scanCores" data-i18n="scan.cores">هسته‌های موازی</label>
+                  <input type="number" id="scanCores" class="input" dir="ltr" min="1" max="6" />
                 </div>
-                <label class="switch"><input type="checkbox" id="optProcWatch" /><span class="slider"></span></label>
+                <div>
+                  <label class="field-label" for="scanSamples" data-i18n="scan.samples">نمونه‌های تأخیر</label>
+                  <input type="number" id="scanSamples" class="input" dir="ltr" min="1" max="10" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanTcpTimeout" data-i18n="scan.tcpTimeout">سقف انتظار TCP (ms)</label>
+                  <input type="number" id="scanTcpTimeout" class="input" dir="ltr" min="500" max="30000" step="100" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDelayTimeout" data-i18n="scan.delayTimeout">سقف انتظار تأخیر (ms)</label>
+                  <input type="number" id="scanDelayTimeout" class="input" dir="ltr" min="500" max="60000" step="100" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanSpeedTop" data-i18n="scan.speedTop">چند تای برتر تست سرعت شوند</label>
+                  <input type="number" id="scanSpeedTop" class="input" dir="ltr" min="0" max="50" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanSpeedConc" data-i18n="scan.speedConc">تست سرعت هم‌زمان</label>
+                  <input type="number" id="scanSpeedConc" class="input" dir="ltr" min="1" max="4" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanSpeedRounds" data-i18n="scan.speedRounds">دورهای دانلود</label>
+                  <input type="number" id="scanSpeedRounds" class="input" dir="ltr" min="1" max="3" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanBatch" data-i18n="scan.batch">اندازهٔ دسته</label>
+                  <input type="number" id="scanBatch" class="input" dir="ltr" min="1" max="50" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDelayHost" data-i18n="scan.delayHost">هاست تست تأخیر</label>
+                  <input type="text" id="scanDelayHost" class="input" dir="ltr" spellcheck="false" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDelayPort" data-i18n="scan.delayPort">پورت تست تأخیر</label>
+                  <input type="number" id="scanDelayPort" class="input" dir="ltr" min="1" max="65535" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDelayPath" data-i18n="scan.delayPath">مسیر تست تأخیر</label>
+                  <input type="text" id="scanDelayPath" class="input" dir="ltr" spellcheck="false" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDownMb" data-i18n="scan.downMb">حجم دانلود (MB)</label>
+                  <input type="number" id="scanDownMb" class="input" dir="ltr" min="1" max="500" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDownHost" data-i18n="scan.downHost">هاست دانلود</label>
+                  <input type="text" id="scanDownHost" class="input" dir="ltr" spellcheck="false" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDownPath" data-i18n="scan.downPath">مسیر دانلود</label>
+                  <input type="text" id="scanDownPath" class="input" dir="ltr" spellcheck="false" data-i18n-ph="scan.downPathPh" />
+                </div>
               </div>
-              <p class="hint" data-i18n="proc.note">روتینگ پروسه بر اساس IP مقصدهای مشاهده‌شده‌ی آن برنامه کار می‌کند (xray امکان تطبیق مستقیم پروسه را ندارد). برنامه‌های دیگری که به همان IPها وصل شوند هم تأثیر می‌گیرند؛ برای برنامه‌هایی با سرور ثابت بهترین نتیجه را دارد.</p>
-              <button class="btn ghost" id="btnClearProcCache" data-i18n="proc.clearCache">پاک‌سازی IPهای یادگرفته‌شده</button>
-            </div>
-
-            <button class="btn primary" id="btnSaveAdv" data-i18n="adv.save">ذخیره روتینگ پیشرفته</button>
-            <span class="saved-hint" id="advSavedHint"></span>
-            </div><!-- /advEditor -->
+            </details>
           </div>
         </div>
 
-        <div class="card pro-only" id="simpleRulesCard">
-          <label class="field-label" data-i18n="rules.label">قوانین سفارشی</label>
-          <p class="hint" data-i18n="rules.hint">هر خط: domain|ip|port , مقدار , خروجی(proxy/direct/block)</p>
-          <textarea id="customRules" class="textarea" rows="4"
-            placeholder="domain, geosite:google, proxy&#10;ip, 8.8.8.8, direct&#10;port, 443, proxy"></textarea>
-          <button class="btn primary" id="btnSaveRules" data-i18n="btn.saveRules">ذخیره قوانین</button>
-        </div>
-
-        </div><!-- /routing-main -->
-
-        <aside class="routing-side">
-          <div class="sec"><span class="sec-label" data-i18n="routing.filters">فیلترها</span></div>
-          <div class="card">
-            <div class="switch-row">
-              <div><div class="switch-title" data-i18n="ads.title">مسدودسازی تبلیغات</div>
-                <div class="switch-sub" data-i18n="ads.sub">دامنه‌های تبلیغاتی بلاک می‌شن</div></div>
-              <label class="switch"><input type="checkbox" id="optBlockAds" /><span class="slider"></span></label>
+        <div class="card scan-run">
+          <div class="scan-run-row">
+            <button class="btn primary" id="btnScanStart" type="button" data-i18n="scan.start">شروع اسکن</button>
+            <button class="btn ghost" id="btnScanStop" type="button" data-i18n="scan.stop" disabled>توقف</button>
+            <span class="scan-stage" id="scanStage" data-stage="idle" data-i18n="scan.stage.idle">آماده</span>
+            <span class="scan-stage-text" id="scanStageText"></span>
+            <span class="scan-eta" id="scanEta"></span>
+            <span class="scan-elapsed" id="scanElapsed"></span>
+          </div>
+          <!-- one bar per phase; the wrapper is the track, the span inside is the fill -->
+          <div class="scan-bars">
+            <div class="scan-barline">
+              <span class="scan-bar-label" data-i18n="scan.stage.filter">غربال</span>
+              <div class="scan-bar" id="scanBarFilter"><span class="scan-bar-fill"></span></div>
             </div>
-            <div class="switch-row">
-              <div><div class="switch-title" data-i18n="sniff.title">Sniffing</div>
-                <div class="switch-sub" data-i18n="sniff.sub">تشخیص دامنه برای روتینگ دقیق‌تر</div></div>
-              <label class="switch"><input type="checkbox" id="optSniff" /><span class="slider"></span></label>
+            <div class="scan-barline">
+              <span class="scan-bar-label" data-i18n="scan.stage.speed">سرعت</span>
+              <div class="scan-bar scan-bar-sp" id="scanBarSpeed"><span class="scan-bar-fill"></span></div>
             </div>
           </div>
-        </aside>
-        </div><!-- /routing-cols -->
+          <!-- what the run itself said: the ECH config fetched once, cores left out and why -->
+          <ul class="scan-notes" id="scanNotes" hidden></ul>
+          <p class="hint warn scan-error" id="scanError" hidden></p>
+        </div>
+
+        <div class="card scan-results">
+          <div class="sec">
+            <span class="sec-label" data-i18n="scan.results">نتیجه‌ها</span>
+            <div class="head-actions">
+              <input type="number" id="scanTopN" class="input scan-num" dir="ltr" min="1" max="500" value="10" data-i18n-title="scan.topN" />
+              <button class="btn primary small" id="btnScanCopyTop" type="button" data-i18n="scan.copyTop">کپی لینک بهترین‌ها</button>
+              <button class="btn ghost small" id="btnScanRetop" type="button" data-i18n="scan.retop">تست دوبارهٔ سرعت</button>
+              <button class="btn ghost small" id="btnScanExportCsv" type="button" data-i18n="scan.exportCsv">CSV</button>
+              <button class="btn ghost small" id="btnScanExportJson" type="button" data-i18n="scan.exportJson">JSON</button>
+              <button class="btn ghost small" id="btnScanClear" type="button" data-i18n="scan.clear">پاک کردن</button>
+            </div>
+          </div>
+          <!-- many columns never fit 900px: the table scrolls inside this wrapper -->
+          <div class="scan-table-wrap">
+            <table class="scan-table" id="scanTable">
+              <thead>
+                <tr>
+                  <th class="scan-th" data-sort="addr"><span data-i18n="scan.col.addr">آدرس</span><span class="scan-sort"></span></th>
+                  <th class="scan-th scan-c-sni" id="scanThSni" data-sort="sni"><span data-i18n="scan.col.sni">SNI</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="engine"><span data-i18n="scan.col.engine">هسته</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="tcp"><span data-i18n="scan.col.tcp">TCP</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="median" data-i18n-title="scan.col.medianHint"><span data-i18n="scan.col.median">تأخیر</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="avg"><span data-i18n="scan.col.avg">میانگین</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="min"><span data-i18n="scan.col.min">کمینه</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="jitter"><span data-i18n="scan.col.jitter">جیتر</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="loss"><span data-i18n="scan.col.loss">اتلاف</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="down"><span data-i18n="scan.col.down">دانلود</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="up"><span data-i18n="scan.col.up">آپلود</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="score"><span data-i18n="scan.col.score">امتیاز</span><span class="scan-sort"></span></th>
+                  <th class="scan-th scan-th-acts"><span data-i18n="scan.col.actions">کارها</span></th>
+                </tr>
+              </thead>
+              <tbody id="scanTbody"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="scanEmpty" data-i18n="scan.empty">هنوز نتیجه‌ای نیست.</div>
+          <p class="hint scan-p1-hint" data-i18n="scan.p1Hint"></p>
+        </div>
       </section>
 
-      <!-- plus: SERVER (the local Xray server, src/renderer/plus/xserver.js) -->
+      <!-- SERVER (the local Xray server, src/renderer/plus/xserver.js) -->
       <section class="view" id="view-xserver">
         <div class="view-head"><h2 data-i18n="xs.title">سرور Xray</h2></div>
 
@@ -812,1043 +573,117 @@
         </div>
       </section>
 
-      <!-- plus: IP SCAN (src/renderer/plus/scan.js) -->
-      <section class="view" id="view-scan">
-        <div class="view-head"><h2 data-i18n="scan.title">اسکن IP</h2></div>
-        <p class="hint" data-i18n="scan.intro"></p>
-
-        <div class="scan-forms">
-          <!-- what is dialled: a stored config, or a link pasted here -->
-          <div class="card scan-card">
-            <div class="sec"><span class="sec-label" data-i18n="scan.config">کانفیگ</span></div>
-            <div class="seg scan-seg" id="scanSourceSeg">
-              <button type="button" class="seg-btn active" data-src="server" data-i18n="scan.srcServer">از سرورهای ذخیره‌شده</button>
-              <button type="button" class="seg-btn" data-src="link" data-i18n="scan.srcLink">جای‌گذاری لینک</button>
-            </div>
-            <div class="scan-src" id="scanSrcServer">
-              <label class="field-label" data-i18n="scan.pickServer">کانفیگ پایه</label>
-              <!-- the searchable picker mounts here; the <select> stays the value
-                   holder, out of sight, the way the settings option-cards do -->
-              <div class="scan-mount" id="scanSourceMount"></div>
-              <select id="scanSource" class="select vis-hidden" tabindex="-1" aria-hidden="true"></select>
-              <p class="hint" data-i18n="scan.pickHint"></p>
-            </div>
-            <div class="scan-src" id="scanSrcLink" hidden>
-              <label class="field-label" data-i18n="scan.link">لینک کانفیگ</label>
-              <textarea id="scanLink" class="textarea" rows="3" dir="ltr" spellcheck="false" data-i18n-ph="scan.linkPh"></textarea>
-            </div>
-          </div>
-
-          <!-- where to dial it from -->
-          <div class="card scan-card">
-            <div class="sec"><span class="sec-label" data-i18n="scan.ips">آدرس‌ها</span></div>
-            <textarea id="scanIps" class="textarea scan-ips" rows="7" dir="ltr" spellcheck="false" data-i18n-ph="scan.ipsPh"></textarea>
-            <div class="row-gap scan-ip-actions">
-              <button class="btn ghost small" id="btnScanCf" data-i18n="scan.cf">رنج‌های کلودفلر</button>
-              <button class="btn ghost small" id="btnScanFile" data-i18n="scan.file">از فایل</button>
-              <!-- how main reads the box: every address, or a fresh draw per range on every start -->
-              <div class="seg scan-pick" id="scanPickSeg">
-                <button type="button" class="seg-btn active" data-pick="all" data-i18n="scan.pick.all">همهٔ آدرس‌ها</button>
-                <button type="button" class="seg-btn" data-pick="random" data-i18n="scan.pick.random">تصادفی از هر رنج</button>
-              </div>
-              <input type="file" id="scanFile" accept=".txt,.csv,.log,text/plain" class="vis-hidden" tabindex="-1" aria-hidden="true" />
-              <span class="scan-count" id="scanCount"></span>
-            </div>
-            <div class="row-gap scan-pick-opts" id="scanPickOpts" hidden>
-              <label class="field-label scan-inline-label" for="scanPerRange" data-i18n="scan.perRange">از هر رنج</label>
-              <input type="number" id="scanPerRange" class="input scan-num" dir="ltr" min="1" max="5000" value="20" data-i18n-title="scan.perRangeHint" />
-              <label class="scan-check"><input type="checkbox" id="scanFresh" checked /><span class="scan-check-label" data-i18n="scan.fresh">فقط آدرس‌های تست‌نشده</span></label>
-              <button class="btn ghost small" id="btnScanForget" data-i18n="scan.forget">فراموش کردن تاریخچه</button>
-              <span class="scan-count" id="scanTested" hidden></span>
-            </div>
-          </div>
-
-          <!-- which cores and which probes -->
-          <div class="card scan-card">
-            <div class="sec"><span class="sec-label" data-i18n="scan.tests">تست‌ها</span></div>
-            <label class="field-label" data-i18n="scan.engines">هسته‌ها</label>
-            <div class="scan-checks" id="scanEngines"></div>
-            <label class="field-label scan-sub-label" data-i18n="scan.testsPick">چه چیزی اندازه گرفته شود</label>
-            <div class="scan-checks" id="scanTests"></div>
-            <p class="hint" data-i18n="scan.testsHint"></p>
-          </div>
-
-          <!-- how hard to push: one preset fills it all, every field stays editable -->
-          <div class="card scan-card">
-            <div class="sec"><span class="sec-label" data-i18n="scan.limits">محدودیت‌ها</span></div>
-            <label class="field-label" data-i18n="scan.preset">پیش‌تنظیم</label>
-            <div class="seg scan-preset" id="scanPreset">
-              <button type="button" class="seg-btn" data-preset="fast" data-i18n="scan.preset.fast">سریع</button>
-              <button type="button" class="seg-btn" data-preset="balanced" data-i18n="scan.preset.balanced">متعادل</button>
-              <button type="button" class="seg-btn" data-preset="accurate" data-i18n="scan.preset.accurate">دقیق</button>
-            </div>
-            <p class="hint" data-i18n="scan.presetHint"></p>
-
-            <label class="field-label scan-sub-label" data-i18n="scan.stage.filter">غربال</label>
-            <div class="scan-limits">
-              <div>
-                <label class="field-label" for="scanConc" data-i18n="scan.conc" data-i18n-title="scan.conc">چند IP هم‌زمان در هر هسته</label>
-                <input type="number" id="scanConc" class="input" dir="ltr" min="1" max="64" />
-              </div>
-              <div>
-                <label class="field-label" for="scanCores" data-i18n="scan.cores" data-i18n-title="scan.cores">هسته‌های موازی</label>
-                <input type="number" id="scanCores" class="input" dir="ltr" min="1" max="6" />
-              </div>
-              <div>
-                <label class="field-label" for="scanSamples" data-i18n="scan.samples" data-i18n-title="scan.samples">نمونه‌های تأخیر</label>
-                <input type="number" id="scanSamples" class="input" dir="ltr" min="1" max="10" />
-              </div>
-              <div>
-                <label class="field-label" for="scanTcpTimeout" data-i18n="scan.tcpTimeout" data-i18n-title="scan.tcpTimeout">سقف انتظار TCP (ms)</label>
-                <input type="number" id="scanTcpTimeout" class="input" dir="ltr" min="500" max="30000" step="100" />
-              </div>
-              <div>
-                <label class="field-label" for="scanDelayTimeout" data-i18n="scan.delayTimeout" data-i18n-title="scan.delayTimeout">سقف انتظار تأخیر (ms)</label>
-                <input type="number" id="scanDelayTimeout" class="input" dir="ltr" min="500" max="60000" step="100" />
-              </div>
-            </div>
-
-            <label class="field-label scan-sub-label" data-i18n="scan.stage.speed">سرعت</label>
-            <div class="scan-limits">
-              <div>
-                <label class="field-label" for="scanSpeedTop" data-i18n="scan.speedTop" data-i18n-title="scan.speedTop">چند IP برتر تست سرعت شوند؛ ۰ = بدون تست سرعت</label>
-                <input type="number" id="scanSpeedTop" class="input" dir="ltr" min="0" max="50" />
-              </div>
-              <div>
-                <label class="field-label" for="scanSpeedConc" data-i18n="scan.speedConc" data-i18n-title="scan.speedConc">چند تست سرعت هم‌زمان — ۱ دقیق‌ترین است</label>
-                <input type="number" id="scanSpeedConc" class="input" dir="ltr" min="1" max="4" />
-              </div>
-              <div>
-                <label class="field-label" for="scanSpeedRounds" data-i18n="scan.speedRounds" data-i18n-title="scan.speedRounds">چند دور دانلود؛ بهترین می‌ماند</label>
-                <input type="number" id="scanSpeedRounds" class="input" dir="ltr" min="1" max="3" />
-              </div>
-              <div>
-                <label class="field-label" for="scanDownMb" data-i18n="scan.downMb" data-i18n-title="scan.downMb">حجم دانلود (MB)</label>
-                <input type="number" id="scanDownMb" class="input" dir="ltr" min="1" max="500" />
-              </div>
-              <div>
-                <label class="field-label" for="scanDownHost" data-i18n="scan.downHost" data-i18n-title="scan.downHost">هاست دانلود</label>
-                <input type="text" id="scanDownHost" class="input" dir="ltr" spellcheck="false" />
-              </div>
-              <div>
-                <label class="field-label" for="scanDownPath" data-i18n="scan.downPath" data-i18n-title="scan.downPath">مسیر دانلود</label>
-                <input type="text" id="scanDownPath" class="input" dir="ltr" spellcheck="false" data-i18n-ph="scan.downPathPh" />
-              </div>
-            </div>
-
-            <!-- the one knob almost nobody should touch: how many IPs share a core -->
-            <div class="row-gap scan-adv">
-              <label class="field-label" for="scanBatch" data-i18n="scan.batch">اندازهٔ دسته</label>
-              <input type="number" id="scanBatch" class="input scan-num" dir="ltr" min="1" max="50" />
-            </div>
+      <!-- CONFIGS (src/renderer/plus/configs.js): what the scan dials and the server's exits point at -->
+      <section class="view" id="view-configs">
+        <div class="view-head">
+          <h2 data-i18n="cfg.title">کانفیگ‌ها</h2>
+          <div class="head-actions">
+            <button class="btn ghost" id="btnCfgImport" type="button" data-i18n="cfg.import">از IRNetFree</button>
+            <button class="btn ghost" id="btnCfgFile" type="button" data-i18n="cfg.file">از فایل</button>
+            <input type="file" id="cfgFile" accept=".txt,.json,.conf,text/plain,application/json" class="vis-hidden" tabindex="-1" aria-hidden="true" />
           </div>
         </div>
-
-        <div class="card scan-run">
-          <div class="scan-run-row">
-            <button class="btn primary" id="btnScanStart" data-i18n="scan.start">شروع اسکن</button>
-            <button class="btn ghost" id="btnScanStop" data-i18n="scan.stop" disabled>توقف</button>
-            <span class="scan-stage" id="scanStage" data-stage="idle" data-i18n="scan.stage.idle">آماده</span>
-            <span class="scan-stage-text" id="scanStageText"></span>
-            <span class="scan-eta" id="scanEta"></span>
-            <span class="scan-elapsed" id="scanElapsed"></span>
+        <p class="hint" data-i18n="cfg.intro"></p>
+        <div class="card">
+          <div class="sec"><span class="sec-label" data-i18n="cfg.add">افزودن</span></div>
+          <textarea id="cfgText" class="textarea cfg-text" rows="4" dir="ltr" spellcheck="false" data-i18n-ph="cfg.addPh"></textarea>
+          <div class="row-gap cfg-actions">
+            <button class="btn primary" id="btnCfgAdd" type="button" data-i18n="cfg.addBtn">افزودن</button>
+            <span class="hint" id="cfgResult"></span>
           </div>
-          <!-- one bar per phase; the wrapper is the track, the span inside is the fill -->
-          <div class="scan-bars">
-            <div class="scan-barline">
-              <span class="scan-bar-label" data-i18n="scan.stage.filter">غربال</span>
-              <div class="scan-bar" id="scanBarFilter"><span class="scan-bar-fill"></span></div>
-            </div>
-            <div class="scan-barline">
-              <span class="scan-bar-label" data-i18n="scan.stage.speed">سرعت</span>
-              <div class="scan-bar scan-bar-sp" id="scanBarSpeed"><span class="scan-bar-fill"></span></div>
-            </div>
-          </div>
-          <p class="hint warn scan-error" id="scanError" hidden></p>
         </div>
-
-        <div class="card scan-results">
+        <div class="card">
           <div class="sec">
-            <span class="sec-label" data-i18n="scan.results">نتیجه‌ها</span>
-            <div class="head-actions">
-              <button class="btn ghost small" id="btnScanRetop" data-i18n="scan.retop">تست دوبارهٔ بهترین‌ها</button>
-              <input type="number" id="scanRetopN" class="input scan-num" dir="ltr" min="1" max="500" value="10" data-i18n-title="scan.retopN" />
-              <button class="btn ghost small" id="btnScanExportCsv" data-i18n="scan.exportCsv">خروجی CSV</button>
-              <button class="btn ghost small" id="btnScanExportJson" data-i18n="scan.exportJson">خروجی JSON</button>
-              <button class="btn ghost small" id="btnScanClear" data-i18n="scan.clear">پاک کردن</button>
-            </div>
+            <span class="sec-label" data-i18n="cfg.list">فهرست</span>
+            <span class="cfg-count" id="cfgCount"></span>
           </div>
-          <!-- twelve columns never fit 900px: the table scrolls inside this
-               wrapper so the page itself never grows sideways -->
-          <div class="scan-table-wrap">
-            <table class="scan-table" id="scanTable">
-              <thead>
-                <tr>
-                  <th class="scan-th" data-sort="ip"><span data-i18n="scan.col.ip">IP</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="engine"><span data-i18n="scan.col.engine">هسته</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="tcp"><span data-i18n="scan.col.tcp">TCP</span><span class="scan-sort"></span></th>
-                  <!-- the median leads the delay group: one slow sample must not
-                       decide how an IP reads -->
-                  <th class="scan-th" data-sort="median" data-i18n-title="scan.col.medianHint"><span data-i18n="scan.col.median">تأخیر (میانه)</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="avg"><span data-i18n="scan.col.avg">میانگین</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="min"><span data-i18n="scan.col.min">کمینه</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="jitter"><span data-i18n="scan.col.jitter">جیتر</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="loss"><span data-i18n="scan.col.loss">اتلاف</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="down"><span data-i18n="scan.col.down">دانلود</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="up"><span data-i18n="scan.col.up">آپلود</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="score"><span data-i18n="scan.col.score">امتیاز</span><span class="scan-sort"></span></th>
-                  <th class="scan-th scan-th-acts"><span data-i18n="scan.col.actions">کارها</span></th>
-                </tr>
-              </thead>
-              <tbody id="scanTbody"></tbody>
-            </table>
-          </div>
-          <div class="empty" id="scanEmpty" data-i18n="scan.empty">هنوز نتیجه‌ای نیست.</div>
-          <p class="hint scan-p1-hint" data-i18n="scan.p1Hint"></p>
+          <input type="text" id="cfgSearch" class="input cfg-search" data-i18n-ph="cfg.search" />
+          <div class="cfg-list" id="cfgList"></div>
+          <div class="empty" id="cfgEmpty" data-i18n="cfg.empty">هنوز کانفیگی نیست.</div>
         </div>
+      </section>
+
+      <!-- LOG -->
+      <section class="view" id="view-logs">
+        <div class="view-head">
+          <h2 data-i18n="log.title">لاگ</h2>
+          <div class="head-actions">
+            <button class="btn ghost" id="btnLogCopy" type="button" data-i18n="log.copy">کپی</button>
+            <button class="btn ghost" id="btnLogClear" type="button" data-i18n="log.clear">پاک کردن</button>
+          </div>
+        </div>
+        <pre class="logbox plus-log" id="logBox"></pre>
       </section>
 
       <!-- SETTINGS -->
       <section class="view" id="view-settings">
-        <div class="view-head"><h2 data-i18n="settings.title">تنظیمات</h2></div>
+        <div class="view-head"><h2 data-i18n="nav.settings">تنظیمات</h2></div>
 
         <div class="card">
+          <div class="sec"><span class="sec-label" data-i18n="set.cores">هسته‌ها</span></div>
+          <p class="hint" data-i18n="set.coresHint"></p>
+          <div class="comp-list" id="compList"></div>
+        </div>
+
+        <div class="card">
+          <div class="sec"><span class="sec-label" data-i18n="set.look">ظاهر</span></div>
           <div class="grid2">
             <div>
-              <label class="field-label" data-i18n="set.socks">پورت SOCKS</label>
-              <input type="number" id="socksPort" class="input" />
-            </div>
-            <div>
-              <label class="field-label" data-i18n="set.http">پورت HTTP</label>
-              <input type="number" id="httpPort" class="input" />
-            </div>
-          </div>
-          <div class="grid2">
-            <div>
-              <label class="field-label" data-i18n="set.dnsRemote">DNS خارجی (از داخل تونل)</label>
-              <select id="dnsRemotePreset" class="select u-mbe-8">
-                <option value="" data-i18n="dns.custom">سفارشی…</option>
-                <option value="https://1.1.1.1/dns-query,https://1.0.0.1/dns-query">Cloudflare — DoH</option>
-                <option value="https://8.8.8.8/dns-query,https://8.8.4.4/dns-query">Google — DoH</option>
-                <option value="https://9.9.9.9/dns-query,https://149.112.112.112/dns-query">Quad9 — DoH</option>
-                <option value="https://94.140.14.14/dns-query,https://94.140.15.15/dns-query">AdGuard — DoH</option>
-                <option value="1.1.1.1,1.0.0.1">Cloudflare — UDP</option>
-                <option value="8.8.8.8,8.8.4.4">Google — UDP</option>
-              </select>
-              <input type="text" id="dnsRemoteInput" class="input" dir="ltr" placeholder="https://1.1.1.1/dns-query, https://8.8.8.8/dns-query" />
-              <p class="hint" data-i18n="dns.remoteHint"></p>
-            </div>
-            <div>
-              <label class="field-label" data-i18n="set.logLevel">سطح لاگ</label>
-              <select id="logLevel" class="select">
-                <option value="none">none</option>
-                <option value="error">error</option>
-                <option value="warning">warning</option>
-                <option value="info">info</option>
-                <option value="debug">debug</option>
-              </select>
-            </div>
-          </div>
-          <div class="grid2">
-            <div>
-              <label class="field-label" data-i18n="set.dnsDirect">DNS داخلی (برای دور زدن ایران)</label>
-              <select id="dnsDirectPreset" class="select u-mbe-8">
-                <option value="" data-i18n="dns.custom">سفارشی…</option>
-                <option value="178.22.122.100,185.51.200.2">Shecan (شکن)</option>
-                <option value="78.157.42.100,78.157.42.101">Electro (الکترو)</option>
-                <option value="10.202.10.202,10.202.10.102">begzar (بگذر)</option>
-                <option value="10.202.10.10,10.202.10.11">403.online</option>
-              </select>
-              <input type="text" id="dnsDirectInput" class="input" dir="ltr" placeholder="178.22.122.100, 185.51.200.2" />
-              <p class="hint" data-i18n="dns.directHint"></p>
-            </div>
-            <div></div>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="dnsm.title">مدیریت DNS توسط برنامه</div>
-              <div class="switch-sub" data-i18n="dnsm.sub"></div></div>
-            <label class="switch"><input type="checkbox" id="optDnsManaged" /><span class="slider"></span></label>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="ipv6.title">IPv6</div>
-              <div class="switch-sub" data-i18n="ipv6.sub"></div></div>
-            <label class="switch"><input type="checkbox" id="optIpv6" /><span class="slider"></span></label>
-          </div>
-          <div class="grid2">
-            <div>
-              <label class="field-label" data-i18n="set.lang">زبان / Language</label>
-              <select id="langSelect" class="select">
+              <label class="field-label" for="setLang" data-i18n="set.lang">زبان</label>
+              <select id="setLang" class="select">
                 <option value="fa">فارسی</option>
                 <option value="en">English</option>
               </select>
             </div>
             <div>
-              <label class="field-label" data-i18n="set.defaultEngine">هستهٔ پیش‌فرض</label>
-              <select id="defaultEngine" class="select">
-                <option value="xray" data-i18n="engine.official">Xray (رسمی)</option>
-                <option value="xray-pattn" data-i18n="engine.pattn">Xray-PattN (patterniha)</option>
+              <label class="field-label" for="setTheme" data-i18n="set.theme">پوسته</label>
+              <select id="setTheme" class="select">
+                <option value="system" data-i18n="set.themeSystem">مثل سیستم</option>
+                <option value="dark" data-i18n="set.themeDark">تیره</option>
+                <option value="light" data-i18n="set.themeLight">روشن</option>
               </select>
-              <p class="hint" data-i18n="set.defaultEngineHint"></p>
             </div>
           </div>
-          <div class="grid2">
+          <label class="field-label" for="setSkin" data-i18n="set.skin">ظاهر برنامه</label>
+          <select id="setSkin" class="select">
+            <option value="console">Console</option>
+            <option value="cockpit">Cockpit</option>
+            <option value="legacy">Legacy</option>
+          </select>
+        </div>
+
+        <div class="card" id="setStartCard">
+          <div class="switch-row">
             <div>
-              <label class="field-label" data-i18n="set.theme">تم</label>
-              <select id="themeSelect" class="select">
-                <option value="dark" data-i18n="theme.dark">تیره</option>
-                <option value="light" data-i18n="theme.light">روشن</option>
-                <option value="system" data-i18n="theme.system">مثل سیستم</option>
-              </select>
+              <div class="switch-title" data-i18n="set.openAtLogin">اجرا با روشن شدن سیستم</div>
+              <div class="switch-sub" data-i18n="set.openAtLoginSub"></div>
             </div>
-            <div>
-              <label class="field-label" data-i18n="set.skin">ظاهر برنامه</label>
-              <select id="skinSelect" class="select">
-                <option value="console" data-i18n="skin.console">کنسول (پیش‌فرض)</option>
-                <option value="cockpit" data-i18n="skin.cockpit">کاکپیت</option>
-                <option value="legacy" data-i18n="skin.legacy">کلاسیک</option>
-              </select>
-              <p class="hint" data-i18n="skin.hint">چیدمان یکی است؛ فقط رنگ‌ها، شکل‌ها و نوار کناری فرق می‌کنند. با هر دو تمِ تیره و روشن کار می‌کند.</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Required runtime files -->
-        <div class="card">
-          <label class="field-label" data-i18n="comp.title">فایل‌های موردنیاز</label>
-          <p class="hint" data-i18n="comp.hint"></p>
-          <div class="comp-list" id="compList"></div>
-          <p class="hint warn" id="compTunNote" data-i18n="comp.tunNote"></p>
-          <div class="setting-row">
-            <label class="field-label" data-i18n="assets.auto">به‌روزرسانی خودکار فایل‌ها</label>
-            <select id="optAutoUpdateAssets" class="select">
-              <option value="off" data-i18n="assets.auto.off">خاموش</option>
-              <option value="geo" data-i18n="assets.auto.geo">هفتگی — فقط فایل‌های geo</option>
-              <option value="all" data-i18n="assets.auto.all">هفتگی — فایل‌های geo و هسته‌ها</option>
-            </select>
-            <p class="hint" data-i18n="assets.auto.hint">فقط وقتی وصل نیستید. فایل‌های geo داده‌اند و کانفیگی را خراب نمی‌کنند؛ هستهٔ جدید می‌تواند رفتار عوض کند، پس فقط با انتخاب خودتان</p>
-          </div>
-          <div class="row-gap">
-            <button class="btn danger" id="btnRemoveFiles" data-i18n="comp.removeAll">حذف فایل‌های دانلودشده</button>
-          </div>
-          <p class="hint" data-i18n="comp.removeHint">فقط فایل‌هایی که برنامه دانلود کرده (در پوشهٔ داده‌ها) پاک می‌شوند.</p>
-        </div>
-
-        <div class="card">
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="sysproxy.title">پروکسی سیستمی</div>
-              <div class="switch-sub" data-i18n="sysproxy.sub">هنگام اتصال، پروکسی ویندوز تنظیم بشه</div></div>
-            <label class="switch"><input type="checkbox" id="optSysProxy" /><span class="slider"></span></label>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="tun.title">حالت TUN (تانل کل سیستم)</div>
-              <div class="switch-sub" data-i18n="tun.sub">همه‌ی ترافیک سیستم از تانل رد می‌شه (نیازمند sing-box (یا tun2socks) و دسترسی ادمین)</div></div>
-            <label class="switch"><input type="checkbox" id="optTun" /><span class="slider"></span></label>
-          </div>
-          <!-- OpenWrt only: there is no TUN switch there — the tunnel is the whole network's -->
-          <p class="hint" id="tunRouterNote" data-i18n="mode.routerNote" hidden></p>
-          <div class="tun-status" id="tunStatus"></div>
-          <button class="btn ghost admin-btn" id="btnRunAdmin" data-i18n="tun.runAdmin" hidden>اجرای مجدد با دسترسی ادمین</button>
-          <!-- which program builds the tunnel; changing it needs a reconnect -->
-          <div class="setting-row" id="tunBackendRow">
-            <label class="field-label" for="optTunBackend" data-i18n="set.tunBackend">بک‌اندِ TUN</label>
-            <!-- The <select> stays the source of truth — everything reads and
-                 writes .value, and the reconnect dialog watches it — and the
-                 cards below are a face for it that dispatch `change` on it. -->
-            <select id="optTunBackend" class="select vis-hidden">
-              <option value="native-macos" data-i18n="tun.backendNative" hidden>macOS native</option>
-              <option value="sing-box" data-i18n="tun.backendSingbox">sing-box</option>
-              <option value="tun2socks" data-i18n="tun.backendTun2socks">tun2socks</option>
-            </select>
-            <div class="opt-cards" id="tunBackendCards"></div>
-            <p class="hint" data-i18n="tun.backendHint"></p>
-          </div>
-          <div class="setting-row" id="nativeMacControls" hidden>
-            <div class="field-label" data-i18n="native.title"></div>
-            <p class="hint" data-i18n="native.hint"></p>
-            <div class="native-service-actions">
-              <button type="button" class="btn ghost" data-native-service="status" data-i18n="native.check"></button>
-              <button type="button" class="btn ghost" data-native-service="register" data-i18n="native.enable"></button>
-              <button type="button" class="btn ghost" data-native-service="settings" data-i18n="native.settings"></button>
-              <button type="button" class="btn ghost" data-native-service="unregister" data-i18n="native.disable"></button>
-            </div>
-            <p class="hint" id="nativeMacStatus" role="status" aria-live="polite" data-i18n="native.unchecked"></p>
-            <p class="hint warn" id="nativeMacStrict" data-i18n="native.strict" hidden></p>
-          </div>
-          <!-- which apps go through the tunnel and which go around it: sing-box
-               knows the process behind each packet, so it can split by app.
-               Same shape as the backend row above; what shows and what hides
-               inside it is updateTunAppRows(). -->
-          <div class="setting-row" id="tunAppRow">
-            <label class="field-label" for="optTunAppMode" data-i18n="tunapp.title">روتینگ به‌تفکیک برنامه (فقط sing-box)</label>
-            <select id="optTunAppMode" class="select vis-hidden">
-              <option value="off" data-i18n="tunapp.off">خاموش — همه‌ی برنامه‌ها از تونل می‌روند</option>
-              <option value="exclude" data-i18n="tunapp.exclude">به‌جز این‌ها — برنامه‌های فهرست از تونل بیرون می‌روند، بقیه از تونل</option>
-              <option value="only" data-i18n="tunapp.only">فقط این‌ها — فقط برنامه‌های فهرست از تونل می‌روند؛ بقیه‌ی سیستم بیرون از تونل است</option>
-            </select>
-            <div class="opt-cards" id="tunAppModeCards"></div>
-            <!-- the list only exists once a mode is chosen -->
-            <div class="row-stack" id="tunAppsBlock" hidden>
-              <textarea id="optTunApps" class="textarea" rows="4" dir="ltr" spellcheck="false" data-i18n-ph="tunapp.ph"></textarea>
-              <div class="row-gap">
-                <button class="btn ghost" type="button" id="btnTunAppsPick" data-i18n="tunapp.pick">از برنامه‌های متصل</button>
-                <select id="tunAppsPick" class="select" hidden></select>
-              </div>
-              <p class="hint" data-i18n="tunapp.hint"></p>
-            </div>
-            <p class="hint warn" id="tunAppStrictNote" data-i18n="tunapp.strictNote" hidden></p>
-            <p class="hint warn" id="tunAppNeedsSingbox" data-i18n="tunapp.needsSingbox" hidden></p>
-          </div>
-          <!-- how hard the guard holds; TUN mode only (see updateGuardRows) -->
-          <div class="setting-row" id="leakGuardRow">
-            <label class="field-label" for="optLeakGuard" data-i18n="set.leakGuard">گارد نشتی</label>
-            <select id="optLeakGuard" class="select vis-hidden">
-              <option value="off" data-i18n="guard.off">خاموش</option>
-              <option value="standard" data-i18n="guard.standard">استاندارد</option>
-              <option value="strict" data-i18n="guard.strict">سخت‌گیرانه</option>
-            </select>
-            <div class="opt-cards" id="leakGuardCards"></div>
-            <p class="hint" data-i18n="guard.hint"></p>
-            <p class="hint warn" id="guardMacNote" data-i18n="guard.macExperimental" hidden></p>
-            <p class="hint warn" id="guardStrictRouting" data-i18n="guard.strictRouting" hidden></p>
-            <p class="hint warn" id="guardNeedsTun" data-i18n="guard.needsTun" hidden></p>
-          </div>
-          <!-- sing-box 1.14+ answers the tunnel's DNS itself unless told not to (tunSingbox.tunDnsModeFor) -->
-          <div class="setting-row" id="singboxDnsRow">
-            <label class="field-label" for="optSingboxDns" data-i18n="set.singboxDns">DNS در TUN (sing-box)</label>
-            <select id="optSingboxDns" class="select vis-hidden">
-              <option value="app" data-i18n="sbdns.app">برنامه</option>
-              <option value="core" data-i18n="sbdns.core">خودِ sing-box</option>
-            </select>
-            <div class="opt-cards" id="singboxDnsCards"></div>
-            <p class="hint" data-i18n="sbdns.hint"></p>
-            <p class="hint warn" id="sbdnsStrictNote" data-i18n="sbdns.strictNote" hidden></p>
-          </div>
-          <!-- the proxy-mode counterpart: TUN already carries UDP, so it is the other way round -->
-          <div class="switch-row" id="udpBlockRow">
-            <div><div class="switch-title" data-i18n="udpblock.title">بستن UDP در حالت پروکسی</div>
-              <div class="switch-sub" data-i18n="udpblock.sub"></div>
-              <div class="hint warn" id="udpBlockNote" data-i18n="udpblock.needsProxy" hidden></div></div>
-            <label class="switch"><input type="checkbox" id="optBlockUdpProxy" /><span class="slider"></span></label>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="lan.title">اجازه به شبکه محلی (LAN)</div>
-              <div class="switch-sub" data-i18n="lan.sub">دستگاه‌های دیگه هم بتونن وصل بشن</div></div>
-            <label class="switch"><input type="checkbox" id="optAllowLan" /><span class="slider"></span></label>
-          </div>
-          <div class="tun-status" id="lanInfo"></div>
-          <!-- OpenWrt only (state.flavor === 'openwrt'): the devices behind the
-               router and which of them go around the tunnel. Filled by
-               renderLanDevices(); a tick saves lanBypassMacs and applies live. -->
-          <div class="setting-row" id="gwRow" hidden>
-            <div class="field-label" data-i18n="gw.title">دستگاه‌های شبکه</div>
-            <!-- the first line under the title: what the inspector's gateway row (which opens this) means -->
-            <p class="hint" data-i18n="gw.insHint"></p>
-            <p class="hint" data-i18n="gw.sub"></p>
-            <div class="row-gap">
-              <button class="btn ghost" type="button" id="btnGwRefresh" data-i18n="gw.refresh">تازه‌سازی</button>
-            </div>
-            <div class="gw-list" id="gwList"></div>
-            <p class="hint" data-i18n="gw.hint"></p>
-          </div>
-          <!-- OpenWrt only: QUIC from the LAN refused, so browsers use TCP (which every proxy carries) -->
-          <div class="switch-row" id="gwQuicRow" hidden>
-            <div><div class="switch-title" data-i18n="gw.quic">رد کردن QUIC (UDP 443) از شبکه</div>
-              <div class="switch-sub" data-i18n="gw.quicSub"></div></div>
-            <label class="switch"><input type="checkbox" id="optLanBlockQuic" /><span class="slider"></span></label>
-          </div>
-          <!-- OpenWrt only: remote access lives in LuCI, not on this page — the
-               LuCI page and the guide are links (renderRemotePointer) -->
-          <div class="setting-row" id="gwRemoteRow" hidden>
-            <p class="hint" id="gwRemote" data-i18n="gw.remote"></p>
-          </div>
-          <!-- mux on the servers' own outbounds (src/main/mux.js): auto tests each
-               WebSocket / HTTPUpgrade server once. Written into the config, so a
-               change waits for a reconnect, like the settings around it. -->
-          <div class="setting-row" id="muxRow">
-            <label class="field-label" for="optMux" data-i18n="set.mux">Mux (مالتی‌پلکس)</label>
-            <select id="optMux" class="select">
-              <option value="auto" data-i18n="mux.auto">خودکار</option>
-              <option value="on" data-i18n="mux.on">روشن</option>
-              <option value="off" data-i18n="mux.off" selected>خاموش</option>
-            </select>
-            <p class="hint" data-i18n="mux.hint"></p>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="kill.title">کیل سوییچ (Kill switch)</div>
-              <div class="switch-sub" data-i18n="kill.sub">اگر اتصال ناگهانی قطع شد، کل اینترنت بسته می‌شود تا نشتی نباشد (ویندوز، نیازمند ادمین)</div></div>
-            <label class="switch"><input type="checkbox" id="optKillSwitch" /><span class="slider"></span></label>
-          </div>
-          <div class="tun-status" id="killStatus"></div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="netauto.title">اتصال مجدد خودکار هنگام تغییر شبکه</div>
-              <div class="switch-sub" data-i18n="netauto.sub">اگر اینترنت عوض شد (وای‌فای/کابل/بیدارشدن از خواب)، تونل خودکار بازسازی می‌شود</div></div>
-            <label class="switch"><input type="checkbox" id="optNetAuto" /><span class="slider"></span></label>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="notify.title">اعلان سیستمی</div>
-              <div class="switch-sub" data-i18n="notify.sub">هنگام قطع، اتصال مجدد یا فعال‌شدن کیل‌سوییچ یک اعلان کوتاه نشان داده می‌شود</div></div>
-            <label class="switch"><input type="checkbox" id="optNotify" /><span class="slider"></span></label>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="login.title">اجرا با ویندوز</div>
-              <div class="switch-sub" data-i18n="login.sub">برنامه هنگام ورود به سیستم، پنهان در سینی، اجرا می‌شود (روی ویندوز یک task زمان‌بندی‌شده با دسترسی ادمین ساخته می‌شود)</div></div>
-            <label class="switch"><input type="checkbox" id="optLaunchAtLogin" /><span class="slider"></span></label>
-          </div>
-          <div class="switch-row">
-            <div><div class="switch-title" data-i18n="autoconn.title">اتصال خودکار</div>
-              <div class="switch-sub" data-i18n="autoconn.sub">هنگام اجرا به آخرین سروری که وصل بودید وصل می‌شود</div></div>
-            <label class="switch"><input type="checkbox" id="optAutoConnect" /><span class="slider"></span></label>
+            <label class="switch"><input type="checkbox" id="setOpenAtLogin" /><span class="slider"></span></label>
           </div>
         </div>
 
         <div class="card">
-          <label class="field-label" data-i18n="xray.label">مسیر هسته Xray</label>
-          <div class="xray-status" id="xrayStatus" data-i18n="xray.checking">در حال بررسی…</div>
-          <div class="xray-version" id="xrayVersion"></div>
-          <div class="row-gap">
-            <button class="btn ghost" id="btnLocateXray" data-i18n="btn.locate">انتخاب فایل xray</button>
-            <button class="btn ghost" id="btnOpenData" data-i18n="btn.openData">پوشه داده‌ها</button>
-            <button class="btn ghost" id="btnDownloadHelp" data-i18n="btn.help">راهنمای دانلود</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <button class="btn primary" id="btnSaveSettings" data-i18n="btn.save">ذخیره تنظیمات</button>
-          <span class="saved-hint" id="savedHint"></span>
-        </div>
-
-        <!-- About / Update -->
-        <div class="card">
-          <label class="field-label" data-i18n="about.title">درباره و به‌روزرسانی</label>
+          <div class="sec"><span class="sec-label" data-i18n="set.about">درباره</span></div>
           <div class="about-row">
-            <span class="about-label" data-i18n="about.version">نسخه برنامه</span>
-            <span class="about-val" id="appVersion">—</span>
+            <span class="about-label" data-i18n="app.version">نسخه</span>
+            <span class="about-val" id="aboutVersion" dir="ltr">—</span>
           </div>
+          <div class="about-row">
+            <span class="about-label" data-i18n="set.dataDir">پوشهٔ داده‌ها</span>
+            <span class="about-val" id="aboutDataDir" dir="ltr">—</span>
+          </div>
+          <p class="hint" data-i18n="set.aboutHint"></p>
           <div class="update-status" id="updateStatus"></div>
           <div class="row-gap">
-            <button class="btn ghost" id="btnCheckUpdate" data-i18n="about.check">بررسی به‌روزرسانی</button>
-            <button class="btn primary" id="btnDownloadUpdate" data-i18n="about.download" hidden>دانلود نسخه جدید</button>
-          </div>
-          <p class="hint" data-i18n="backup.hint">پشتیبان همهٔ سرورها، ساب‌ها، زنجیره‌ها، استخر، تنظیمات و مصرف را در یک فایل JSON می‌گذارد؛ بازیابی، آنچه را که هست نگه می‌دارد و فقط موارد تازه را اضافه می‌کند</p>
-          <div class="row-gap">
-            <button class="btn ghost" id="btnBackupExport" data-i18n="backup.export">پشتیبان‌گیری (JSON)</button>
-            <button class="btn ghost" id="btnBackupImport" data-i18n="backup.import">بازیابی از فایل</button>
-            <input type="file" id="backupFile" accept=".json,application/json" class="vis-hidden" tabindex="-1" aria-hidden="true" />
+            <button class="btn ghost" id="btnCheckUpdate" type="button" data-i18n="set.checkUpdate">بررسی نسخهٔ تازه</button>
+            <button class="btn ghost" id="btnOpenData" type="button" data-i18n="set.openData">پوشهٔ داده‌ها</button>
           </div>
         </div>
       </section>
-
-      <!-- LOGS -->
-      <section class="view" id="view-logs">
-        <div class="view-head">
-          <h2 data-i18n="logs.title">لاگ‌ها</h2>
-          <button class="btn ghost" id="btnClearLogs" data-i18n="btn.clearLogs">پاک کردن</button>
-        </div>
-        <pre class="logbox" id="logBox"></pre>
-      </section>
-
     </main>
-
-    <!-- Inspector: what the tunnel is doing right now, always in view. Every
-         value here is already known to the renderer — it is filled from the
-         same state the settings page renders from, never polled. -->
-    <aside class="inspector pro-only" id="inspector">
-      <div class="sec"><span class="sec-label" data-i18n="ins.title">اینسپکتور</span></div>
-
-      <div class="ins-group">
-        <div class="ins-head" data-i18n="ins.protection">محافظت</div>
-        <!-- #insTunRow / #insGuardRow: the router has no TUN switch and no guard cards to mirror (applyFlavor) -->
-        <div class="ins-row" id="insTunRow"><span class="ins-label" data-i18n="ins.tun">TUN</span><span class="ins-val" id="insTun">—</span></div>
-        <div class="ins-row"><span class="ins-label" data-i18n="ins.kill">Kill switch</span><span class="ins-val" id="insKill">—</span></div>
-        <div class="ins-row" id="insGuardRow"><span class="ins-label" data-i18n="ins.guard">Leak guard</span><span class="ins-val" id="insGuard">—</span></div>
-        <div class="ins-row"><span class="ins-label" data-i18n="ins.ipv6">IPv6</span><span class="ins-val" id="insIpv6">—</span></div>
-        <!-- OpenWrt only: a status, not a switch — the button says what it means and opens the device list -->
-        <button type="button" class="ins-row" id="insGatewayRow" hidden data-i18n-title="gw.insHint"><span class="ins-label" data-i18n="ins.gateway">تونل کل شبکه</span><span class="ins-val ins-text" id="insGateway">—</span></button>
-      </div>
-
-      <div class="ins-div"></div>
-
-      <div class="ins-group">
-        <div class="ins-head" data-i18n="ins.ports">پورت‌های محلی</div>
-        <div class="ins-row"><span class="ins-label">SOCKS</span><span class="ins-val" id="insSocks">—</span></div>
-        <div class="ins-row"><span class="ins-label">HTTP</span><span class="ins-val" id="insHttp">—</span></div>
-        <div class="ins-row"><span class="ins-label" data-i18n="ins.core">هسته</span><span class="ins-val" id="insCore">—</span></div>
-        <div class="ins-row"><span class="ins-label" data-i18n="ins.routing">روتینگ</span><span class="ins-val accent" id="insRouting">—</span></div>
-      </div>
-
-      <div class="ins-div"></div>
-
-      <div class="ins-actions">
-        <button class="btn small" id="btnInsPing" data-i18n="btn.quickPing">تست پینگ</button>
-        <button class="btn small" id="btnInsIp" data-i18n="btn.checkIp">بررسی IP</button>
-      </div>
-    </aside>
   </div>
 
-  <!-- edit server modal -->
-  <div class="modal-overlay" id="editModal" hidden>
-    <div class="modal ed-modal">
-      <div class="modal-head">
-        <span class="modal-title" id="edTitle" data-i18n="edit.title">ویرایش سرور</span>
-        <span class="ed-head-proto" id="edHeadProto" dir="ltr"></span>
-        <!-- one draft, two views (app.js setEditView): today's form, or every field in five tabs -->
-        <div class="seg ed-view" id="edView" role="radiogroup" data-i18n-title="edit.view.label">
-          <button type="button" class="seg-btn active" role="radio" aria-checked="true" data-edit-view="simple" data-i18n="edit.view.simple">ساده</button>
-          <button type="button" class="seg-btn" role="radio" aria-checked="false" data-edit-view="pro" data-i18n="edit.view.pro">حرفه‌ای</button>
-        </div>
-        <button class="tb-btn" id="editClose">&#x2715;</button>
-      </div>
-      <div class="modal-body" id="editBody">
-        <div class="ed-simple" id="edSimple">
-        <div class="grid2" id="edNameRow">
-          <div><label class="field-label" data-i18n="edit.name">نام</label>
-            <input type="text" id="edName" class="input" /></div>
-          <div id="edAddrWrap"><label class="field-label" id="edAddrLabel" data-i18n="edit.address">آدرس</label>
-            <input type="text" id="edAddress" class="input" dir="ltr" /></div>
-        </div>
-        <!-- A JSON server (source 'json'): the config itself is the one source, so the link fields
-             below are hidden for it and this block stands in. Always LTR and monospace. -->
-        <div class="ed-json" id="edJsonWrap" hidden>
-          <div>
-            <label class="field-label" id="edJsonModeLabel" data-i18n="ed.jsonMode">نحوهٔ اجرا</label>
-            <div class="seg" id="edJsonMode" role="radiogroup" aria-labelledby="edJsonModeLabel">
-              <button type="button" class="seg-btn active" role="radio" aria-checked="true" data-json-mode="full" data-i18n="ed.jsonFull">کامل</button>
-              <button type="button" class="seg-btn" role="radio" aria-checked="false" data-json-mode="raw" data-i18n="ed.jsonRaw">خام</button>
-            </div>
-            <p class="hint" id="edJsonHelp"></p>
-            <!-- the router's web UI only (flavor openwrt), with Raw selected -->
-            <p class="hint warn" id="edJsonRouterNote" hidden></p>
-          </div>
-          <div class="ed-json-info" id="edJsonInfo" hidden></div>
-          <div>
-            <label class="field-label" for="edJson" data-i18n="ed.jsonEditor">کانفیگ (JSON)</label>
-            <textarea id="edJson" class="textarea ed-json-text" dir="ltr" rows="14" wrap="off" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
-            <p class="hint warn" id="edJsonError" dir="auto" role="alert" hidden></p>
-          </div>
-          <div class="ed-json-actions">
-            <button type="button" class="btn ghost small" id="edJsonCopy" data-i18n="ed.jsonCopy">کپی JSON</button>
-          </div>
-        </div>
-        <div class="ed-fields" id="edLinkFields">
-        <div class="grid2">
-          <div><label class="field-label" id="edPortLabel" data-i18n="edit.port">پورت</label>
-            <input type="number" id="edPort" class="input" dir="ltr" /></div>
-          <div id="edCredWrap"><label class="field-label" id="edCredLabel" data-i18n="edit.uuid">شناسه</label>
-            <input type="text" id="edCred" class="input" dir="ltr" /></div>
-        </div>
-        <!-- MASQUE: its HTTP version, as two cards (app.js setMasqueHttpForm) -->
-        <div class="ed-masque" id="edMasqueRow" hidden>
-          <div class="field-label"><span data-i18n="sf.masqueHttp">نسخهٔ HTTP</span> <span class="ed-key" dir="ltr">alpn</span></div>
-          <div class="ed-http" id="edMasqueHttp" role="radiogroup">
-            <button type="button" class="ed-http-opt" role="radio" aria-checked="false" data-masque-http="h3"><span><bdi dir="ltr">HTTP/3</bdi></span><small data-i18n="masque.h3Desc">روی QUIC (UDP 443)</small></button>
-            <button type="button" class="ed-http-opt" role="radio" aria-checked="false" data-masque-http="h2"><span><bdi dir="ltr">HTTP/2</bdi></span><small data-i18n="masque.h2Desc">روی TCP 443</small></button>
-          </div>
-        </div>
-        <!-- what the Simple view lacked (VLESS flow and Encryption, the VMess cipher, the SS method): drawn from serverFields.js -->
-        <div class="ed-simple-extra" id="edSimpleExtra" hidden></div>
-        <!-- transport row (hidden for ss/wireguard) -->
-        <div class="grid2" id="edTransportRow">
-          <div><label class="field-label" data-i18n="edit.network">ترنسپورت</label>
-            <select id="edNetwork" class="select">
-              <option value="tcp">tcp</option><option value="ws">ws</option>
-              <option value="grpc">grpc</option><option value="h2">h2</option>
-              <option value="xhttp">xhttp</option><option value="kcp">kcp</option>
-              <option value="httpupgrade">httpupgrade</option>
-            </select></div>
-          <div><label class="field-label" data-i18n="edit.security">امنیت</label>
-            <select id="edSecurity" class="select">
-              <option value="none">none</option><option value="tls">tls</option>
-              <option value="reality">reality</option>
-            </select></div>
-        </div>
-        <div class="edit-section" id="edSpoofHead"><span id="edSpoofHeadText">🛡 SNI spoofing</span></div>
-        <div class="grid2" id="edTlsRow">
-          <div><label class="field-label" id="edSniLabel">SNI</label>
-            <input type="text" id="edSni" class="input" dir="ltr" placeholder="e.g. www.google.com" /></div>
-          <div id="edHostWrap"><label class="field-label" id="edHostLabel">Host</label>
-            <input type="text" id="edHost" class="input" dir="ltr" /></div>
-        </div>
-        <!-- MASQUE: a WARP account's summary (app.js renderMasqueSimple), or a Basic user and password -->
-        <div class="ed-masque" id="edMasqueAuth" hidden>
-          <div class="ed-card" id="edWarpCard" hidden>
-            <div class="ed-card-head">
-              <span class="warp-ico sm" aria-hidden="true">☁</span>
-              <span><span class="ttl" data-i18n="masque.warpTitle">WARP کلادفلر</span><br><span class="sub" data-i18n="masque.warpFromSignup">کلیدها از ثبت‌نام آمده‌اند.</span></span>
-            </div>
-            <div class="ed-chips-read" id="edWarpChips"></div>
-          </div>
-          <div class="grid2" id="edMasqueCred">
-            <div><label class="field-label" data-i18n="sf.masqueUser">نام کاربری</label>
-              <input type="text" id="edMasqueUser" class="input" dir="ltr" spellcheck="false" data-i18n-ph="masque.optional" /></div>
-            <div><label class="field-label" data-i18n="sf.masquePass">رمز عبور</label>
-              <input type="text" id="edMasquePass" class="input" dir="ltr" spellcheck="false" data-i18n-ph="masque.optional" /></div>
-          </div>
-        </div>
-        <p class="hint" id="edSpoofHint">The SNI is the domain sent in the TLS handshake.</p>
-        <label class="switch-row inline-switch" id="edHideSniRow">
-          <span class="switch-title" id="edHideSniLabel">🕵 Hide SNI from DPI (TLS fragment)</span>
-          <span class="switch"><input type="checkbox" id="edHideSni" /><span class="slider"></span></span>
-        </label>
-        <!-- the server's finalmask already fragments the ClientHello: this switch would add a second fragmenter -->
-        <p class="hint warn" id="edHideSniFmNote" data-i18n="spoof.hideSniFinalmask" hidden></p>
-        <div class="grid2" id="edPathRow">
-          <div><label class="field-label" data-i18n="edit.path">Path / ServiceName</label>
-            <input type="text" id="edPath" class="input" dir="ltr" /></div>
-          <div><label class="field-label" data-i18n="edit.fp">Fake ClientHello (browser fingerprint)</label>
-            <select id="edFp" class="select">
-              <option value="chrome">chrome</option>
-              <option value="firefox">firefox</option>
-              <option value="safari">safari</option>
-              <option value="ios">ios</option>
-              <option value="android">android</option>
-              <option value="edge">edge</option>
-              <option value="random">random</option>
-              <option value="randomized">randomized</option>
-              <option value="unsafe">unsafe (custom cipherSuites)</option>
-            </select></div>
-        </div>
-        <div class="grid2" id="edRealityRow" hidden>
-          <div><label class="field-label" data-i18n="edit.pbk">Public Key (pbk)</label>
-            <input type="text" id="edPbk" class="input" dir="ltr" /></div>
-          <div><label class="field-label" data-i18n="edit.sid">Short ID (sid)</label>
-            <input type="text" id="edSid" class="input" dir="ltr" /></div>
-        </div>
-        <!-- REALITY's post-quantum check (pqv): the server's ML-DSA-65 public key -->
-        <div id="edPqvRow" hidden>
-          <label class="field-label" data-i18n="edit.pqv">ML-DSA-65 verify key (pqv)</label>
-          <input type="text" id="edPqv" class="input" dir="ltr" spellcheck="false" />
-        </div>
-        <!-- Hysteria2: the salamander obfuscation and port hopping -->
-        <div class="grid2" id="edHy2Row" hidden>
-          <div><label class="field-label" data-i18n="edit.hy2Obfs">Obfs password (salamander)</label>
-            <input type="text" id="edHy2Obfs" class="input" dir="ltr" spellcheck="false" /></div>
-          <div><label class="field-label" data-i18n="edit.hy2Ports">Port hopping</label>
-            <input type="text" id="edHy2Ports" class="input" dir="ltr" placeholder="20000-50000" spellcheck="false" /></div>
-        </div>
-        <!-- newer TLS knobs: Encrypted Client Hello, a certificate pin, the name to verify against -->
-        <div id="edTlsExtra" hidden>
-          <label class="field-label" data-i18n="edit.ech">ECH — Encrypted Client Hello</label>
-          <input type="text" id="edEch" class="input" dir="ltr" spellcheck="false" placeholder="cloudflare-ech.com+udp://1.1.1.1" />
-          <p class="hint" data-i18n="edit.echHint">Hides the real SNI inside an encrypted ClientHello. Either the ECH config itself (base64) or where to fetch it: name+udp://resolver or name+https://resolver/dns-query. Empty = off.</p>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="edit.pcs">Certificate SHA-256 (pcs)</label>
-              <input type="text" id="edPcs" class="input" dir="ltr" spellcheck="false" placeholder="e3b0c442…, …" /></div>
-            <div><label class="field-label" data-i18n="edit.vcn">Verify certificate as (vcn)</label>
-              <input type="text" id="edVcn" class="input" dir="ltr" spellcheck="false" placeholder="real.example.com" /></div>
-          </div>
-          <p class="hint" data-i18n="edit.pcsHint">pcs: accept exactly this certificate (a self-signed one too) — what replaced Allow Insecure. vcn: check the certificate against this name instead of the SNI.</p>
-        </div>
-        <label class="switch-row inline-switch" id="edInsecureRow">
-          <span class="switch-title" data-i18n="edit.allowInsecure">Allow Insecure</span>
-          <span class="switch"><input type="checkbox" id="edInsecure" /><span class="slider"></span></span>
-        </label>
-        <div class="hint" id="edInsecureHint" data-i18n="edit.insecureHint"></div>
-        <!-- the certificate pinned on first use (certPin.js): read-only, clearable -->
-        <div class="hint" id="edCertPinRow" dir="ltr" hidden>
-          <span data-i18n="edit.certPin">Pinned certificate</span>: <code id="edCertPin"></code>
-          <button type="button" class="btn ghost tiny" id="edCertPinClear" data-i18n="edit.certPinClear">Clear pin</button>
-        </div>
-        <!-- socks/http proxy credentials -->
-        <div class="grid2" id="edProxyRow" hidden>
-          <div><label class="field-label" data-i18n="proxy.user">نام کاربری (اختیاری)</label>
-            <input type="text" id="edProxyUser" class="input" dir="ltr" /></div>
-          <div><label class="field-label" data-i18n="proxy.pass">رمز عبور (اختیاری)</label>
-            <input type="text" id="edProxyPass" class="input" dir="ltr" /></div>
-        </div>
-        <!-- wireguard extras -->
-        <div id="edWgExtra" hidden>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.publicKey">Peer Public Key</label>
-              <input type="text" id="edWgPub" class="input" dir="ltr" /></div>
-            <div><label class="field-label" data-i18n="wg.address">Address</label>
-              <input type="text" id="edWgAddr" class="input" dir="ltr" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.psk">Pre-shared Key</label>
-              <input type="text" id="edWgPsk" class="input" dir="ltr" /></div>
-            <div><label class="field-label" data-i18n="wg.mtu">MTU</label>
-              <input type="number" id="edWgMtu" class="input" dir="ltr" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.reserved">Reserved</label>
-              <input type="text" id="edWgReserved" class="input" dir="ltr" /></div>
-            <div><label class="field-label" data-i18n="wg.allowed">Allowed IPs</label>
-              <input type="text" id="edWgAllowed" class="input" dir="ltr" placeholder="0.0.0.0/0, ::/0" /></div>
-          </div>
-          <div class="grid2">
-            <div><label class="field-label" data-i18n="wg.dns">DNS</label>
-              <input type="text" id="edWgDns" class="input" dir="ltr" placeholder="192.168.60.1, tes.systems" /></div>
-            <div></div>
-          </div>
-        </div>
-        <div class="edit-section" id="edAdvHead"><span data-i18n="edit.advTitle">⚙ Advanced — DPI evasion (optional)</span></div>
-        <!-- Per-config core / engine (all protocols) -->
-        <div class="grid2" id="edEngineRow">
-          <div><label class="field-label" data-i18n="edit.engine">Core / Engine</label>
-            <select id="edEngine" class="select">
-              <option value="xray" data-i18n="engine.official">Xray (official)</option>
-              <option value="xray-pattn" data-i18n="engine.pattn">Xray-PattN (patterniha)</option>
-              <option value="sing-box" data-i18n="engine.singbox">sing-box (fake ClientHello / uTLS)</option>
-            </select></div>
-          <div class="engine-hint"><p class="hint" id="edEngineHint" data-i18n="edit.engineHint">Only this config runs on the chosen core. sing-box needs its binary in bin/; falls back to Xray if missing.</p>
-            <!-- MASQUE runs on Xray or Xray-PattN only (app.js hides the sing-box option for it) -->
-            <p class="hint" id="edEngineHintMasque" data-i18n="sf.engine.hint.masque" hidden>sing-box MASQUE ندارد.</p></div>
-        </div>
-        <!-- TLS fragmentation (all protocols); MASQUE shows one of the two: a fragment over HTTP/2, noise over HTTP/3 -->
-        <div class="grid2" id="edFragmentRow">
-          <div id="edFragmentWrap"><label class="field-label" data-i18n="edit.fragment">Fragment (packets,length,interval — خالی = خاموش)</label>
-            <input type="text" id="edFragment" class="input" dir="ltr" placeholder="tlshello,100-200,10-20" /></div>
-          <div id="edNoiseWrap"><label class="field-label" data-i18n="edit.noise">Noise (anti-DPI / fake ClientHello)</label>
-            <select id="edNoise" class="select">
-              <option value="off" data-i18n="noise.off">Off</option>
-              <option value="random" data-i18n="noise.random">Random</option>
-              <option value="faketls" data-i18n="noise.faketls">Fake ClientHello</option>
-              <option value="custom" data-i18n="noise.custom">Custom…</option>
-            </select></div>
-        </div>
-        <div id="edNoiseCustomRow" hidden>
-          <label class="field-label" data-i18n="edit.noiseCustom">Noise spec (type:packet:delay; …)</label>
-          <input type="text" id="edNoiseCustom" class="input" dir="ltr" placeholder="rand:50-100:0;base64:FgMBAAA=:10-20" />
-          <p class="hint" data-i18n="edit.noiseHint">Decoy packets sent before the real TLS handshake to confuse DPI. type = rand/str/base64/hex.</p>
-        </div>
-        <!-- patterniha custom-TLS (only meaningful for TLS configs) -->
-        <div id="edPattWrap">
-          <div class="edit-section"><span data-i18n="edit.pattTitle">🧩 finalmask / cipherSuites</span></div>
-          <label class="field-label" data-i18n="edit.cipherSuites">cipherSuites (با fingerprint = unsafe)</label>
-          <input type="text" id="edCipherSuites" class="input" dir="ltr" placeholder="TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256" />
-          <label class="field-label u-mbs-8 u-block" data-i18n="edit.finalMask">finalmask (JSON — همان چیزی که در لینک با fm می‌آید)</label>
-          <textarea id="edFinalMask" class="input" dir="ltr" rows="3" spellcheck="false" placeholder='{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["3-5","6-8"],"delays":["10-20"],"maxSplit":"3-6"}}]}'></textarea>
-          <p class="hint" data-i18n="edit.pattHint">دقیقاً همان JSON را بچسبان؛ برنامه دست‌کاری‌اش نمی‌کند. برای روش پترنیها: Address یک IP تمیز کلودفلر، fingerprint = unsafe، بعد cipherSuites و finalmask.</p>
-        </div>
-        <!-- the Simple view's last line: everything else is in the Pro view (filled by app.js) -->
-        <p class="hint ed-more" id="edMoreInPro"></p>
-        </div>
-        </div>
-        <!-- the Pro view: every field of serverFields.js, in five tabs (app.js renderEditPro) -->
-        <div class="ed-pro" id="edPro" hidden>
-          <nav class="ed-tabs" id="edTabs" role="tablist"></nav>
-          <div class="ed-pane" id="edProPane" role="tabpanel"></div>
-        </div>
-      </div>
-      <div class="modal-foot ed-foot">
-        <button class="btn primary" id="editSave" data-i18n="btn.save">ذخیره</button>
-        <button class="btn ghost" id="editCancel" data-i18n="btn.cancel">انصراف</button>
-        <span class="ed-foot-note" id="edFootNote"></span>
-      </div>
-    </div>
-  </div>
-
-  <!-- + WARP: a WARP account, made here or imported, as MASQUE servers (app.js renderWarp draws the body and foot) -->
-  <div class="modal-overlay" id="warpModal" hidden>
-    <div class="modal warp-modal" role="dialog" aria-modal="true" aria-labelledby="warpTitle">
-      <div class="modal-head">
-        <span class="warp-ico" aria-hidden="true">☁</span>
-        <span class="modal-title" id="warpTitle" data-i18n="warp.title">WARP روی MASQUE</span>
-        <button class="tb-btn" id="warpClose" data-i18n-title="tb.close">&#x2715;</button>
-      </div>
-      <div class="modal-body" id="warpBody"></div>
-      <div class="modal-foot ed-foot" id="warpFoot"></div>
-    </div>
-  </div>
-
-  <!-- connection-mode modal -->
-  <div class="modal-overlay" id="modeModal" hidden>
-    <div class="modal modal-sm">
-      <div class="modal-head">
-        <span class="modal-title" data-i18n="mode.pick">حالت اتصال</span>
-        <button class="tb-btn" id="modeClose">&#x2715;</button>
-      </div>
-      <div class="modal-body mode-body">
-        <button class="mode-option" data-mode="proxy">
-          <span class="mode-opt-ico">⚡</span>
-          <span class="mode-opt-text">
-            <span class="mode-opt-title" data-i18n="mode.proxy">پروکسی</span>
-            <span class="mode-opt-desc" data-i18n="mode.proxyDesc">سبک و سریع؛ فقط برنامه‌هایی که از پروکسی سیستمی/SOCKS استفاده می‌کنند تونل می‌شوند.</span>
-          </span>
-          <span class="mode-opt-check">✓</span>
-        </button>
-        <button class="mode-option" data-mode="tun">
-          <span class="mode-opt-ico">🛡</span>
-          <span class="mode-opt-text">
-            <span class="mode-opt-title" data-i18n="mode.tun">TUN (کل سیستم)</span>
-            <span class="mode-opt-desc" data-i18n="mode.tunDesc">تمام ترافیک کل سیستم از تونل عبور می‌کند (نیازمند tun2socks و دسترسی ادمین).</span>
-          </span>
-          <span class="mode-opt-check">✓</span>
-        </button>
-        <div class="mode-note" id="modeNote"></div>
-        <button class="btn primary mode-fix" id="modeGetFiles" data-i18n="mode.getFiles" hidden>دانلود فایل‌های موردنیاز</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- first-run / missing required files modal -->
-  <div class="modal-overlay" id="filesModal" hidden>
-    <div class="modal modal-sm">
-      <div class="modal-head">
-        <span class="modal-title" data-i18n="files.title">فایل‌های موردنیاز</span>
-        <button class="tb-btn" id="filesClose">&#x2715;</button>
-      </div>
-      <div class="modal-body">
-        <p class="hint" data-i18n="files.intro">برای اجرای برنامه چند فایل لازم است که هنوز دانلود نشده‌اند. اجازه می‌دهی الان دانلود شوند؟</p>
-        <div class="files-list" id="filesList"></div>
-        <div class="files-progress" id="filesProgress"></div>
-      </div>
-      <div class="modal-foot">
-        <button class="btn primary" id="filesDownload" data-i18n="files.download">دانلود کن</button>
-        <button class="btn ghost" id="filesLater" data-i18n="files.later">بعداً</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- geo suggestion lists for advanced routing (type to filter or pick) -->
-  <datalist id="geoipList">
-    <option value="geoip:ir"></option>
-    <option value="geoip:cn"></option>
-    <option value="geoip:us"></option>
-    <option value="geoip:private"></option>
-    <option value="geoip:telegram"></option>
-    <option value="geoip:google"></option>
-    <option value="geoip:cloudflare"></option>
-    <option value="geoip:facebook"></option>
-    <option value="geoip:twitter"></option>
-    <option value="geoip:netflix"></option>
-  </datalist>
-  <datalist id="geositeList">
-    <option value="geosite:category-ads-all"></option>
-    <!-- `geosite:ir` is NOT in geosite.dat: the Iranian domain list is category-ir,
-         and suggesting the other one had the core refuse the whole config -->
-    <option value="geosite:category-ir"></option>
-    <option value="geosite:cn"></option>
-    <option value="geosite:google"></option>
-    <option value="geosite:youtube"></option>
-    <option value="geosite:telegram"></option>
-    <option value="geosite:twitter"></option>
-    <option value="geosite:facebook"></option>
-    <option value="geosite:instagram"></option>
-    <option value="geosite:netflix"></option>
-    <option value="geosite:spotify"></option>
-    <option value="geosite:openai"></option>
-    <option value="geosite:github"></option>
-    <option value="geosite:category-porn"></option>
-    <option value="geosite:private"></option>
-  </datalist>
-
-  <!-- settings changed while connected: they are saved but NOT live until a reconnect -->
-  <div class="modal-overlay" id="applyModal" hidden>
-    <div class="modal modal-sm">
-      <div class="modal-head">
-        <span class="modal-title" data-i18n="apply.title">اعمال تنظیمات</span>
-        <button class="tb-btn" id="applyClose">&#x2715;</button>
-      </div>
-      <div class="modal-body">
-        <p class="hint" data-i18n="apply.intro">این تنظیمات تا وقتی اتصال دوباره برقرار نشود اعمال نمی‌شوند:</p>
-        <ul class="apply-list" id="applyList"></ul>
-        <p class="hint warn" id="applyKillNote" hidden data-i18n="apply.killNote">کیل‌سوییچ روشن است: در فاصله‌ی قطع تا اتصال مجدد، اینترنت کاملاً بسته می‌ماند تا چیزی بیرون درز نکند.</p>
-        <p class="hint" id="applyGapNote" data-i18n="apply.gapNote">اتصال چند ثانیه قطع می‌شود.</p>
-      </div>
-      <div class="modal-foot">
-        <button class="btn primary" id="applyNow" data-i18n="apply.now">اعمال و اتصال مجدد</button>
-        <button class="btn ghost" id="applyLater" data-i18n="apply.later">بعداً</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- The banners, in one stack fixed over the window's foot (styles.css .banner-stack).
-       The window never scrolls, so a banner in the flow after .layout is below the
-       screen: that is where all four sat from the redesign to v1.16.3. -->
-  <div class="banner-stack" id="bannerStack">
-    <!-- kill-switch banner (shown when internet is blocked after an unexpected drop) -->
-    <div class="kill-banner" id="killBanner" hidden>
-      <span class="kill-banner-text" data-i18n="kill.blocked">⛔ کیل سوییچ فعال شد — اینترنت بسته است</span>
-      <div class="kill-banner-actions">
-        <button class="btn" id="killReconnect" data-i18n="kill.reconnect">اتصال مجدد</button>
-        <button class="btn ghost" id="killDisarm" data-i18n="kill.disarm">باز کردن اینترنت</button>
-      </div>
-    </div>
-
-    <!-- Shown when the reconnect attempts were given up on and the leak guard is
-         STILL holding: nothing is leaking, but nothing resolves either, and the
-         user is owed a way out. -->
-    <div class="kill-banner" id="guardBanner" hidden>
-      <span class="kill-banner-text" data-i18n="guard.held">🔒 اتصال مجدد ناموفق بود. برای این‌که چیزی نشت نکند، دی‌ان‌اس روی تونل نگه داشته شده — تا وصل نشوی نام‌ها باز نمی‌شوند.</span>
-      <div class="kill-banner-actions">
-        <button class="btn" id="guardRetry" data-i18n="guard.retry">تلاش دوباره</button>
-        <button class="btn ghost" id="guardRelease" data-i18n="guard.release">اینترنتم را برگردان</button>
-      </div>
-    </div>
-
-    <!-- persistent reminder while saved-but-not-applied settings exist -->
-    <div class="pending-banner" id="pendingBanner" hidden>
-      <span class="pending-banner-text" id="pendingBannerText"></span>
-      <div class="pending-banner-actions">
-        <button class="btn" id="pendingApply" data-i18n="apply.now">اعمال و اتصال مجدد</button>
-        <button class="btn ghost" id="pendingDismiss" data-i18n="apply.dismiss">بستن</button>
-      </div>
-    </div>
-
-    <!-- Windows: the logon task starts ANOTHER copy of the app (an older build keeps its
-         own DNS code) — main only reads the task; the button re-registers it for this one -->
-    <div class="pending-banner" id="autostartBanner" hidden>
-      <span class="pending-banner-text" id="autostartBannerText"></span>
-      <div class="pending-banner-actions">
-        <button class="btn" id="autostartFix" data-i18n="notice.autostartFix">هنگام ورود همین نسخه اجرا شود</button>
-        <button class="btn ghost" id="autostartDismiss" data-i18n="apply.dismiss">بستن</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- toast -->
-  <div class="toast" id="toast"></div>
-
-  <div class="modal-overlay" id="qrModal" hidden>
-    <div class="modal modal-sm">
-      <div class="modal-head">
-        <span class="modal-title" data-i18n="qr.title">اشتراک کانفیگ</span>
-        <button class="tb-btn" id="qrClose">&#x2715;</button>
-      </div>
-      <div class="modal-body qr-body">
-        <div id="qrImage" class="qr-image"></div>
-        <p class="hint" data-i18n="qr.hint">این لینک همهٔ تنظیمات (شامل patterniha) را دارد. اسکن کن یا کپی و در کلاینت دیگر وارد کن.</p>
-        <textarea id="qrLink" class="input" readonly rows="3" dir="ltr"></textarea>
-        <button class="btn primary" id="qrCopy" data-i18n="qr.copy">کپی لینک</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- a routing profile's or a chain's share link: the warning first, then the QR and the text -->
-  <div class="modal-overlay" id="rpShareModal" hidden>
-    <div class="modal modal-sm">
-      <div class="modal-head">
-        <span class="modal-title" id="rpShareTitle" data-i18n="rp.shareTitle">اشتراک روتینگ</span>
-        <button class="tb-btn" id="rpShareClose">&#x2715;</button>
-      </div>
-      <div class="modal-body qr-body">
-        <p class="hint rp-share-warn" id="rpShareWarn"></p>
-        <div id="rpShareQr" class="qr-image"></div>
-        <textarea id="rpShareLink" class="input" readonly rows="3" dir="ltr"></textarea>
-        <button class="btn primary" id="rpShareCopy" data-i18n="qr.copy">کپی لینک</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- an irnetfree://routing/ link pasted or added: what it holds, before anything is written -->
-  <div class="modal-overlay" id="rpImportModal" hidden>
-    <div class="modal modal-sm">
-      <div class="modal-head">
-        <span class="modal-title" data-i18n="rp.importTitle">وارد کردن روتینگ</span>
-        <button class="tb-btn" id="rpImportClose">&#x2715;</button>
-      </div>
-      <div class="modal-body">
-        <div class="rp-im-sum" id="rpImportSum"></div>
-        <p class="hint" data-i18n="rp.importNote">سرورهایی که از قبل داری دوباره استفاده می‌شوند؛ سرورهای تازه به‌صورت دستی (بدون اشتراک) اضافه می‌شوند. روتینگ به‌عنوان یک روتینگ تازه اضافه می‌شود.</p>
-      </div>
-      <div class="modal-foot">
-        <button class="btn primary" id="rpImportGo" data-i18n="btn.import">وارد کردن</button>
-        <button class="btn ghost" id="rpImportCancel" data-i18n="btn.cancel">انصراف</button>
-      </div>
-    </div>
-  </div>
-  <!-- plus: the Server tab's five modals (src/renderer/plus/xserver.js) -->
+  <!-- the Server tab's five modals (src/renderer/plus/xserver.js) -->
   <div class="modal-overlay" id="xsInboundModal" hidden>
     <div class="modal">
       <div class="modal-head">
@@ -2006,7 +841,7 @@
     </div>
   </div>
 
-  <div class="modal-overlay" id="xsClientModal" hidden><!-- plus -->
+  <div class="modal-overlay" id="xsClientModal" hidden>
     <div class="modal">
       <div class="modal-head">
         <span class="modal-title" data-i18n="xs.cl.title">کاربر</span>
@@ -2079,7 +914,7 @@
     </div>
   </div>
 
-  <div class="modal-overlay" id="xsOutboundModal" hidden><!-- plus -->
+  <div class="modal-overlay" id="xsOutboundModal" hidden>
     <div class="modal modal-sm">
       <div class="modal-head">
         <span class="modal-title" data-i18n="xs.out.title">خروجی</span>
@@ -2127,7 +962,7 @@
     </div>
   </div>
 
-  <div class="modal-overlay" id="xsRuleModal" hidden><!-- plus -->
+  <div class="modal-overlay" id="xsRuleModal" hidden>
     <div class="modal">
       <div class="modal-head">
         <span class="modal-title" data-i18n="xs.rule.title">قانون</span>
@@ -2193,7 +1028,7 @@
     </div>
   </div>
 
-  <div class="modal-overlay" id="xsPreviewModal" hidden><!-- plus -->
+  <div class="modal-overlay" id="xsPreviewModal" hidden>
     <div class="modal">
       <div class="modal-head">
         <span class="modal-title" data-i18n="xs.preview.title">کانفیگ سرور</span>
@@ -2210,16 +1045,32 @@
     </div>
   </div>
 
+  <!-- a client's share link as a QR (the Server tab opens it; app.js closes and copies) -->
+  <div class="modal-overlay" id="qrModal" hidden>
+    <div class="modal modal-sm">
+      <div class="modal-head">
+        <span class="modal-title" data-i18n="qr.title">اشتراک کانفیگ</span>
+        <button class="tb-btn" id="qrClose" type="button">&#x2715;</button>
+      </div>
+      <div class="modal-body qr-body">
+        <div id="qrImage" class="qr-image"></div>
+        <textarea id="qrLink" class="input" readonly rows="3" dir="ltr"></textarea>
+        <button class="btn primary" id="qrCopy" type="button" data-i18n="qr.copy">کپی لینک</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
   <script src="vendor/qrcode.js"></script>
   <script src="i18n.js"></script>
-  <script src="diagnostics.js"></script>
-  <script src="settingsExperience.js"></script>
+  <script src="plus/i18n.js"></script>
+  <script src="plus/xserver.i18n.js"></script>
+  <script src="plus/scan.i18n.js"></script>
   <script src="corePicker.js"></script>
-  <script src="serverFields.js"></script>
-  <script src="plus/xserver.i18n.js"></script><!-- plus -->
-  <script src="plus/scan.i18n.js"></script><!-- plus -->
   <script src="app.js"></script>
-  <script src="plus/xserver.js"></script><!-- plus -->
-  <script src="plus/scan.js"></script><!-- plus -->
+  <script src="plus/configs.js"></script>
+  <script src="plus/xserver.js"></script>
+  <script src="plus/scan.js"></script>
 </body>
 </html>

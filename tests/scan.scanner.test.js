@@ -31,7 +31,11 @@ const until = async (pred, ms = 5000, what = 'condition') => {
   const t0 = Date.now();
   while (!pred()) { if (Date.now() - t0 > ms) throw new Error(`${what} not met within ${ms}ms`); await tick(5); }
 };
-const RESULT_KEYS = ['delay', 'down', 'engine', 'error', 'ip', 'phase', 'score', 'tcp', 'up'];
+const RESULT_KEYS = ['addr', 'delay', 'down', 'engine', 'error', 'ip', 'key', 'phase', 'port', 'score', 'sni', 'tcp', 'up'];
+/** The fake rig's cores never listen: the readiness wait is answered at once. */
+const ready = async () => true;
+/** A stored SOCKS proxy: nothing a target can be put into (the scan's one refusal left, with JSON chains). */
+const SOCKS = Object.assign(parseLink('socks://1.2.3.4:1080#socks'), { id: 'sv-socks' });
 const PROGRESS_KEYS = ['alive', 'done', 'etaMs', 'speedDone', 'speedTotal', 'stage', 'total'];
 
 /* ----------------------------- the fake rig ----------------------------- */
@@ -39,7 +43,7 @@ const PROGRESS_KEYS = ['alive', 'done', 'etaMs', 'speedDone', 'speedTotal', 'sta
 /** Address a test config dials for its k-th inbound (the real buildMultiTestConfig shapes). */
 function dialAddress(out) {
   const s = out.settings || {};
-  return (s.vnext && s.vnext[0] && s.vnext[0].address) || (s.servers && s.servers[0] && s.servers[0].address) || null;
+  return (s.vnext && s.vnext[0] && s.vnext[0].address) || (s.servers && s.servers[0] && s.servers[0].address) || s.address || null;
 }
 const ipsOf = (cfg) => cfg.inbounds.map((inb, k) => dialAddress(cfg.outbounds[k]));
 
@@ -58,6 +62,7 @@ function fakeRig(spec = {}) {
   const ipOf = (port) => portToIp.get(port);
   const xray = {
     binExists: (id) => (spec.installed || ['xray', 'xray-pattn']).includes(id),
+    version: async (id) => (spec.versions && spec.versions[id]) || '26.10.13',
     startTest: async (cfg, engine) => {
       calls.push({ cfg, engine });
       if (spec.failStart && spec.failStart(engine, calls.length, cfg)) throw new Error('spawn failed');
@@ -108,7 +113,7 @@ const downs = (rig) => rig.log.filter(e => e[0] === 'down');
 
 function run(rig, over = {}) {
   const results = [], progress = [];
-  const opts = Object.assign({ batch: 2, filterConcurrency: 8, coresInParallel: 2, probes: rig.probes, getFreePorts: rig.getFreePorts }, over.opts);
+  const opts = Object.assign({ batch: 2, filterConcurrency: 8, coresInParallel: 2, probes: rig.probes, getFreePorts: rig.getFreePorts, waitReady: ready }, over.opts);
   const args = Object.assign({
     server: F.VLESS_WS_TLS, ips: IPS, engines: ['xray'], tests: { tcp: true, delay: true, down: true, up: false },
     xray: rig.xray, token: { cancelled: false },
@@ -190,7 +195,7 @@ test('never more than filterConcurrency probes in flight inside a batch; the v2.
   const legacy = fakeRig({ probeMs: 15 });
   await runScan({
     server: F.VLESS_WS_TLS, ips: IPS, engines: ['xray'], tests: { tcp: true, delay: true, down: false, up: false },
-    opts: { batch: 20, concurrency: 3, probes: legacy.probes, getFreePorts: legacy.getFreePorts },
+    opts: { batch: 20, concurrency: 3, probes: legacy.probes, getFreePorts: legacy.getFreePorts, waitReady: ready },
     xray: legacy.xray
   });
   assert.equal(legacy.peak.filter, 3, 'a caller that only knows `concurrency` gets it, not the 16 default');
@@ -428,10 +433,11 @@ test('a core that fails to start in phase 2 re-emits its rows with phase 2, the 
 
 test('a config the substitution refuses marks every batch without spawning a core', async () => {
   const rig = fakeRig();
-  const { promise, results } = run(rig, { server: F.WG_BAD_MASK, ips: ['1.1.1.1', '1.1.1.2'] });
+  const { promise, results } = run(rig, { server: SOCKS, ips: ['1.1.1.1', '1.1.1.2'] });
   await promise;
   assert.equal(rig.calls.length, 0);
-  assert.deepEqual(results.map(r => r.error), ['unsupported protocol', 'unsupported protocol']);
+  assert.equal(results.length, 2);
+  for (const r of results) assert.match(r.error, /unsupported protocol/);
 });
 
 test('no IPs or no engines is an empty, finished run', async () => {
@@ -455,7 +461,7 @@ test('runSpeed: phase 2 alone on the rows given, in the speed stage from the sta
       { ip: '', engine: 'xray' }
     ],
     tests: { down: true, up: false },
-    opts: { probes: rig.probes, getFreePorts: rig.getFreePorts },
+    opts: { probes: rig.probes, getFreePorts: rig.getFreePorts, waitReady: ready },
     xray: rig.xray, token: { cancelled: false },
     onResult: (r) => results.push(r), onProgress: (p) => progress.push(p)
   });
@@ -505,7 +511,7 @@ function fakeCtx(rig, { servers = [] } = {}) {
 function setup(spec = {}, extra = {}) {
   const rig = fakeRig(spec);
   const c = fakeCtx(rig, extra);
-  const scan = createScan(c.ctx, { probes: rig.probes, getFreePorts: rig.getFreePorts, runScan: extra.runScan });
+  const scan = createScan(c.ctx, { probes: rig.probes, getFreePorts: rig.getFreePorts, waitReady: ready, runScan: extra.runScan, fetchEchConfig: extra.fetchEchConfig });
   scan.register();
   return Object.assign({ rig, scan }, c);
 }
@@ -513,9 +519,9 @@ function setup(spec = {}, extra = {}) {
 const progressOf = (events) => events.filter(e => e.ch === 'scan-progress').map(e => e.payload);
 const EVENT_KEYS = ['alive', 'done', 'etaMs', 'runId', 'speedDone', 'speedTotal', 'stage', 'total'];
 
-test('register() puts exactly the seven scan channels on the context', () => {
+test('register() puts exactly the nine scan channels on the context', () => {
   const s = setup();
-  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:export', 'scan:forget', 'scan:presets', 'scan:retest', 'scan:start', 'scan:stop']);
+  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:export', 'scan:forget', 'scan:links', 'scan:presets', 'scan:retest', 'scan:start', 'scan:stop', 'scan:suggest']);
   assert.equal(s.scan.busy(), false);
 });
 
@@ -526,6 +532,7 @@ test('scan:presets — the Cloudflare ranges, the exact defaults, the three pres
   const balanced = {
     batch: 20, filterConcurrency: 16, coresInParallel: 2, delaySamples: 2,
     tcpTimeout: 2000, delayTimeout: 4000,
+    delayHost: 'cp.cloudflare.com', delayPort: 80, delayPath: '/',
     speedTop: 10, speedConcurrency: 1, speedRounds: 1, warmupMs: 300,
     downBytes: 10e6, downMaxMs: 6000, downTimeout: 8000,
     downHost: 'speed.cloudflare.com', downPath: '/__down?bytes=10000000', downPort: 443, downTls: true,
@@ -544,16 +551,17 @@ test('scan:presets — the Cloudflare ranges, the exact defaults, the three pres
     { id: 'xray-pattn', label: 'Xray-PattN (patterniha)', installed: false }
   ]);
   assert.equal(p.tested, 0, 'nothing tested yet');
-  assert.deepEqual(Object.keys(p).sort(), ['cfRanges', 'defaults', 'engines', 'last', 'presets', 'tested']);
+  assert.deepEqual(Object.keys(p).sort(), ['cfRanges', 'defaults', 'engines', 'last', 'presets', 'ranges', 'tested']);
+  assert.deepEqual(Object.keys(p.ranges).sort(), ['cf', 'cf-plain-ports', 'cf-tls-ports', 'warp-masque', 'warp-wg']);
 });
 
 test('scan:start refuses what it cannot run, with the agreed reasons', async () => {
-  const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS, F.WG_BAD_MASK] });
+  const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS, SOCKS] });
   const start = s.handlers['scan:start'];
   assert.deepEqual(await start({ ipsText: '1.1.1.1' }), { error: 'no server' });
   assert.deepEqual(await start({ serverId: 'nope', ipsText: '1.1.1.1' }), { error: 'server not found' });
   assert.match((await start({ link: 'garbage', ipsText: '1.1.1.1' })).error, /Unsupported or invalid link/);
-  assert.deepEqual(await start({ serverId: 'sv-wg', ipsText: '1.1.1.1' }), { error: 'unsupported protocol' });
+  assert.deepEqual(await start({ serverId: 'sv-socks', ipsText: '1.1.1.1' }), { error: 'unsupported protocol' });
   assert.deepEqual(await start({ link: 'socks://1.2.3.4:1080', ipsText: '1.1.1.1' }), { error: 'unsupported protocol' });
   const none = await start({ serverId: 'sv-vless', ipsText: '# nothing\nbad-line' });
   assert.equal(none.error, 'no targets');
@@ -594,7 +602,7 @@ test('scan:start runs in the background and streams scan-progress: one event per
 
   // the last request is remembered without results, with the engines it actually ran and the v2.1 option names
   const last = s.data.scan;
-  assert.deepEqual(Object.keys(last).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'serverId', 'tests']);
+  assert.deepEqual(Object.keys(last).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests']);
   assert.deepEqual(last.pick, { mode: 'all', perRange: 20, fresh: true }, 'a request without a pick is every address');
   assert.equal(last.serverId, 'sv-vless');
   assert.equal(last.ipsText, req.ipsText);
@@ -679,10 +687,10 @@ test('a run that blows up ends with finished + error instead of a stuck busy fla
 });
 
 test('scan:retest runs phase 2 alone on the rows given, in the speed stage from the first event; it refuses what it cannot run', async () => {
-  const s = setup({ installed: ['xray', 'xray-pattn'] }, { servers: [F.VLESS_WS_TLS, F.WG_BAD_MASK] });
+  const s = setup({ installed: ['xray', 'xray-pattn'] }, { servers: [F.VLESS_WS_TLS, SOCKS] });
   const retest = s.handlers['scan:retest'];
   assert.deepEqual(await retest({ rows: [{ ip: '1.1.1.1', engine: 'xray' }] }), { error: 'no server' });
-  assert.deepEqual(await retest({ serverId: 'sv-wg', rows: [{ ip: '1.1.1.1', engine: 'xray' }] }), { error: 'unsupported protocol' });
+  assert.deepEqual(await retest({ serverId: 'sv-socks', rows: [{ ip: '1.1.1.1', engine: 'xray' }] }), { error: 'unsupported protocol' });
   assert.deepEqual(await retest({ serverId: 'sv-vless' }), { error: 'no rows' });
   assert.deepEqual(await retest({ serverId: 'sv-vless', rows: [{ ip: 'nope', engine: 'xray' }, { ip: '1.1.1.1', engine: 'sing-box' }, null] }), { error: 'no rows' });
   assert.deepEqual(await retest({ serverId: 'sv-vless', rows: [{ ip: '1.1.1.1', engine: 'xray' }], tests: { down: false, up: false } }), { error: 'no tests' });
@@ -734,7 +742,9 @@ test('scan:apply stores a clone that dials the IP under "<name> [ip]" with a fre
   assert.equal(back.address, '104.16.2.3');
   assert.equal(back.outbound.streamSettings.tlsSettings.serverName, 'a.example.com');
   assert.equal(back.outbound.settings.vnext[0].users[0].id, 'uuid-a');
-  assert.equal(s.added[0], rec, 'went through ctx.addServer');
+  assert.equal(s.added[0].id, rec.id, 'went through ctx.addServer');
+  assert.equal(rec.link, rec.raw, 'the link to copy comes back with it');
+  assert.ok(Array.isArray(rec.servers), 'and the list, for the page');
   assert.equal(F.VLESS_WS_TLS.address, 'a.example.com', 'the source is untouched');
 
   const named = await s.handlers['scan:apply']({ serverId: 'sv-vless', ip: '104.16.2.4', name: 'CF edge', engine: 'xray-pattn' });
@@ -749,10 +759,10 @@ test('scan:apply stores a clone that dials the IP under "<name> [ip]" with a fre
 });
 
 test('scan:apply refuses a bad IP, a missing server and an unsupported protocol', async () => {
-  const s = setup({ installed: ['xray'] }, { servers: [F.WG_BAD_MASK] });
-  assert.deepEqual(await s.handlers['scan:apply']({ serverId: 'sv-wg', ip: 'not-an-ip' }), { error: 'invalid ip' });
+  const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS, SOCKS] });
+  assert.deepEqual(await s.handlers['scan:apply']({ serverId: 'sv-vless', ip: 'not-an-ip' }), { error: 'invalid ip' });
   assert.deepEqual(await s.handlers['scan:apply']({ serverId: 'gone', ip: '1.1.1.1' }), { error: 'server not found' });
-  assert.deepEqual(await s.handlers['scan:apply']({ serverId: 'sv-wg', ip: '1.1.1.1' }), { error: 'unsupported protocol' });
+  assert.deepEqual(await s.handlers['scan:apply']({ serverId: 'sv-socks', ip: '1.1.1.1' }), { error: 'unsupported protocol' });
   assert.deepEqual(await s.handlers['scan:apply']({ ip: '1.1.1.1' }), { error: 'no server' });
   assert.equal(s.added.length, 0);
 });
@@ -766,10 +776,10 @@ test('scan:export — CSV with the exact header, the phase and the median, empty
   ];
   const csv = await s.handlers['scan:export']({ format: 'csv', results });
   const lines = csv.split('\r\n');
-  assert.equal(lines[0], 'ip,engine,phase,tcp_ms,delay_min,delay_median,delay_avg,jitter,loss,down_mbps,up_mbps,score,error');
-  assert.equal(lines[1], '1.1.1.1,xray,2,12,40,45,45.5,2.5,0,12.34,,987.6,');
-  assert.equal(lines[2], '1.1.1.2,xray-pattn,1,,,,,,,,,0,', 'a row without a phase is a phase-1 row');
-  assert.equal(lines[3], '1.1.1.3,xray,1,,,,,,1,,1.5,0,"spawn failed, ""quoted"""');
+  assert.equal(lines[0], 'addr,port,sni,engine,phase,tcp_ms,delay_min,delay_median,delay_avg,jitter,loss,down_mbps,up_mbps,score,error');
+  assert.equal(lines[1], '1.1.1.1,,,xray,2,12,40,45,45.5,2.5,0,12.34,,987.6,', 'a v2 row (ip, no port or SNI) still exports');
+  assert.equal(lines[2], '1.1.1.2,,,xray-pattn,1,,,,,,,,,0,', 'a row without a phase is a phase-1 row');
+  assert.equal(lines[3], '1.1.1.3,,,xray,1,,,,,,1,,1.5,0,"spawn failed, ""quoted"""');
   assert.equal(lines[4], '');
   assert.equal(lines.length, 5);
 
@@ -796,11 +806,11 @@ test('scan:start with a random pick draws perRange from every range, remembers t
   assert.equal(ips.filter(ip => ip.startsWith('1.1.1.')).length, 2);
   assert.equal(ips.filter(ip => ip.startsWith('2.2.2.')).length, 2);
   assert.deepEqual(s.data.scan.pick, { mode: 'random', perRange: 2, fresh: true }, 'the pick is part of the remembered request');
-  assert.deepEqual(Object.keys(s.data.scan).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'serverId', 'tests']);
+  assert.deepEqual(Object.keys(s.data.scan).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests']);
   // the history: the four addresses, as integers, and the count in presets
   assert.equal(s.data.scanTested.length, 4);
-  assert.ok(s.data.scanTested.every(n => Number.isInteger(n)));
-  assert.deepEqual(s.data.scanTested.map(intToIp4).sort(), ips);
+  assert.ok(s.data.scanTested.every(n => typeof n === 'string'), 'v3 keeps normalised strings');
+  assert.deepEqual(s.data.scanTested.slice().sort(), ips);
   assert.equal((await s.handlers['scan:presets']()).tested, 4);
   assert.ok(s.logs.some(l => /fresh draw of 2 per range from 2 range\(s\), 0 tested before skipped/.test(l.line)), s.logs.map(l => l.line).join('\n'));
 });
@@ -858,9 +868,143 @@ test('a plain (v2.1) request reads as pick `all`, still records what it tested, 
   assert.deepEqual([reply.ranges, reply.exhausted], [0, 0]);
   await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
   assert.deepEqual(s.data.scan.pick, { mode: 'all', perRange: 20, fresh: true });
-  assert.equal(s.data.scanTested[0], ip4ToInt('9.9.9.9'), 'what was there stays first');
-  assert.deepEqual(s.data.scanTested.slice(1).sort(), [ip4ToInt('1.1.1.1'), ip4ToInt('1.1.1.2')].sort(), 'bad entries dropped, the run’s addresses added');
+  assert.equal(s.data.scanTested[0], '9.9.9.9', 'a v2.2 integer is read back as its address and stays first');
+  assert.deepEqual(s.data.scanTested.slice(1).sort(), ['1.1.1.1', '1.1.1.2'], 'bad entries dropped, the run’s addresses added');
   assert.deepEqual(sanitizePick({ mode: 'random', perRange: 0, fresh: 0 }), { mode: 'random', perRange: 1, fresh: false }, 'clamped, like every other number');
   assert.deepEqual(sanitizePick({ mode: 'weird', perRange: 99999 }), { mode: 'all', perRange: 5000, fresh: true });
   assert.deepEqual(sanitizePick(null), PICK_DEFAULTS);
+});
+
+/* ----------------------------- v3: targets, UDP, readiness, the engine gate, ECH, SNI, links ----------------------------- */
+
+const { createServer } = require('../src/main/parser');
+
+const HY2 = Object.assign(parseLink('hy2://secret@h.example.com:443?sni=h.example.com#hy'), { id: 'sv-hy2' });
+const REALITY = Object.assign(parseLink('vless://2c0f0d9a-6b3a-4f0e-9a1f-8c2b4d6e7a10@r.example.com:443?encryption=none&type=tcp&security=reality&sni=www.microsoft.com&fp=chrome&pbk=Z84J2IelR9ch3k8VtlVhhs5ycBUlXA7wHBWcBrjqnAw&sid=6ba85179#reality'), { id: 'sv-reality' });
+const ECH = Object.assign(parseLink('vless://2c0f0d9a-6b3a-4f0e-9a1f-8c2b4d6e7a10@e.example.com:443?encryption=none&type=ws&security=tls&sni=e.example.com&host=e.example.com&path=%2Fws&ech=cloudflare-ech.com%2Budp%3A%2F%2F1.1.1.1#ech'), { id: 'sv-ech' });
+const MASQUE = Object.assign(createServer({ protocol: 'masque', name: 'mq', address: 'mq.example.com', port: '443', sni: 'mq.example.com', masqueUser: 'u', masquePass: 'p', masqueHttp: 'h2', fp: 'chrome' }), { id: 'sv-mq' });
+const flatOrNode = (o) => (o.settings && (o.settings.address || (o.settings.vnext && o.settings.vnext[0].address) || (o.settings.servers && o.settings.servers[0].address))) || null;
+
+test('a UDP config (Hysteria2) gets no TCP connect: the row says skipped and the delay decides', async () => {
+  const rig = fakeRig();
+  const { promise, results } = run(rig, { server: HY2, ips: ['5.5.5.5', '5.5.5.6'], transport: 'udp', tests: { tcp: true, delay: true, down: false, up: false } });
+  await promise;
+  assert.ok(!rig.log.some(e => e[0] === 'tcp'), 'no TCP probe at all');
+  for (const r of results) {
+    assert.deepEqual(r.tcp, { ok: false, skipped: true, ms: 0 });
+    assert.ok(r.score > 0, 'alive on its delay');
+  }
+  assert.equal(flatOrNode(rig.calls[0].cfg.outbounds[0]), '5.5.5.5');
+});
+
+test('a core that never starts listening marks its batch, and the run goes on to the next', async () => {
+  const rig = fakeRig();
+  let n = 0;
+  const { promise, results } = run(rig, { ips: ['1.1.1.1', '1.1.1.2', '1.1.1.3'], opts: { batch: 2, coresInParallel: 1, waitReady: async () => (++n > 1) }, tests: { tcp: true, delay: true, down: false, up: false } });
+  await promise;
+  const byIp = Object.fromEntries(results.map(r => [r.addr, r]));
+  assert.equal(byIp['1.1.1.1'].error, 'the core did not start listening');
+  assert.equal(byIp['1.1.1.2'].error, 'the core did not start listening');
+  assert.equal(byIp['1.1.1.3'].error, null);
+  for (const c of rig.cores) assert.equal(c.cleaned, 1, 'the silent core is killed too');
+});
+
+test('targets carry a port and an SNI: TCP goes to that port, the core dials it with that SNI and the original Host', async () => {
+  const rig = fakeRig();
+  const targets = [
+    { addr: '104.16.0.1', port: 2053, sni: 'front.example.org', key: '104.16.0.1:2053|front.example.org' },
+    { addr: '2606:4700::1', port: 443, sni: null, key: '[2606:4700::1]:443|' }
+  ];
+  const { promise, results } = run(rig, { targets, tests: { tcp: true, delay: true, down: false, up: false } });
+  await promise;
+  assert.deepEqual(rig.log.filter(e => e[0] === 'tcp').map(e => [e[1], e[2]]).sort(), [['104.16.0.1', 2053], ['2606:4700::1', 443]]);
+  const out = rig.calls[0].cfg.outbounds;
+  assert.equal(out[0].settings.vnext[0].port, 2053);
+  assert.equal(out[0].streamSettings.tlsSettings.serverName, 'front.example.org');
+  assert.equal(out[0].streamSettings.wsSettings.headers.Host, 'a.example.com', 'the Host stays the real site');
+  assert.equal(out[1].settings.vnext[0].address, '2606:4700::1');
+  assert.deepEqual(results.map(r => r.key).sort(), targets.map(t => t.key).sort());
+});
+
+test('scan:start — ports × SNIs make the targets; an SNI list on a REALITY config is refused', async () => {
+  const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS, REALITY] });
+  const r = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '1.1.1.1\n1.1.1.2:8443', portsText: '443, 2053', snisText: 'a.example.org\nb.example.org', tests: FILTER_ONLY });
+  assert.equal(r.targets, 1 * 2 * 2 + 1 * 1 * 2, 'an address with its own port takes only that one');
+  assert.deepEqual([r.portErrors, r.sniErrors], [[], []]);
+  await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
+  const keys = progressOf(s.events).filter(p => p.result).map(p => p.result.key).sort();
+  assert.deepEqual(keys, ['1.1.1.1:2053|a.example.org', '1.1.1.1:2053|b.example.org', '1.1.1.1:443|a.example.org', '1.1.1.1:443|b.example.org', '1.1.1.2:8443|a.example.org', '1.1.1.2:8443|b.example.org']);
+  assert.equal(s.data.scan.portsText, '443, 2053');
+  const refused = await s.handlers['scan:start']({ serverId: 'sv-reality', ipsText: '1.1.1.1', snisText: 'a.example.org', tests: FILTER_ONLY });
+  assert.equal(refused.error, 'sni');
+  assert.equal(refused.code, 'reality');
+});
+
+test('scan:start with an empty address box tests the config’s own address', async () => {
+  const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS] });
+  const r = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '  # nothing typed\n', tests: FILTER_ONLY });
+  assert.equal(r.targets, 1);
+  await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
+  assert.equal(progressOf(s.events).find(p => p.result).result.key, 'a.example.com:443|');
+});
+
+test('the engine gate: a core too old for MASQUE is left out with the reason; none left is a refusal', async () => {
+  const s = setup({ installed: ['xray', 'xray-pattn'], versions: { xray: '26.3.27', 'xray-pattn': '26.10.13' } }, { servers: [MASQUE] });
+  const r = await s.handlers['scan:start']({ serverId: 'sv-mq', ipsText: '9.9.9.9', tests: FILTER_ONLY });
+  assert.deepEqual(r.engines, ['xray-pattn']);
+  assert.equal(r.skipped.length, 1);
+  assert.equal(r.skipped[0].engine, 'xray');
+  assert.match(r.skipped[0].reason, /26\.3\.27 does not know MASQUE \(26\.9\.30 and newer do\)/);
+  await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
+  assert.deepEqual(s.rig.calls.map(c => c.engine), ['xray-pattn']);
+
+  const old = setup({ installed: ['xray'], versions: { xray: '26.3.27' } }, { servers: [MASQUE] });
+  const none = await old.handlers['scan:start']({ serverId: 'sv-mq', ipsText: '9.9.9.9', tests: FILTER_ONLY });
+  assert.equal(none.error, 'core too old');
+  assert.equal(none.skipped.length, 1);
+  assert.equal(old.rig.calls.length, 0);
+});
+
+test('ECH asked of DNS is fetched once and every core gets the list itself; a failed fetch keeps the query form', async () => {
+  const asked = [];
+  const okFetch = async (list, o) => { asked.push([list, o.serverName]); return { ok: true, list: 'AEX+DQBBAQAgACBzZWNyZXQ=', publicName: 'cloudflare-ech.com', via: 'udp://1.1.1.1:53' }; };
+  const s = setup({ installed: ['xray'] }, { servers: [ECH], fetchEchConfig: okFetch });
+  const r = await s.handlers['scan:start']({ serverId: 'sv-ech', ipsText: '1.1.1.1\n1.1.1.2\n1.1.1.3', tests: FILTER_ONLY, opts: { batch: 2 } });
+  assert.deepEqual(r.ech, { ok: true, publicName: 'cloudflare-ech.com', via: 'udp://1.1.1.1:53' });
+  await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
+  assert.deepEqual(asked, [['cloudflare-ech.com+udp://1.1.1.1', 'e.example.com']], 'once per run, not per core');
+  assert.equal(s.rig.calls.length, 2);
+  for (const c of s.rig.calls) for (const o of c.cfg.outbounds.filter(x => x.protocol === 'vless')) assert.equal(o.streamSettings.tlsSettings.echConfigList, 'AEX+DQBBAQAgACBzZWNyZXQ=');
+  assert.equal(ECH.outbound.streamSettings.tlsSettings.echConfigList, 'cloudflare-ech.com+udp://1.1.1.1', 'the stored config is untouched');
+
+  const failing = setup({ installed: ['xray'] }, { servers: [ECH], fetchEchConfig: async () => ({ ok: false, error: 'no answer from udp://1.1.1.1:53 within 4 s (asked twice)', via: 'udp://1.1.1.1:53' }) });
+  const f = await failing.handlers['scan:start']({ serverId: 'sv-ech', ipsText: '1.1.1.1', tests: FILTER_ONLY });
+  assert.equal(f.ech.ok, false);
+  await until(() => progressOf(failing.events).some(p => p.finished), 5000, 'finished');
+  assert.equal(failing.rig.calls[0].cfg.outbounds[0].streamSettings.tlsSettings.echConfigList, 'cloudflare-ech.com+udp://1.1.1.1');
+  assert.ok(failing.logs.some(l => l.level === 'warn' && /ECH config could not be fetched/.test(l.line)));
+});
+
+test('scan:suggest says what a config allows; scan:links makes one share link per row with the target in it', async () => {
+  const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS, HY2, REALITY, ECH, MASQUE] });
+  const v = await s.handlers['scan:suggest']({ serverId: 'sv-vless' });
+  assert.deepEqual([v.transport, v.sni.ok, v.ech, v.preset, v.unsupported], ['tcp', true, false, 'cf', '']);
+  const h = await s.handlers['scan:suggest']({ serverId: 'sv-hy2' });
+  assert.equal(h.transport, 'udp');
+  const rr = await s.handlers['scan:suggest']({ serverId: 'sv-reality' });
+  assert.deepEqual([rr.sni.ok, rr.sni.code], [false, 'reality']);
+  const e = await s.handlers['scan:suggest']({ serverId: 'sv-ech' });
+  assert.deepEqual([e.ech, e.echQuery, e.sni.code], [true, true, 'ech']);
+  const m = await s.handlers['scan:suggest']({ serverId: 'sv-mq' });
+  assert.deepEqual([m.masque, m.warp, m.transport], [true, false, 'tcp'], 'MASQUE over HTTP/2 runs on TCP');
+  assert.deepEqual(await s.handlers['scan:suggest']({ serverId: 'gone' }), { error: 'server not found' });
+
+  const l = await s.handlers['scan:links']({ serverId: 'sv-vless', rows: [{ addr: '104.16.0.9', port: 2053 }, { addr: '104.16.0.10', sni: 'front.example.org' }, { addr: 'bad addr!' }] });
+  assert.equal(l.links.length, 2, 'a row that does not fit is left out');
+  const a = parseLink(l.links[0]);
+  assert.deepEqual([a.address, a.port, a.outbound.streamSettings.tlsSettings.serverName], ['104.16.0.9', 2053, 'a.example.com']);
+  const b = parseLink(l.links[1]);
+  assert.equal(b.outbound.streamSettings.tlsSettings.serverName, 'front.example.org');
+  assert.equal(b.outbound.streamSettings.wsSettings.headers.Host, 'a.example.com');
+  assert.equal(s.added.length, 0, 'links save nothing');
 });

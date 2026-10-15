@@ -1,60 +1,71 @@
 'use strict';
 /**
- * plus: the IP-scan tab — a config tested through many addresses on every
- * installed xray-format core (spec section 3 of v2.0, section 1 of v2.1).
- * One module for both mirrors: `ctx` is the normalised context main.js and
- * service.js build the same way, and a handler gets its one argument already
- * unwrapped.
+ * plus: the Scan page — one config tried through many targets (address × port
+ * × SNI) on every installed Xray-format core (spec 2026-10-15 §4; v2.1 §1 for
+ * the two phases, v2.2 for the random pick). `ctx` is the service's context
+ * (src/main/plus/service.js); a handler gets its one argument unwrapped.
  *
- * Channels: scan:start, scan:retest, scan:stop, scan:presets, scan:apply,
- * scan:export, scan:forget. Event: scan-progress { runId, stage, done, total, alive,
- * speedDone, speedTotal, etaMs, result } per result, the same without a
- * result when the stage changes, then { ..., finished: true, cancelled } (plus
- * `error` when the run itself failed). One run at a time; the last request is
- * remembered in the store under `scan`, never the results — only the addresses
- * that were tested, under `scanTested`, so a random draw can skip them (v2.2).
+ * Channels: scan:start, scan:retest, scan:stop, scan:presets, scan:suggest,
+ * scan:apply, scan:links, scan:export, scan:forget. Event: scan-progress
+ * { runId, stage, done, total, alive, speedDone, speedTotal, etaMs, result }
+ * per result, the same without a result when the stage changes, then
+ * { ..., finished: true, cancelled } (plus `error` when the run itself failed).
+ * One run at a time. The last request is remembered under `scan`, never the
+ * results — only the addresses tested, under `scanTested`, so a random draw
+ * can skip them.
+ *
+ * Before a run (prepare): the config is checked to be one a target can be put
+ * into; an SNI list is refused for a config whose SNI cannot change; a core
+ * too old for the config is left out (MASQUE, a WARP account, ECH); and an
+ * ECH config that is a DNS query is fetched ONCE here and handed to every
+ * core as the list itself.
  */
 const crypto = require('crypto');
-const { isIPv4 } = require('net');
-const { parseLink, buildShareLink } = require('../parser');
+const { parseLink, parseMany, buildShareLink } = require('../parser');
+const { buildMultiTestConfig, echQueryOf } = require('../configBuilder');
+const { usesMasque, usesMasqueWarp, usesEch, versionBelow, MASQUE_SINCE, MASQUE_WARP_SINCE, ECH_SINCE } = require('../xrayManager');
 const { xrayEngines, engineLabel } = require('../engines');
-const { expandTargets, drawTargets, CF_IPV4_RANGES, ip4ToInt } = require('./targets');
-const { withAddress } = require('./substitute');
+const T = require('./targets');
+const { applyTarget, dialOf, transportOf, sniSupport } = require('./substitute');
+const { fetchEchConfig: defaultFetchEch } = require('./ech');
 const { runScan: defaultRunScan, runSpeed: defaultRunSpeed } = require('./scanner');
 
 const STORE_KEY = 'scan';
 const MAX_TARGETS = 5000;
-/** Every address a run has tested (phase 1), as integers, newest last — spec v2.2 §2.2. */
+/** Every address a run has tested (phase 1), normalised strings, newest last — spec v2.2 §2.2. */
 const TESTED_KEY = 'scanTested';
 const TESTED_CAP = 50000;
-/** How the box is read: every address, or a fresh draw of `perRange` per range that skips the tested. */
+const ECH_TIMEOUT_MS = 4000;
+/** How the address box is read: every address, or a fresh draw of `perRange` per range that skips the tested. */
 const PICK_DEFAULTS = { mode: 'all', perRange: 20, fresh: true };
-/** What the tab shows before the user changes anything: the balanced preset. */
+/** What the page shows before the user changes anything: the balanced preset. */
 const PRESET_DEFAULTS = {
   batch: 20, filterConcurrency: 16, coresInParallel: 2, delaySamples: 2,
   tcpTimeout: 2000, delayTimeout: 4000,
+  delayHost: 'cp.cloudflare.com', delayPort: 80, delayPath: '/',
   speedTop: 10, speedConcurrency: 1, speedRounds: 1, warmupMs: 300,
   downBytes: 10e6, downMaxMs: 6000, downTimeout: 8000,
   downHost: 'speed.cloudflare.com', downPath: '/__down?bytes=10000000', downPort: 443, downTls: true,
   upBytes: 2e6, upTimeout: 20000,
   upHost: 'speed.cloudflare.com', upPath: '/__up', upPort: 443, upTls: true
 };
-/** The three presets of spec section 1.2; every one a full opts object. */
+/** The three presets; every one a full opts object. */
 const PRESETS = {
   fast: Object.assign({}, PRESET_DEFAULTS, { delaySamples: 1, tcpTimeout: 1500, delayTimeout: 3000, filterConcurrency: 32, coresInParallel: 3, speedTop: 5 }),
   balanced: Object.assign({}, PRESET_DEFAULTS),
   accurate: Object.assign({}, PRESET_DEFAULTS, { delaySamples: 4, filterConcurrency: 8, speedTop: 20, speedRounds: 2, speedConcurrency: 1 })
 };
 const DEFAULT_TESTS = { tcp: true, delay: true, down: true, up: false };
-const CSV_HEADER = 'ip,engine,phase,tcp_ms,delay_min,delay_median,delay_avg,jitter,loss,down_mbps,up_mbps,score,error';
+const CSV_HEADER = 'addr,port,sni,engine,phase,tcp_ms,delay_min,delay_median,delay_avg,jitter,loss,down_mbps,up_mbps,score,error';
 
 const num = (v, def, lo, hi) => {
   const n = Math.floor(Number(v));
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
 };
 const str = (v, def) => (typeof v === 'string' && v.trim() ? v.trim() : def);
+const hasTokens = (text) => String(text || '').split(/\r?\n/).some((l) => l.replace(/#.*/, '').trim());
 
-/** The pick as sent, clamped; a v2.1 request without one reads as `all`. */
+/** The pick as sent, clamped; a request without one reads as `all`. */
 function sanitizePick(raw) {
   const p = raw && typeof raw === 'object' ? raw : {};
   return {
@@ -64,7 +75,7 @@ function sanitizePick(raw) {
   };
 }
 
-/** Clamp what the renderer sent; anything missing takes the default. */
+/** Clamp what the page sent; anything missing takes the default. */
 function sanitizeOpts(raw) {
   const o = raw && typeof raw === 'object' ? raw : {};
   const D = PRESET_DEFAULTS;
@@ -77,6 +88,9 @@ function sanitizeOpts(raw) {
     delaySamples: num(o.delaySamples, D.delaySamples, 1, 10),
     tcpTimeout: num(o.tcpTimeout, D.tcpTimeout, 500, 30000),
     delayTimeout: num(o.delayTimeout, D.delayTimeout, 500, 60000),
+    delayHost: str(o.delayHost, D.delayHost),
+    delayPort: num(o.delayPort, D.delayPort, 1, 65535),
+    delayPath: str(o.delayPath, D.delayPath),
     speedTop: num(o.speedTop, D.speedTop, 0, 50),
     speedConcurrency: num(o.speedConcurrency, D.speedConcurrency, 1, 4),
     speedRounds: num(o.speedRounds, D.speedRounds, 1, 3),
@@ -111,7 +125,7 @@ function csvCell(v) {
 function csvRow(r) {
   const d = r.delay && r.delay.loss < 1 ? r.delay : null;
   return [
-    r.ip, r.engine, r.phase || 1,
+    r.addr || r.ip, r.port, r.sni, r.engine, r.phase || 1,
     r.tcp && r.tcp.ok ? r.tcp.ms : null,
     d ? d.min : null, d ? d.median : null, d ? d.avg : null, d ? d.jitter : null,
     r.delay ? r.delay.loss : null,
@@ -121,27 +135,44 @@ function csvRow(r) {
   ].map(csvCell).join(',');
 }
 
+/** Why a config cannot take a target, as the page's error code; '' when it can. */
+function refusalOf(err) {
+  const code = err && err.code;
+  if (code === 'json-chain') return 'json chain';
+  if (code === 'reality' || code === 'ech' || code === 'notls') return 'sni';
+  return 'unsupported protocol';
+}
+
+/** The TLS settings of a config's dialling outbound, or null. */
+const tlsOf = (server) => (server && server.outbound && server.outbound.streamSettings && server.outbound.streamSettings.tlsSettings) || null;
+
 /**
  * createScan(ctx, deps?) → { register(), stop(), busy() }
- * `deps` = { probes, getFreePorts, runScan, runSpeed } are injection points for tests.
+ * `deps` = { probes, getFreePorts, waitReady, runScan, runSpeed, fetchEchConfig } are the tests' seams.
  */
 function createScan(ctx, deps = {}) {
   const runScan = deps.runScan || defaultRunScan;
   const runSpeed = deps.runSpeed || defaultRunSpeed;
+  const fetchEch = deps.fetchEchConfig || defaultFetchEch;
   let run = null;                    // { runId, token, promise } while a scan is in flight
 
   function engineOffer() {
     return xrayEngines().map((id) => ({ id, label: engineLabel(id), installed: !!ctx.xray.binExists(id) }));
   }
 
-  /** The stored server or the pasted link. Throws with a reason the reply carries. */
+  /** The stored config, or the pasted link or JSON. Throws with a reason the reply carries. */
   function resolveServer(req) {
     if (req.serverId) {
       const t = ctx.resolveTarget(req.serverId) || {};
       if (!t.server) throw new Error('server not found');
       return t.server;
     }
-    if (req.link) return parseLink(req.link);
+    if (req.link) {
+      const text = String(req.link).trim();
+      const many = (() => { try { return parseMany(text); } catch { return { servers: [] }; } })();
+      if (many.servers && many.servers.length) return many.servers[0];
+      return parseLink(text);   // throws, saying why
+    }
     throw new Error('no server');
   }
 
@@ -152,21 +183,88 @@ function createScan(ctx, deps = {}) {
     return offered.filter((e) => e.installed && want.includes(e.id)).map((e) => e.id);
   }
 
+  /** What a config allows a scan to do — for the page, before anything runs. */
+  function factsOf(server) {
+    const tls = tlsOf(server) || {};
+    const ms = server.outbound && server.outbound.streamSettings && server.outbound.streamSettings.masqueSettings;
+    let applies = '';
+    try { applyTarget(server, {}); } catch (e) { applies = refusalOf(e); }
+    const dial = dialOf(server);
+    return {
+      protocol: String(server.protocol || (server.outbound && server.outbound.protocol) || ''),
+      name: server.name || '',
+      address: dial.addr || '', port: dial.port || null, sniName: dial.sni || '',
+      transport: transportOf(server),
+      sni: sniSupport(server),
+      ech: !!String(tls.echConfigList || '').trim(),
+      echQuery: !!echQueryOf(tls.echConfigList),
+      masque: (server.outbound && server.outbound.protocol) === 'masque',
+      warp: !!(ms && ms.warp),
+      preset: T.suggestPreset(server),
+      unsupported: applies
+    };
+  }
+
+  /** The cores a run can use: a core too old for this config is left out, with the reason. */
+  async function gateEngines(server, engines) {
+    let cfg;
+    try { cfg = buildMultiTestConfig([applyTarget(server, {})], [1]); } catch { return { engines, skipped: [] }; }
+    const need = usesMasqueWarp(cfg) ? MASQUE_WARP_SINCE : (usesMasque(cfg) ? MASQUE_SINCE : (usesEch(cfg) ? ECH_SINCE : ''));
+    if (!need) return { engines, skipped: [] };
+    const ok = [], skipped = [];
+    for (const id of engines) {
+      let v = '';
+      try { v = String(await ctx.xray.version(id) || ''); } catch { /* unreadable: give it the run */ }
+      if (/\d+\.\d+\.\d+/.test(v) && versionBelow(v, need)) {
+        const what = need === MASQUE_WARP_SINCE ? 'MASQUE with a WARP account' : (need === MASQUE_SINCE ? 'MASQUE' : 'ECH');
+        skipped.push({ engine: id, version: v, need, reason: `${engineLabel(id)} ${v} does not know ${what} (${need} and newer do)` });
+      } else ok.push(id);
+    }
+    return { engines: ok, skipped };
+  }
+
+  /**
+   * An ECH config given as a DNS query, fetched once: the config with the
+   * list itself in it, and what the page says about it. Any failure keeps the
+   * query form — each core then asks on its own, as a connect does.
+   */
+  async function withEch(server) {
+    const tls = tlsOf(server);
+    if (!tls || !echQueryOf(tls.echConfigList)) return { server, ech: null };
+    let r;
+    try { r = await fetchEch(tls.echConfigList, { serverName: tls.serverName || dialOf(server).sni || '', timeout: ECH_TIMEOUT_MS }); }
+    catch (e) { r = { ok: false, error: (e && e.message) || String(e) }; }
+    if (!r || !r.ok) {
+      const msg = (r && r.error) || 'no answer';
+      ctx.log(`Scan: the ECH config could not be fetched here (${msg}) — each core asks itself`, 'warn');
+      return { server, ech: { ok: false, error: msg, via: (r && r.via) || '' } };
+    }
+    const copy = JSON.parse(JSON.stringify(server));
+    tlsOf(copy).echConfigList = r.list;
+    ctx.log(`Scan: ECH config fetched once over ${r.via}${r.publicName ? ' — public name ' + r.publicName : ''}`, 'info');
+    return { server: copy, ech: { ok: true, publicName: r.publicName || '', via: r.via || '' } };
+  }
+
   /* ----------------------------- the tested history ----------------------------- */
 
-  let tested = null;        // Set<int>, read from the store on first use
-  let testedDirty = false;  // something was added since the last write
+  let tested = null;        // Set<string>, read from the store on first use
+  let testedDirty = false;
   const testedSet = () => {
     if (!tested) {
       const raw = ctx.store.get(TESTED_KEY, null);
-      tested = new Set(Array.isArray(raw) ? raw.filter(n => Number.isInteger(n) && n >= 0 && n <= 0xffffffff) : []);
+      tested = new Set();
+      for (const v of Array.isArray(raw) ? raw : []) {
+        // v2.2 kept IPv4 integers; v3 keeps normalised strings of any kind
+        const s = Number.isInteger(v) && v >= 0 && v <= 0xffffffff ? T.intToIp4(v) : (typeof v === 'string' ? T.normalizeAddr(v) : null);
+        if (s) tested.add(s);
+      }
     }
     return tested;
   };
-  /** A Set keeps insertion order, so the cap drops the oldest; an address seen again keeps its old place. */
-  function rememberTested(ip) {
-    const n = ip4ToInt(ip);
-    if (n === null) return;
+  /** A Set keeps insertion order, so the cap drops the oldest. */
+  function rememberTested(addr) {
+    const n = T.normalizeAddr(addr);
+    if (!n) return;
     const set = testedSet();
     if (set.has(n)) return;
     set.add(n);
@@ -184,6 +282,8 @@ function createScan(ctx, deps = {}) {
     try { ctx.store.set(TESTED_KEY, []); } catch { /* same */ }
     return { ok: true, tested: 0 };
   }
+
+  /* ----------------------------- runs ----------------------------- */
 
   /**
    * Put a run in flight: its events go out as scan-progress with the newest
@@ -204,7 +304,7 @@ function createScan(ctx, deps = {}) {
       },
       onResult: (result) => {
         done++;
-        if (result && result.phase === 1 && result.ip) rememberTested(result.ip);   // whatever mode: it was tested
+        if (result && result.phase === 1 && result.addr) rememberTested(result.addr);   // whatever the pick: it was tested
         send({ result });
       }
     };
@@ -220,45 +320,74 @@ function createScan(ctx, deps = {}) {
       }
     ).finally(() => { run = null; persistTested(); });
     run = { runId, token, promise };
-    const label = server.name || server.address;
-    return { runId, label };
+    return { runId, label: server.name || server.address };
+  }
+
+  /** What every run needs first: the config, its cores, its ECH. A refusal is `{ error }`. */
+  async function prepare(req) {
+    let server;
+    try { server = resolveServer(req); } catch (e) { return { error: e.message }; }
+    try { applyTarget(server, {}); } catch (e) { return { error: refusalOf(e) }; }
+    const engines = chooseEngines(req.engines);
+    if (!engines.length) return { error: 'no engine' };
+    const gate = await gateEngines(server, engines);
+    if (!gate.engines.length) return { error: 'core too old', skipped: gate.skipped };
+    const e = await withEch(server);
+    return { server: e.server, original: server, engines: gate.engines, skipped: gate.skipped, ech: e.ech };
   }
 
   async function start(raw) {
     const req = raw && typeof raw === 'object' ? raw : {};
     if (run) return { error: 'busy' };
+
+    // the targets first: a typo is answered without waiting on a core or DNS
     let server;
     try { server = resolveServer(req); } catch (e) { return { error: e.message }; }
-    try { withAddress(server, '127.0.0.1'); } catch { return { error: 'unsupported protocol' }; }
-
-    // the box, read the way the pick says: every address, or a fresh draw per range
+    try { applyTarget(server, {}); } catch (e) { return { error: refusalOf(e) }; }
     const pick = sanitizePick(req.pick);
-    const drawn = pick.mode === 'random'
-      ? drawTargets(req.ipsText, { perRange: pick.perRange, max: MAX_TARGETS, exclude: pick.fresh ? testedSet() : undefined })
-      : expandTargets(req.ipsText, { max: MAX_TARGETS });
-    const { ips, errors, truncated } = drawn;
-    if (!ips.length) return { error: 'no targets', errors };
-
-    const engines = chooseEngines(req.engines);
-    if (!engines.length) return { error: 'no engine' };
+    const dial = dialOf(server);
+    const addrText = String(req.ipsText || '');
+    let drawn = { addrs: [], errors: [], ranges: 0, exhausted: 0, truncated: false };
+    if (hasTokens(addrText)) {
+      drawn = pick.mode === 'random'
+        ? T.drawTargets(addrText, { perRange: pick.perRange, max: MAX_TARGETS, exclude: pick.fresh ? testedSet() : undefined })
+        : Object.assign({ ranges: 0, exhausted: 0 }, T.expandTargets(addrText, { max: MAX_TARGETS }));
+      if (!drawn.addrs.length) return { error: 'no targets', errors: drawn.errors };
+    }
+    const ports = T.parsePorts(String(req.portsText || ''));
+    const snis = T.parseSnis(String(req.snisText || ''));
+    if (snis.snis.length) {
+      const s = sniSupport(server);
+      if (!s.ok) return { error: 'sni', code: s.code, reason: s.reason };
+    }
+    const built = T.buildTargets({ addrs: drawn.addrs, ports: ports.ports, snis: snis.snis, defaultAddr: dial.addr, defaultPort: dial.port, max: MAX_TARGETS });
+    if (!built.targets.length) return { error: 'no targets', errors: drawn.errors };
 
     const tests = sanitizeTests(req.tests);
-    if (!tests.tcp && !tests.delay && !tests.down && !tests.up) return { error: 'no tests' };
+    const transport = transportOf(server);
+    const measures = tests.delay || tests.down || tests.up || (tests.tcp && transport === 'tcp');
+    if (!measures) return { error: 'no tests' };
     const opts = sanitizeOpts(req.opts);
+
+    const prep = await prepare(req);
+    if (prep.error) return prep;
+    if (run) return { error: 'busy' };   // another start won while this one asked DNS
 
     const remembered = {
       serverId: req.serverId || null, link: req.serverId ? null : (req.link || null),
-      ipsText: String(req.ipsText || ''), pick, engines, tests, opts
+      ipsText: addrText, portsText: String(req.portsText || ''), snisText: String(req.snisText || ''),
+      pick, engines: prep.engines, tests, opts
     };
     try { ctx.store.setLazy(STORE_KEY, remembered); } catch { /* the run matters more than the memory of it */ }
 
-    const total = ips.length * engines.length;
+    const targets = built.targets;
+    const total = targets.length * prep.engines.length;
     const token = { cancelled: false };
     const { runId, label } = launch({
-      server, total, stage: 'filter', token,
+      server: prep.server, total, stage: 'filter', token,
       start: (hooks) => runScan(Object.assign({
-        server, ips, engines, tests,
-        opts: Object.assign({}, opts, { probes: deps.probes, getFreePorts: deps.getFreePorts }),
+        server: prep.server, targets, engines: prep.engines, tests, transport,
+        opts: Object.assign({}, opts, { probes: deps.probes, getFreePorts: deps.getFreePorts, waitReady: deps.waitReady }),
         xray: ctx.xray, token
       }, hooks))
     });
@@ -266,27 +395,36 @@ function createScan(ctx, deps = {}) {
       ` — a fresh draw of ${pick.perRange} per range from ${drawn.ranges} range(s)` +
       (pick.fresh ? `, ${testedSet().size} tested before skipped` : '') +
       (drawn.exhausted ? `, ${drawn.exhausted} range(s) had to repeat` : '');
-    ctx.log(`Scan ${runId}: ${ips.length} target(s) × ${engines.join(', ')} through "${label}"${how}`, 'info');
-    return { runId, total, truncated, errors, pick, ranges: drawn.ranges || 0, exhausted: drawn.exhausted || 0 };
+    ctx.log(`Scan ${runId}: ${targets.length} target(s) × ${prep.engines.join(', ')} through "${label}"${how}`, 'info');
+    for (const s of prep.skipped) ctx.log('Scan: ' + s.reason, 'warn');
+    return {
+      runId, total, targets: targets.length, truncated: !!(drawn.truncated || built.truncated),
+      errors: drawn.errors, portErrors: ports.errors, sniErrors: snis.errors,
+      pick, ranges: drawn.ranges || 0, exhausted: drawn.exhausted || 0,
+      transport, ech: prep.ech, skipped: prep.skipped, engines: prep.engines
+    };
   }
 
   /** Phase 2 alone on rows the table chose; every row names its engine. */
   async function retest(raw) {
     const req = raw && typeof raw === 'object' ? raw : {};
     if (run) return { error: 'busy' };
-    let server;
-    try { server = resolveServer(req); } catch (e) { return { error: e.message }; }
-    try { withAddress(server, '127.0.0.1'); } catch { return { error: 'unsupported protocol' }; }
-
-    const installed = chooseEngines(null);
+    const prep = await prepare(Object.assign({}, req, { engines: null }));
+    if (prep.error) return prep;
+    if (run) return { error: 'busy' };
     const seen = new Set();
     const rows = [];
     for (const r of Array.isArray(req.rows) ? req.rows : []) {
-      if (!r || typeof r !== 'object') continue;
-      const ip = String(r.ip || '').trim();
-      if (!isIPv4(ip) || !installed.includes(r.engine) || seen.has(`${ip}|${r.engine}`)) continue;
-      seen.add(`${ip}|${r.engine}`);
-      rows.push({ ip, engine: r.engine, tcp: r.tcp, delay: r.delay });
+      if (!r || typeof r !== 'object' || !prep.engines.includes(r.engine)) continue;
+      const addr = T.normalizeAddr(r.addr || r.ip);
+      if (!addr) continue;
+      const port = Number.isInteger(Number(r.port)) && r.port >= 1 && r.port <= 65535 ? Number(r.port) : null;
+      const sni = r.sni ? (T.parseSnis(String(r.sni)).snis[0] || null) : null;
+      if (r.sni && !sni) continue;
+      const key = T.addrPort(addr, port) + '|' + (sni || '');
+      if (seen.has(`${key}|${r.engine}`)) continue;
+      seen.add(`${key}|${r.engine}`);
+      rows.push({ key, addr, port, sni, engine: r.engine, tcp: r.tcp, delay: r.delay });
     }
     if (!rows.length) return { error: 'no rows' };
 
@@ -297,14 +435,14 @@ function createScan(ctx, deps = {}) {
 
     const token = { cancelled: false };
     const { runId, label } = launch({
-      server, total: rows.length, stage: 'speed', token,
+      server: prep.server, total: rows.length, stage: 'speed', token,
       start: (hooks) => runSpeed(Object.assign({
-        server, rows, tests,
-        opts: Object.assign({}, opts, { probes: deps.probes, getFreePorts: deps.getFreePorts }),
+        server: prep.server, rows, tests,
+        opts: Object.assign({}, opts, { probes: deps.probes, getFreePorts: deps.getFreePorts, waitReady: deps.waitReady }),
         xray: ctx.xray, token
       }, hooks))
     });
-    ctx.log(`Scan ${runId}: re-test of ${rows.length} row(s) through "${label}"`, 'info');
+    ctx.log(`Scan ${runId}: speed test of ${rows.length} row(s) through "${label}"`, 'info');
     return { runId, total: rows.length };
   }
 
@@ -316,7 +454,8 @@ function createScan(ctx, deps = {}) {
 
   function presets() {
     return {
-      cfRanges: CF_IPV4_RANGES.slice(),
+      cfRanges: T.CF_IPV4_RANGES.slice(),
+      ranges: JSON.parse(JSON.stringify(T.PRESETS)),
       defaults: Object.assign({}, PRESET_DEFAULTS),
       presets: { fast: Object.assign({}, PRESETS.fast), balanced: Object.assign({}, PRESETS.balanced), accurate: Object.assign({}, PRESETS.accurate) },
       last: ctx.store.get(STORE_KEY, null) || null,
@@ -325,22 +464,53 @@ function createScan(ctx, deps = {}) {
     };
   }
 
-  function apply(raw) {
+  /** What the chosen config allows (page hints and the suggested addresses). */
+  function suggest(raw) {
     const req = raw && typeof raw === 'object' ? raw : {};
-    const ip = String(req.ip || '').trim();
-    if (!isIPv4(ip)) return { error: 'invalid ip' };
-    let server, record;
+    let server;
     try { server = resolveServer(req); } catch (e) { return { error: e.message }; }
-    try { record = withAddress(server, ip); } catch (e) { return { error: e.message }; }
+    return factsOf(server);
+  }
+
+  /** The config with one target in it: a new record named after the target, its share link rebuilt. */
+  function recordFor(req) {
+    const server = resolveServer(req);
+    const addr = T.normalizeAddr(req.addr || req.ip);
+    if (!addr) throw new Error('invalid ip');
+    const port = req.port != null && req.port !== '' ? Number(req.port) : null;
+    const sni = req.sni ? String(req.sni) : null;
+    const record = applyTarget(server, { addr, port, sni });
     record.id = 'sv-' + crypto.randomBytes(6).toString('hex');
-    record.name = `${str(req.name, '') || server.name || server.address} [${ip}]`;
+    const label = T.addrPort(addr, port) + (sni ? ' ' + sni : '');
+    record.name = `${str(req.name, '') || server.name || server.address} [${label}]`;
+    delete record.importedFrom; delete record.importedId; delete record.importedSub;
     if (req.engine && xrayEngines().includes(req.engine)) {
       // the engine the winning row ran on; the official core is the unmarked default
       if (req.engine === 'xray') delete record.engine; else record.engine = req.engine;
     }
-    record.raw = buildShareLink(record);
-    ctx.addServer(record);
-    return record;
+    let link = '';
+    try { link = buildShareLink(record); } catch { link = ''; }
+    if (!link && record.source === 'json' && record.json) link = JSON.stringify(record.json);
+    record.raw = link || record.raw || '';
+    return { record, link };
+  }
+
+  function apply(raw) {
+    const req = raw && typeof raw === 'object' ? raw : {};
+    let made;
+    try { made = recordFor(req); } catch (e) { return { error: e.code ? refusalOf(e) : e.message }; }
+    const saved = ctx.addServer(made.record);
+    return Object.assign({}, saved, { link: made.link, servers: ctx.getServers() });
+  }
+
+  /** Share links for rows — "copy the best N", ready to paste into IRNetFree. */
+  function links(raw) {
+    const req = raw && typeof raw === 'object' ? raw : {};
+    const out = [];
+    for (const r of Array.isArray(req.rows) ? req.rows.slice(0, 500) : []) {
+      try { const { link } = recordFor(Object.assign({}, req, r, { rows: undefined })); if (link) out.push(link); } catch { /* a row that no longer fits is left out */ }
+    }
+    return { links: out };
   }
 
   function exportText(raw) {
@@ -357,18 +527,19 @@ function createScan(ctx, deps = {}) {
     'scan:retest': retest,
     'scan:stop': stop,
     'scan:presets': presets,
+    'scan:suggest': suggest,
     'scan:apply': apply,
+    'scan:links': links,
     'scan:export': exportText,
     'scan:forget': forget
   };
 
   return {
     register() { for (const [channel, fn] of Object.entries(handlers)) ctx.handle(channel, fn); },
-    /** Quit path: cancel a run in flight and wait for its core to be cleaned up. */
-    stop: async () => {
+    async stop() {
       if (!run) return;
       run.token.cancelled = true;
-      try { await run.promise; } catch { /* reported through the event */ }
+      try { await run.promise; } catch { /* reported through scan-progress */ }
     },
     busy: () => !!run
   };

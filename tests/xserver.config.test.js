@@ -322,7 +322,7 @@ test('without geoip.dat the private block is the literal list, other geo entries
   ] } });
   const noGeo = build(m, { geoAvailable: false });
   assert.deepEqual(noGeo.routing.rules, [
-    { type: 'field', ip: require('../src/main/configBuilder').PRIVATE_IPS, outboundTag: 'block' },
+    { type: 'field', ip: require('../src/main/xserver/config').PRIVATE_IPS, outboundTag: 'block' },
     { type: 'field', domain: ['a.com'], ip: ['1.2.3.4'], outboundTag: 'direct' },
     { type: 'field', protocol: ['bittorrent'], outboundTag: 'block' }
   ]);
@@ -1006,7 +1006,7 @@ test('wizardBridge refuses a missing or non-VLESS target, an unknown exit, and b
 
 test('the exported names are exactly the Z1 interface', () => {
   assert.deepEqual(Object.keys(X).sort(), [
-    'DEFAULT_MODEL', 'NETWORKS', 'OUTBOUND_KINDS', 'PROTOCOLS', 'RULE_PRESETS', 'SCHEMA', 'SECURITIES', 'SS_METHODS',
+    'DEFAULT_MODEL', 'NETWORKS', 'OUTBOUND_KINDS', 'PRIVATE_IPS', 'PROTOCOLS', 'RULE_PRESETS', 'SCHEMA', 'SECURITIES', 'SS_METHODS',
     'allTags', 'buildServerConfig', 'clientLink', 'clientServerRecord', 'defaultTag', 'migrateModel',
     'newClient', 'newInbound', 'newOutbound', 'newRule', 'normalizeModel', 'otherSideSnippet',
     'parseX25519', 'presetRule', 'randomKeyFor', 'randomPassword', 'randomShortId', 'slugTag',

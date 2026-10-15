@@ -1,46 +1,47 @@
 'use strict';
 /**
- * plus: the IP-scan tab (spec section 1 of v2.1). Shares app.js globals ($, t, state, toast, …).
+ * plus: the Scan page (spec 2026-10-15 §4). Shares app.js's globals ($, t,
+ * state, toast, escapeHtml, copyText, fmtMs, pingClass, makeSearchSelect,
+ * setServers).
  *
- * One config, a list of addresses, and a table that fills while the cores work.
- * The run has two phases and the strip above the table says which one is in
- * flight: *غربال* walks every address wide and cheap, *سرعت* re-visits only the
- * best ones one transfer at a time. A row therefore arrives twice — phase 1
- * without speeds, phase 2 with them — and the second one REPLACES the first,
- * which is why the table is a Map keyed by `ip|engine` and never an array.
+ * One config and what to test — addresses × ports × SNIs — and a table that
+ * fills while the cores work. The run has two phases and the strip says which
+ * is in flight: the filter walks every target wide and cheap, the speed test
+ * re-visits only the best one transfer at a time. A row therefore arrives
+ * twice and the second REPLACES the first, which is why the table is a Map
+ * keyed by `target|engine`.
  *
- * Everything measured comes from `scan-progress` events, one result at a time,
- * so a run of five thousand rows must not turn into five thousand layouts:
- * results are queued and applied once per animation frame, and the table is
- * kept sorted by inserting each row at its place instead of rebuilding the
- * body. Nothing here expands a CIDR or draws a sample — main owns the target
- * list, and in the *random* pick it draws a fresh set from the ranges on every
- * start (v2.2); the tab only counts what is typed so the line under the box
- * can say what a run will get.
+ * Results come one at a time in `scan-progress`, so a run of thousands of rows
+ * must not become thousands of layouts: they are queued and applied once per
+ * animation frame, each inserted at its sorted place. Nothing here expands an
+ * address list or draws a sample — main owns the targets; the page only
+ * counts what is typed. What a config allows (UDP: no TCP test; ECH; whether
+ * an SNI can change; the addresses that fit) is main's answer to scan:suggest.
  */
 (function () {
-  const XRAY_PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks'];
   const TEST_IDS = ['tcp', 'delay', 'down', 'up'];
   const TEST_DEFAULTS = { tcp: true, delay: true, down: true, up: false };
   /** The table has no room for "Xray-PattN (patterniha)". */
   const ENGINE_SHORT = { xray: 'Xray', 'xray-pattn': 'PattN' };
   const PRESET_IDS = ['fast', 'balanced', 'accurate'];
-  /** scan:start and scan:retest refuse with a bare code; anything else is shown as it came. */
+  /** main's refusals, by their bare code; anything else is shown as it came. */
   const START_ERRORS = {
     busy: 'scan.err.busy',
     'no server': 'scan.err.noServer',
     'server not found': 'scan.err.notFound',
     'unsupported protocol': 'scan.err.proto',
+    'json chain': 'scan.err.chain',
     'no targets': 'scan.err.noTargets',
     'no engine': 'scan.err.noEngine',
+    'core too old': 'scan.err.coreOld',
     'no tests': 'scan.err.noTests',
-    'no rows': 'scan.err.noRows'
+    'no rows': 'scan.err.noRows',
+    sni: 'scan.err.sni'
   };
   /**
-   * The limits card, field by field: every one is exactly one key of the opts
-   * object main sanitizes, so a preset can fill them and a run can read them
-   * back with no mapping table anywhere else. `lo` is what an empty or silly
-   * value falls back to — only speedTop may legitimately be 0 (skip phase 2).
+   * The number fields, each exactly one key of the opts object main
+   * sanitizes, so a preset fills them and a run reads them back with no other
+   * mapping. `lo` is the floor of a sane value; only speedTop may be 0.
    */
   const NUM_FIELDS = [
     ['#scanConc', 'filterConcurrency', 16, 1],
@@ -53,43 +54,48 @@
     ['#scanSpeedRounds', 'speedRounds', 1, 1],
     ['#scanBatch', 'batch', 20, 1]
   ];
-  /** The stage of the run → the word on the pill. */
   const STAGE_KEYS = { idle: 'scan.stage.idle', filter: 'scan.stage.filter', speed: 'scan.stage.speed', done: 'scan.stage.done' };
   /** A path main built from downBytes itself; filling it in would freeze the MB field. */
   const AUTO_DOWN_PATH = /^\/__down\?bytes=\d+$/;
   /** main's cap on one run's targets — the estimate under the box stops there too. */
   const MAX_TARGETS = 5000;
-  const PICK_DEFAULTS = { mode: 'all', perRange: 20, fresh: true };
   /** A queue this deep means the frames stopped coming (hidden window): drain it. */
   const QUEUE_BURST = 500;
+  const PRESET_NAMES = { cf: 'scan.p.cf', 'warp-masque': 'scan.p.warpMasque', 'warp-wg': 'scan.p.warpWg' };
 
-  let started = false;           // initScan can be reached from two directions (see below)
-  let presets = { cfRanges: [], defaults: {}, presets: {}, engines: [], last: null };
+  let started = false;           // initScan can be reached from two directions (see the bottom)
+  let presets = { ranges: {}, defaults: {}, presets: {}, engines: [], last: null, tested: 0 };
+  let facts = null;              // scan:suggest's answer for the chosen config
+  let factsSeq = 0;              // the answer to the newest question wins
   let sourceSel = null;          // the makeSearchSelect element, when there is one
+  let pendingPick = '';          // a config chosen elsewhere (Configs → «اسکن این»), applied at the next rebuild
   let srcMode = 'server';        // 'server' | 'link'
-  let pickMode = 'all';          // 'all' | 'random' — how main reads the box
-  let tested = 0;                // addresses in main's tested history, for the line under the pick row
+  let pickMode = 'all';          // 'all' | 'random'
   let run = null;                // { runId, startedAt } while a scan is in flight
   let prog = null;               // the newest progress; it outlives the run so the strip keeps its numbers
-  let lastReq = null;            // the request the rows came from — apply and re-test reuse its source
+  let lastReq = null;            // the request the rows came from — links, saving and re-tests reuse its source
   let count = { kind: 'typed' }; // what #scanCount says, so a language switch can say it again
-  let ticker = null;             // the one-second elapsed clock
-  const rows = new Map();        // 'ip|engine' -> { result, tr }
+  let notes = [];                // what the last start said about ECH and the cores left out
+  let ticker = null;
+  const rows = new Map();        // 'target|engine' -> { result, tr }
   const order = [];              // the same keys, in the order the tbody shows them
   let sort = { key: 'score', dir: -1 };
   let best = 0;                  // the highest score in the table — what the bars are scaled to
-  let queue = [];                // results waiting for the next frame
+  let queue = [];
   let frame = 0;
-  let late = 0;                  // the timer that flushes when frames stop coming
+  let late = 0;
   let rowTpl = null;
 
   /* ----------------------------- small helpers ----------------------------- */
 
+  const fill = (s, map) => String(s).replace(/\{(\w+)\}/g, (m, k) => (Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m));
   const tbody = () => $('#scanTbody');
   const numOf = (sel, def, lo = 1) => { const n = Number($(sel).value); return Number.isFinite(n) && n >= lo ? n : def; };
   const setNumField = (sel, v, lo = 1) => { const n = Number(v); if (Number.isFinite(n) && n >= lo) $(sel).value = String(n); };
   const mbps = (v) => (Math.round((Number(v) || 0) * 10) / 10).toFixed(1);
   const int0 = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const addrPort = (addr, port) => (port ? (String(addr).includes(':') ? `[${addr}]:${port}` : `${addr}:${port}`) : String(addr));
+  const rowKey = (r) => `${r.key || r.addr || r.ip}|${r.engine}`;
 
   /** mm:ss — the elapsed clock at the end of the run row. */
   function clock(ms) {
@@ -97,14 +103,16 @@
     return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
   }
 
-  /** A line with its comment cut off. */
-  const uncomment = (raw) => { const h = raw.indexOf('#'); return (h === -1 ? raw : raw.slice(0, h)).trim(); };
-
-  function ipInt(ip) {
-    const p = String(ip).split('.');
-    return ((((+p[0] || 0) * 256 + (+p[1] || 0)) * 256 + (+p[2] || 0)) * 256) + (+p[3] || 0);
+  /** The non-comment tokens of a box. */
+  function tokensOf(text) {
+    const out = [];
+    for (const raw of String(text || '').split(/\r?\n/)) {
+      const h = raw.indexOf('#');
+      const line = (h === -1 ? raw : raw.slice(0, h)).trim();
+      if (line) out.push(...line.split(/[\s,;]+/).filter(Boolean));
+    }
+    return out;
   }
-  const intIp = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
 
   /** A known refusal reads as a sentence; anything else is the raw text. */
   const errText = (code) => (START_ERRORS[code] ? t(START_ERRORS[code]) : String(code || ''));
@@ -115,17 +123,197 @@
     el.hidden = !code;
   }
 
-  /* ----------------------------- the form ----------------------------- */
+  /* ----------------------------- the config ----------------------------- */
 
   function setMode(mode) {
     srcMode = mode === 'link' ? 'link' : 'server';
     $$('#scanSourceSeg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.src === srcMode));
     $('#scanSrcServer').hidden = srcMode !== 'server';
     $('#scanSrcLink').hidden = srcMode !== 'link';
+    refreshFacts();
   }
+
+  function formSource() {
+    if (srcMode === 'link') {
+      const link = $('#scanLink').value.trim();
+      return link ? { link } : {};
+    }
+    const id = $('#scanSource').value || '';
+    return id ? { serverId: id } : {};
+  }
+
+  /** The rows came from one config; links, saving and re-tests go through that same one. */
+  function rowSource() {
+    const src = lastReq && (lastReq.serverId ? { serverId: lastReq.serverId } : (lastReq.link ? { link: lastReq.link } : {}));
+    return src && (src.serverId || src.link) ? src : formSource();
+  }
+
+  /** The stored-config picker: every config — main says which it can take. */
+  function refreshSourcePicker() {
+    const mount = $('#scanSourceMount');
+    const sel = $('#scanSource');
+    if (!mount || !sel) return;
+    // what was chosen, read before the options are rebuilt (rebuilding resets the select's value)
+    const wanted = pendingPick || (sourceSel && sourceSel.getValue()) || sel.value || (presets.last && presets.last.serverId) || '';
+    pendingPick = '';
+    const opts = (state.servers || [])
+      .filter(s => s && s.outbound)
+      .map(s => ({ value: s.id, label: `${s.name || '—'} — ${String(s.protocol || '').toUpperCase()} ${addrPort(s.address, s.port)}` }));
+    sel.innerHTML = opts.map(o => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`).join('');
+    mount.innerHTML = '';
+    if (!opts.length) {
+      sourceSel = null;
+      sel.value = '';
+      const note = document.createElement('p');
+      note.className = 'hint warn';
+      note.dataset.i18n = 'scan.noServers';
+      note.textContent = t('scan.noServers');
+      mount.appendChild(note);
+      refreshFacts();
+      return;
+    }
+    const keep = opts.some(o => o.value === wanted) ? wanted : opts[0].value;
+    sourceSel = makeSearchSelect({ options: opts, value: keep, onChange: (v) => { sel.value = v; refreshFacts(); } });
+    mount.appendChild(sourceSel);
+    sel.value = keep;
+    refreshFacts();
+  }
+
+  /** The Configs page's «اسکن این»: this config, chosen. */
+  function useConfig(id) {
+    pendingPick = id;
+    setMode('server');
+    refreshSourcePicker();
+  }
+
+  /** What main says this config allows, as a short list under the picker. */
+  async function refreshFacts() {
+    const seq = ++factsSeq;
+    const src = formSource();
+    if (!src.serverId && !src.link) { facts = null; return paintFacts(); }
+    let r;
+    try { r = await window.api.scanSuggest(src); } catch { r = null; }
+    if (seq !== factsSeq) return undefined;
+    facts = r && !r.error ? r : null;
+    return paintFacts();
+  }
+
+  function paintFacts() {
+    const list = $('#scanFacts');
+    list.innerHTML = '';
+    const sni = $('#scanSnis');
+    if (!facts) { sni.disabled = false; list.hidden = true; return; }
+    const lines = [];
+    const proto = (facts.protocol || '').toUpperCase() + (facts.warp ? ' · WARP' : '');
+    lines.push(fill(t('scan.fact.proto'), { p: proto, t: facts.transport === 'udp' ? 'UDP' : 'TCP' }));
+    if (facts.unsupported) lines.push(fill(t('scan.fact.unsupported'), { r: errText(facts.unsupported) }));
+    lines.push(t(facts.transport === 'udp' ? 'scan.fact.udp' : 'scan.fact.tcp'));
+    if (facts.ech) lines.push(t('scan.fact.ech'));
+    else if (facts.sni && facts.sni.ok) lines.push(t('scan.fact.sniOk'));
+    else if (facts.sni && facts.sni.code) lines.push(t('scan.fact.sni.' + facts.sni.code));
+    if (facts.warp) lines.push(t('scan.fact.warp'));
+    else if (facts.masque) lines.push(t('scan.fact.masque'));
+    if (facts.preset && PRESET_NAMES[facts.preset]) lines.push(fill(t('scan.fact.suggest'), { p: t(PRESET_NAMES[facts.preset]) }));
+    for (const text of lines) {
+      const li = document.createElement('li');
+      li.textContent = text;
+      list.appendChild(li);
+    }
+    list.hidden = false;
+    // an SNI list this config cannot take would only be refused at start
+    sni.disabled = !(facts.sni && facts.sni.ok);
+  }
+
+  /* ----------------------------- what to test ----------------------------- */
+
+  function setPick(mode) {
+    pickMode = mode === 'random' ? 'random' : 'all';
+    $$('#scanPickSeg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.pick === pickMode));
+    $('#scanPickOpts').hidden = pickMode !== 'random';
+    updateCount();
+  }
+  const perRange = () => Math.round(numOf('#scanPerRange', 20, 1));
+
+  /** The addresses an IPv4 token stands for; anything else (IPv6 blocks, names) is drawn, so it counts as one draw. */
+  function sizeOf(tok) {
+    const bare = tok.replace(/^\[([^\]]+)\](?::\d+)?$/, '$1').replace(/:(\d+)$/, (m, p) => (tok.includes('[') || tok.split(':').length > 2 ? m : ''));
+    const cidr = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(bare);
+    if (cidr) return 2 ** (32 - Math.max(8, Math.min(32, Number(cidr[2]))));
+    const dash = /^(\d{1,3}(?:\.\d{1,3}){3})-(\d{1,3}(?:\.\d{1,3}){3})$/.exec(bare);
+    if (dash) {
+      const n = (ip) => ip.split('.').reduce((a, o) => a * 256 + Number(o), 0);
+      return Math.max(1, n(dash[2]) - n(dash[1]) + 1);
+    }
+    if (/\/\d{1,3}$/.test(bare) || /^[0-9a-f:]+-[0-9a-f:]+$/i.test(bare)) return Infinity;
+    return 1;
+  }
+
+  /** The line under the box: what a run will get, as far as the page can tell. */
+  function paintCount() {
+    const el = $('#scanCount');
+    if (count.kind === 'run') {
+      const parts = [fill(t('scan.countTotal'), { n: count.targets, e: count.engines })];
+      if (count.truncated) parts.push(fill(t('scan.truncated'), { n: count.targets }));
+      if (count.bad) parts.push(fill(t('scan.badLines'), { n: count.bad }));
+      if (count.exhausted) parts.push(fill(t('scan.exhausted'), { n: count.exhausted }));
+      el.textContent = parts.join(' · ');
+      return;
+    }
+    if (count.kind === 'retest') { el.textContent = fill(t('scan.retopCount'), { n: count.n }); return; }
+    const toks = tokensOf($('#scanIps').value);
+    const ports = Math.max(1, tokensOf($('#scanPorts').value).length);
+    const snis = $('#scanSnis').disabled ? 1 : Math.max(1, tokensOf($('#scanSnis').value).length);
+    const product = ports > 1 || snis > 1 ? ' ' + fill(t('scan.countProduct'), { p: ports, s: snis }) : '';
+    if (!toks.length) { el.textContent = t('scan.p.none') + product; return; }
+    if (pickMode === 'random') {
+      const k = perRange();
+      const n = Math.min(MAX_TARGETS, toks.reduce((s, tok) => s + Math.min(k, sizeOf(tok)), 0));
+      el.textContent = fill(t('scan.countRandom'), { r: toks.length, k, n }) + product;
+      return;
+    }
+    el.textContent = fill(t('scan.count'), { n: toks.length }) + product;
+  }
+
+  function updateCount() {
+    count = { kind: 'typed' };
+    paintCount();
+  }
+
+  /** The history count next to the pick row; nothing while it is empty. */
+  function paintTested(n) {
+    const el = $('#scanTested');
+    const v = Math.max(0, Math.floor(Number(n) || 0));
+    el.textContent = v ? fill(t('scan.tested'), { n: v }) : '';
+    el.hidden = !v;
+  }
+
+  /** An address preset: its ranges into the box; WARP WireGuard brings its ports too. */
+  function applyAddrPreset(name) {
+    const which = name === 'suggest' ? (facts && facts.preset) : name;
+    const p = which && (presets.ranges || {})[which];
+    if (!p || !Array.isArray(p.ranges)) return toast(t('scan.p.none'), 'warn');
+    $('#scanIps').value = p.ranges.join('\n');
+    if (Array.isArray(p.ports) && p.ports.length) $('#scanPorts').value = p.ports.join(', ');
+    // a big list is meant to be sampled, not walked
+    if (p.ranges.length > 1 || /\/(?:[0-9]|1[0-9]|2[0-3])$/.test(p.ranges[0] || '')) setPick('random');
+    updateCount();
+    return undefined;
+  }
+
+  function applyPortsPreset(name) {
+    const r = presets.ranges || {};
+    const list = Array.isArray(r[name]) ? r[name] : (r[name] && Array.isArray(r[name].ports) ? r[name].ports : null);
+    if (!list) return;
+    $('#scanPorts').value = list.join(', ');
+    updateCount();
+  }
+
+  /* ----------------------------- how ----------------------------- */
 
   function renderEngines(list) {
     const host = $('#scanEngines');
+    const ticked = new Set($$('#scanEngines input').filter(b => b.checked).map(b => b.value));
+    const fresh = !host.children.length;
     host.innerHTML = '';
     for (const e of list) {
       const label = document.createElement('label');
@@ -134,7 +322,7 @@
       const box = document.createElement('input');
       box.type = 'checkbox';
       box.value = e.id;
-      box.checked = !!e.installed;
+      box.checked = !!e.installed && (fresh || ticked.has(e.id) || !ticked.size);
       box.disabled = !e.installed;
       const text = document.createElement('span');
       text.className = 'scan-check-label';
@@ -142,8 +330,6 @@
       label.appendChild(box);
       label.appendChild(text);
       if (!e.installed) {
-        // a core that is not on disk cannot be ticked; say why rather than
-        // leaving a dead checkbox
         const why = document.createElement('span');
         why.className = 'scan-check-hint';
         why.dataset.i18n = 'scan.notInstalled';
@@ -152,15 +338,6 @@
       }
       host.appendChild(label);
     }
-  }
-
-  /** The names come from main, so a language switch only rewrites them in place — the ticks are the user’s. */
-  function paintEngineLabels() {
-    const list = presets.engines || [];
-    $$('#scanEngines .scan-check').forEach((label, i) => {
-      const text = label.querySelector('.scan-check-label');
-      if (text && list[i]) text.textContent = list[i].label || list[i].id;
-    });
   }
 
   function renderTests() {
@@ -186,15 +363,14 @@
   const testBox = (id) => document.querySelector(`#scanTests input[value="${id}"]`);
   const testOn = (id) => { const b = testBox(id); return !!(b && b.checked); };
 
-  /* ----------------------------- presets and limits ----------------------------- */
-
   function fillLimits(o) {
     if (!o || typeof o !== 'object') return;
     for (const [sel, key, , lo] of NUM_FIELDS) setNumField(sel, o[key], lo);
     if (Number(o.downBytes) > 0) setNumField('#scanDownMb', Math.round(Number(o.downBytes) / 1e6));
     if (typeof o.downHost === 'string' && o.downHost) $('#scanDownHost').value = o.downHost;
-    // only a path the user wrote is worth restoring: the generated one carries
-    // its own byte count and would silently outrank the MB field
+    if (typeof o.delayHost === 'string' && o.delayHost) $('#scanDelayHost').value = o.delayHost;
+    if (Number(o.delayPort) > 0) $('#scanDelayPort').value = String(Number(o.delayPort));
+    if (typeof o.delayPath === 'string' && o.delayPath) $('#scanDelayPath').value = o.delayPath;
     if (typeof o.downPath === 'string' && o.downPath && !AUTO_DOWN_PATH.test(o.downPath)) $('#scanDownPath').value = o.downPath;
     paintPreset();
   }
@@ -209,25 +385,20 @@
     return '';
   }
 
-  /** No preset is ever "on" by itself: the mark follows the numbers in the fields. */
   function paintPreset() {
     const now = currentPreset();
     $$('#scanPreset .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.preset === now));
   }
 
-  function applyPreset(name) {
-    const p = (presets.presets || {})[name];
-    if (!p) return;
-    fillLimits(p);
-  }
-
-  /** Every field of the limits card, as the opts object main expects. */
   function buildOpts() {
     const o = {};
     for (const [sel, key, def, lo] of NUM_FIELDS) o[key] = Math.round(numOf(sel, def, lo));
     o.downBytes = Math.round(numOf('#scanDownMb', 10) * 1e6);
     o.downHost = $('#scanDownHost').value.trim();
     o.downPath = $('#scanDownPath').value.trim();
+    o.delayHost = $('#scanDelayHost').value.trim();
+    o.delayPort = Math.round(numOf('#scanDelayPort', 80));
+    o.delayPath = $('#scanDelayPath').value.trim() || '/';
     return o;
   }
 
@@ -235,6 +406,8 @@
   function restore(last) {
     if (!last) return;
     if (last.ipsText) $('#scanIps').value = last.ipsText;
+    if (last.portsText) $('#scanPorts').value = last.portsText;
+    if (last.snisText) $('#scanSnis').value = last.snisText;
     if (last.pick && typeof last.pick === 'object') {
       if (last.pick.perRange) $('#scanPerRange').value = last.pick.perRange;
       $('#scanFresh').checked = last.pick.fresh !== false;
@@ -249,141 +422,8 @@
     else if (last.serverId) setMode('server');
   }
 
-  /**
-   * The stored-config picker. Only the xray-format protocols can be dialled
-   * through a substituted address, so the rest never appear. Exposed as
-   * window.plusScanRefresh so a later change to the server list can rebuild it.
-   */
-  function refreshSourcePicker() {
-    const mount = $('#scanSourceMount');
-    const sel = $('#scanSource');
-    if (!mount || !sel) return;
-    const opts = (state.servers || [])
-      .filter(s => XRAY_PROTOCOLS.includes(s.protocol))
-      .map(s => ({ value: s.id, label: `${s.name} — ${s.address}:${s.port}` }));
-    sel.innerHTML = opts
-      .map(o => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`)
-      .join('');
-    mount.innerHTML = '';
-    if (!opts.length) {
-      sourceSel = null;
-      sel.value = '';
-      const note = document.createElement('p');
-      note.className = 'hint warn';
-      note.dataset.i18n = 'scan.noServers';
-      note.textContent = t('scan.noServers');
-      mount.appendChild(note);
-      return;
-    }
-    const wanted = (sourceSel && sourceSel.getValue()) || sel.value ||
-      (presets.last && presets.last.serverId) || '';
-    const keep = opts.some(o => o.value === wanted) ? wanted : opts[0].value;
-    sourceSel = makeSearchSelect({ options: opts, value: keep, onChange: (v) => { sel.value = v; } });
-    mount.appendChild(sourceSel);
-    sel.value = keep;
-  }
-
-  /* ----------------------------- the target box ----------------------------- */
-
-  /** What the user typed, counted the way main splits it — items, not addresses. */
-  function countTokens(text) {
-    let n = 0;
-    for (const raw of String(text || '').split(/\r?\n/)) {
-      const line = uncomment(raw);
-      if (line) n += line.split(/[\s,;]+/).filter(Boolean).length;
-    }
-    return n;
-  }
-
-  /**
-   * One line, three things it can say: what is typed, what the run really got,
-   * or how many rows went back for a speed test. It is rebuilt rather than
-   * remembered as text so a language switch can say the same thing again.
-   */
-  function paintCount() {
-    const el = $('#scanCount');
-    if (count.kind === 'run') {
-      const engines = Math.max(1, (count.engines || 1));
-      const targets = Math.max(0, Math.round((count.total || 0) / engines));
-      const parts = [t('scan.countTotal').replace('{n}', targets).replace('{e}', engines)];
-      if (count.truncated) parts.push(t('scan.truncated').replace('{n}', targets));
-      if (count.bad) parts.push(t('scan.badLines').replace('{n}', count.bad));
-      if (count.exhausted) parts.push(t('scan.exhausted').replace('{n}', count.exhausted));
-      el.textContent = parts.join(' · ');
-      return;
-    }
-    if (count.kind === 'retest') { el.textContent = t('scan.retopCount').replace('{n}', count.n); return; }
-    if (pickMode === 'random') {
-      const est = drawEstimate($('#scanIps').value, perRange());
-      el.textContent = t('scan.countRandom').replace('{r}', est.ranges).replace('{k}', perRange()).replace('{n}', est.perRun);
-      return;
-    }
-    el.textContent = t('scan.count').replace('{n}', countTokens($('#scanIps').value));
-  }
-
-  function updateCount() {
-    count = { kind: 'typed' };
-    paintCount();
-  }
-
-  /** One token → an inclusive integer interval, or null. */
-  function tokenRange(tok) {
-    const cidr = /^([\d.]+)\/(\d{1,2})$/.exec(tok);
-    if (cidr) {
-      const base = ipInt(cidr[1]);
-      const prefix = Number(cidr[2]);
-      if (prefix < 8 || prefix > 32) return null;
-      const size = 2 ** (32 - prefix);
-      const start = base - (base % size);
-      return { start, end: start + size - 1 };
-    }
-    const dash = tok.indexOf('-');
-    if (dash !== -1) {
-      const a = ipInt(tok.slice(0, dash)), b = ipInt(tok.slice(dash + 1));
-      return b >= a ? { start: a, end: b } : null;
-    }
-    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(tok)) return null;
-    const n = ipInt(tok);
-    return { start: n, end: n };
-  }
-
-  /**
-   * What a random pick will draw: the ranges the box parses (the grammar main
-   * uses) and min(k, size) from each, capped the way main caps a run. An
-   * estimate for the line under the box — the draw itself happens in main.
-   */
-  function drawEstimate(text, k) {
-    let ranges = 0, perRun = 0;
-    for (const raw of String(text || '').split(/\r?\n/)) {
-      for (const tok of uncomment(raw).split(/[\s,;]+/).filter(Boolean)) {
-        const r = tokenRange(tok);
-        if (!r) continue;
-        ranges++;
-        perRun += Math.min(k, r.end - r.start + 1);
-      }
-    }
-    return { ranges, perRun: Math.min(perRun, MAX_TARGETS) };
-  }
-  const perRange = () => Math.round(numOf('#scanPerRange', PICK_DEFAULTS.perRange, 1));
-
-  function setPick(mode) {
-    pickMode = mode === 'random' ? 'random' : 'all';
-    $$('#scanPickSeg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.pick === pickMode));
-    $('#scanPickOpts').hidden = pickMode !== 'random';
-    updateCount();
-  }
-
-  /** The history count next to the pick row; nothing while it is empty. */
-  function paintTested(n) {
-    const el = $('#scanTested');
-    tested = Math.max(0, Math.floor(Number(n) || 0));
-    el.textContent = tested ? t('scan.tested').replace('{n}', tested) : '';
-    el.hidden = !tested;
-  }
-
   /* ----------------------------- the table ----------------------------- */
 
-  /** The number a column sorts on, or null when the row has none. */
   function metric(r, key) {
     const d = r.delay && r.delay.loss < 1 ? r.delay : null;
     switch (key) {
@@ -399,15 +439,15 @@
     }
   }
 
+  const textCmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
   /** A row with nothing to show in the sorted column goes last, either way. */
   function cmp(a, b) {
     const dir = sort.dir;
-    const tie = ipInt(a.ip) - ipInt(b.ip);
-    if (sort.key === 'ip') return dir * tie;
-    if (sort.key === 'engine') {
-      const e = a.engine < b.engine ? -1 : a.engine > b.engine ? 1 : 0;
-      return dir * e || tie;
-    }
+    const tie = textCmp(String(a.key || a.addr || ''), String(b.key || b.addr || ''));
+    if (sort.key === 'addr') return dir * tie;
+    if (sort.key === 'sni') return dir * textCmp(String(a.sni || ''), String(b.sni || '')) || tie;
+    if (sort.key === 'engine') return dir * textCmp(a.engine, b.engine) || tie;
     const av = metric(a, sort.key), bv = metric(b, sort.key);
     if (av === null && bv === null) return tie;
     if (av === null) return 1;
@@ -420,7 +460,8 @@
     const tr = document.createElement('tr');
     tr.className = 'scan-row';
     tr.innerHTML =
-      '<td class="scan-c-ip"></td>' +
+      '<td class="scan-c-ip" dir="ltr"></td>' +
+      '<td class="scan-c-sni" dir="ltr"></td>' +
       '<td class="scan-c-eng"></td>' +
       '<td class="scan-n"></td><td class="scan-n"></td><td class="scan-n"></td>' +
       '<td class="scan-n"></td><td class="scan-n"></td><td class="scan-n"></td>' +
@@ -430,9 +471,9 @@
         '<span class="scan-score-val"></span>' +
       '</span></td>' +
       '<td class="scan-c-acts">' +
-        '<button class="icon-btn" data-act="use" data-i18n-title="scan.use">✔</button>' +
-        '<button class="icon-btn" data-act="copy" data-i18n-title="scan.copy">⧉</button>' +
-        '<button class="icon-btn" data-act="retest" data-i18n-title="scan.retest">↻</button>' +
+        '<button type="button" class="icon-btn" data-act="link" data-i18n-title="scan.link">⧉</button>' +
+        '<button type="button" class="icon-btn" data-act="use" data-i18n-title="scan.use">✔</button>' +
+        '<button type="button" class="icon-btn" data-act="retest" data-i18n-title="scan.retest">↻</button>' +
       '</td>';
     rowTpl = tr;
     return tr;
@@ -441,8 +482,7 @@
   function newRow(key) {
     const tr = rowTemplate().cloneNode(true);
     tr.dataset.key = key;
-    // the titles are set once here; applyI18n keeps them right after a language switch
-    tr.querySelectorAll('[data-i18n-title]').forEach(b => b.title = t(b.dataset.i18nTitle));
+    tr.querySelectorAll('[data-i18n-title]').forEach(b => { b.title = t(b.dataset.i18nTitle); });
     tr.cells[0].title = t('scan.copy');
     return tr;
   }
@@ -451,33 +491,39 @@
 
   function paintScore(tr, r) {
     const s = Number(r.score) || 0;
-    tr.querySelector('.scan-score-fill').style.inlineSize =
-      (best > 0 ? Math.max(0, Math.min(100, (s / best) * 100)) : 0) + '%';
+    tr.querySelector('.scan-score-fill').style.inlineSize = (best > 0 ? Math.max(0, Math.min(100, (s / best) * 100)) : 0) + '%';
     tr.querySelector('.scan-score-val').textContent = s ? String(Math.round(s)) : '—';
   }
 
   function fillRow(tr, r) {
     const c = tr.cells;
     const p1 = Number(r.phase) === 1;
-    c[0].textContent = r.ip;
-    c[1].textContent = ENGINE_SHORT[r.engine] || r.engine;
+    c[0].textContent = addrPort(r.addr || r.ip, r.port);
+    c[1].textContent = r.sni || '';
+    c[2].textContent = ENGINE_SHORT[r.engine] || r.engine;
     const d = r.delay && r.delay.loss < 1 ? r.delay : null;
-    setCell(c[2], r.tcp ? (r.tcp.ok ? fmtMs(r.tcp.ms) : '×') : '—', r.tcp ? pingClass(r.tcp.ok ? r.tcp.ms : -1) : '');
-    // the median is the headline figure of the delay group; the mean sits next to it
-    setCell(c[3], r.delay ? (d ? fmtMs(d.median) : '×') : '—', r.delay ? pingClass(d ? d.median : -1) : '');
-    setCell(c[4], r.delay ? (d ? fmtMs(d.avg) : '×') : '—', '');
-    setCell(c[5], d ? fmtMs(d.min) : (r.delay ? '×' : '—'), '');
-    setCell(c[6], d ? fmtMs(d.jitter) : (r.delay ? '×' : '—'), '');
-    setCell(c[7], r.delay ? Math.round(r.delay.loss * 100) + '%' : '—', r.delay ? pingClass(r.delay.loss >= 1 ? -1 : r.delay.loss * 1000) : '');
-    setCell(c[8], r.down ? (r.down.ok ? mbps(r.down.mbps) : '×') : '—', 'scan-c-sp');
-    setCell(c[9], r.up ? (r.up.ok ? mbps(r.up.mbps) : '×') : '—', 'scan-c-sp');
+    const tcp = r.tcp && !r.tcp.skipped ? r.tcp : null;
+    setCell(c[3], tcp ? (tcp.ok ? fmtMs(tcp.ms) : '×') : '—', tcp ? pingClass(tcp.ok ? tcp.ms : -1) : '');
+    setCell(c[4], r.delay ? (d ? fmtMs(d.median) : '×') : '—', r.delay ? pingClass(d ? d.median : -1) : '');
+    setCell(c[5], r.delay ? (d ? fmtMs(d.avg) : '×') : '—', '');
+    setCell(c[6], d ? fmtMs(d.min) : (r.delay ? '×' : '—'), '');
+    setCell(c[7], d ? fmtMs(d.jitter) : (r.delay ? '×' : '—'), '');
+    setCell(c[8], r.delay ? Math.round(r.delay.loss * 100) + '%' : '—', r.delay ? pingClass(r.delay.loss >= 1 ? -1 : r.delay.loss * 1000) : '');
+    setCell(c[9], r.down ? (r.down.ok ? mbps(r.down.mbps) : '×') : '—', 'scan-c-sp');
+    setCell(c[10], r.up ? (r.up.ok ? mbps(r.up.mbps) : '×') : '—', 'scan-c-sp');
+    c[1].className = 'scan-c-sni';
     paintScore(tr, r);
     tr.classList.toggle('scan-row-dead', !(Number(r.score) > 0));
-    // phase 1 is a provisional row: its speed cells are empty on purpose
     tr.classList.toggle('scan-row-p1', p1);
     if (r.error) tr.title = r.error;
     else if (p1) tr.title = t('scan.phase1');
     else tr.removeAttribute('title');
+  }
+
+  /** The SNI column shows only when a row carries one. */
+  function paintSniColumn() {
+    const any = [...rows.values()].some(e => !!e.result.sni);
+    $('#scanTable').classList.toggle('scan-no-sni', !any);
   }
 
   function detach(key) {
@@ -487,7 +533,6 @@
     if (e && e.tr.parentNode) e.tr.remove();
   }
 
-  /** Binary search into an already-sorted body: one insert, no rebuild. */
   function insertSorted(key, entry) {
     let lo = 0, hi = order.length;
     while (lo < hi) {
@@ -507,17 +552,13 @@
     flush();
   }
 
-  /**
-   * One flush per frame keeps a five-thousand-row run to one layout per frame
-   * instead of one per result. The timer beside it is not belt-and-braces: a
-   * window that is minimised, or a browser tab in the background, stops
-   * serving frames altogether, and the table would sit still for the whole run.
-   */
+  /** One flush per frame, and a timer for when frames stop coming (a hidden window). */
   function schedule() {
     if (queue.length >= QUEUE_BURST) return flushNow();
-    if (frame) return;
+    if (frame) return undefined;
     frame = requestAnimationFrame(flushNow);
     late = setTimeout(flushNow, 250);
+    return undefined;
   }
 
   function flush() {
@@ -526,18 +567,17 @@
     queue = [];
     let rescale = false;
     for (const r of batch) {
-      const key = r.ip + '|' + r.engine;
+      const key = rowKey(r);
       let entry = rows.get(key);
-      // a phase-2 row replaces the phase-1 row of the same ip|engine
       if (!entry) { entry = { result: r, tr: newRow(key) }; rows.set(key, entry); }
       else { entry.result = r; detach(key); }
       if ((Number(r.score) || 0) > best) { best = Number(r.score) || 0; rescale = true; }
       fillRow(entry.tr, r);
       insertSorted(key, entry);
     }
-    // a new best re-scales every bar; it happens a handful of times per run
     if (rescale) for (const e of rows.values()) paintScore(e.tr, e.result);
     $('#scanEmpty').hidden = rows.size > 0;
+    paintSniColumn();
     paintStrip();
   }
 
@@ -549,7 +589,6 @@
     });
   }
 
-  /** A new sort column: the only time the whole body is rewritten. */
   function resortAll() {
     const keys = [...rows.keys()].sort((a, b) => cmp(rows.get(a).result, rows.get(b).result));
     order.length = 0;
@@ -566,24 +605,23 @@
     best = 0;
     tbody().innerHTML = '';
     $('#scanEmpty').hidden = false;
+    paintSniColumn();
   }
 
-  /* ----------------------------- the stage strip ----------------------------- */
+  /* ----------------------------- the strip ----------------------------- */
 
-  /** The track is the element with the id; the fill inside it is what moves. */
   function setBar(sel, done, total) {
-    const fill = $(sel).firstElementChild;
-    if (!fill) return;
+    const bar = $(sel).firstElementChild;
+    if (!bar) return;
     const pct = total > 0 ? Math.max(0, Math.min(100, (done / total) * 100)) : 0;
-    fill.style.inlineSize = pct.toFixed(1) + '%';
+    bar.style.inlineSize = pct.toFixed(1) + '%';
   }
 
-  /** Seconds while they are worth counting, minutes once they are not. */
   function etaText(ms) {
     const n = Number(ms);
     if (!Number.isFinite(n) || n <= 0) return '';
     const s = Math.round(n / 1000);
-    return s >= 90 ? t('scan.etaMin').replace('{n}', Math.round(s / 60)) : t('scan.etaSec').replace('{n}', Math.max(1, s));
+    return s >= 90 ? fill(t('scan.etaMin'), { n: Math.round(s / 60) }) : fill(t('scan.etaSec'), { n: Math.max(1, s) });
   }
 
   function paintStrip() {
@@ -591,42 +629,41 @@
     const stage = STAGE_KEYS[p.stage] ? p.stage : 'idle';
     const pill = $('#scanStage');
     pill.dataset.stage = stage;
-    // the pill is a JS-written label; the key rides along so applyI18n keeps it
     pill.dataset.i18n = STAGE_KEYS[stage];
     pill.textContent = t(STAGE_KEYS[stage]);
     $('#scanStageText').textContent = !prog ? ''
       : p.stage === 'speed'
-        ? t('scan.stageSpeed').replace('{done}', p.speedDone).replace('{total}', p.speedTotal)
-        : t('scan.stageFilter').replace('{done}', p.done).replace('{total}', p.total).replace('{alive}', p.alive);
+        ? fill(t('scan.stageSpeed'), { done: p.speedDone, total: p.speedTotal })
+        : fill(t('scan.stageFilter'), { done: p.done, total: p.total, alive: p.alive });
     setBar('#scanBarFilter', p.done, p.total);
     setBar('#scanBarSpeed', p.speedDone, p.speedTotal);
     $('#scanEta').textContent = run ? etaText(p.etaMs) : '';
     $('#scanElapsed').textContent = prog ? clock((prog.endedAt || Date.now()) - prog.startedAt) : '';
   }
 
-  /* ----------------------------- running ----------------------------- */
-
-  /** The source of a request — one of the two keys, never both. */
-  function srcOf(req) {
-    if (req && req.serverId) return { serverId: req.serverId };
-    if (req && req.link) return { link: req.link };
-    return {};
-  }
-
-  function formSource() {
-    if (srcMode === 'link') {
-      const link = $('#scanLink').value.trim();
-      return link ? { link } : {};
+  /** What the last start said about ECH and the cores left out. */
+  function paintNotes() {
+    const list = $('#scanNotes');
+    list.innerHTML = '';
+    for (const n of notes) {
+      const li = document.createElement('li');
+      if (n.kind === 'ech') li.textContent = fill(t('scan.note.ech'), { via: n.via || '—', name: n.publicName || '—' });
+      else if (n.kind === 'echFail') li.textContent = fill(t('scan.note.echFail'), { error: n.error || '—' });
+      else li.textContent = fill(t('scan.note.skipped'), { engine: ENGINE_SHORT[n.engine] || n.engine, reason: n.reason || '' });
+      if (n.kind !== 'ech') li.className = 'warn';
+      list.appendChild(li);
     }
-    const id = $('#scanSource').value || '';
-    return id ? { serverId: id } : {};
+    list.hidden = !notes.length;
   }
 
-  /** The rows came from one config; a re-test has to go through that same one. */
-  function rowSource() {
-    const src = srcOf(lastReq);
-    return (src.serverId || src.link) ? src : formSource();
+  function notesOf(res) {
+    const out = [];
+    if (res && res.ech) out.push(res.ech.ok ? Object.assign({ kind: 'ech' }, res.ech) : Object.assign({ kind: 'echFail' }, res.ech));
+    for (const s of (res && res.skipped) || []) out.push(Object.assign({ kind: 'skipped' }, s));
+    return out;
   }
+
+  /* ----------------------------- running ----------------------------- */
 
   const selectedEngines = () => $$('#scanEngines input').filter(b => b.checked).map(b => b.value);
 
@@ -636,23 +673,22 @@
     return tests;
   }
 
-  function buildReq(over) {
+  function buildReq() {
     return Object.assign({
       ipsText: $('#scanIps').value,
+      portsText: $('#scanPorts').value,
+      snisText: $('#scanSnis').disabled ? '' : $('#scanSnis').value,
       pick: { mode: pickMode, perRange: perRange(), fresh: $('#scanFresh').checked },
       engines: selectedEngines(),
       tests: selectedTests(),
       opts: buildOpts()
-    }, formSource(), over || {});
+    }, formSource());
   }
 
-  /** A run is in flight: the buttons, the clock and the strip all follow from this. */
   function beginRun(runId, init) {
     const startedAt = Date.now();
     run = { runId, startedAt };
-    prog = Object.assign({
-      stage: 'filter', done: 0, total: 0, alive: 0, speedDone: 0, speedTotal: 0, etaMs: null
-    }, init, { startedAt, endedAt: 0 });
+    prog = Object.assign({ stage: 'filter', done: 0, total: 0, alive: 0, speedDone: 0, speedTotal: 0, etaMs: null }, init, { startedAt, endedAt: 0 });
     $('#btnScanStart').disabled = true;
     $('#btnScanStop').disabled = false;
     clearInterval(ticker);
@@ -660,45 +696,41 @@
     paintStrip();
   }
 
-  async function start(over) {
+  async function start() {
     if (run) return;
-    const req = buildReq(over);
+    const req = buildReq();
     setError('');
+    const btn = $('#btnScanStart');
+    btn.disabled = true;   // main may ask DNS for an ECH config first
     let res;
     try { res = await window.api.scanStart(req); }
-    catch (e) { return setError((e && e.message) || String(e)); }
-    if (!res || res.error) return setError((res && res.error) || 'no server');
+    catch (e) { btn.disabled = false; setError((e && e.message) || String(e)); return; }
+    btn.disabled = false;
+    notes = notesOf(res);
+    paintNotes();
+    if (!res || res.error) { setError((res && res.error) || 'no server'); return; }
     lastReq = req;
     clearTable();
     beginRun(res.runId, { stage: 'filter', total: res.total || 0 });
-    count = {
-      kind: 'run', total: res.total || 0, engines: Math.max(1, (req.engines || []).length),
-      truncated: !!res.truncated, bad: (res.errors && res.errors.length) || 0,
-      exhausted: res.exhausted || 0
-    };
+    const bad = ((res.errors || []).length) + ((res.portErrors || []).length) + ((res.sniErrors || []).length);
+    count = { kind: 'run', targets: res.targets || 0, engines: (res.engines || []).length || 1, truncated: !!res.truncated, bad, exhausted: res.exhausted || 0 };
     paintCount();
   }
 
-  /**
-   * Phase 2 on rows the table already has. The row carries its TCP and its
-   * delay samples back to main so the re-measured row keeps the latency half
-   * of its score instead of being ranked on throughput alone.
-   */
+  /** Phase 2 on rows the table already has; their TCP and delay samples ride along so the score keeps its latency half. */
   async function retest(list) {
     if (run) return;
-    const rowsOut = (list || [])
-      .filter(r => r && r.ip && r.engine)
-      .map(r => ({ ip: r.ip, engine: r.engine, tcp: r.tcp, delay: r.delay }));
-    if (!rowsOut.length) return setError('no rows');
+    const rowsOut = (list || []).filter(r => r && (r.addr || r.ip) && r.engine)
+      .map(r => ({ key: r.key, addr: r.addr || r.ip, port: r.port, sni: r.sni, engine: r.engine, tcp: r.tcp, delay: r.delay }));
+    if (!rowsOut.length) { setError('no rows'); return; }
     const src = rowSource();
-    if (!src.serverId && !src.link) return setError('no server');
+    if (!src.serverId && !src.link) { setError('no server'); return; }
     setError('');
     let res;
     try { res = await window.api.scanRetest(Object.assign({ rows: rowsOut, tests: { down: true, up: testOn('up') }, opts: buildOpts() }, src)); }
-    catch (e) { return setError((e && e.message) || String(e)); }
-    if (!res || res.error) return setError((res && res.error) || 'no rows');
+    catch (e) { setError((e && e.message) || String(e)); return; }
+    if (!res || res.error) { setError((res && res.error) || 'no rows'); return; }
     const n = res.total || rowsOut.length;
-    // these rows passed the filter once already, so that bar starts full
     beginRun(res.runId, { stage: 'speed', total: n, done: n, alive: n, speedTotal: n });
     count = { kind: 'retest', n };
     paintCount();
@@ -718,11 +750,9 @@
     $('#btnScanStop').disabled = true;
     if (ev.error) toast(t('scan.failed') + ': ' + errText(ev.error), 'err');
     else toast(ev.cancelled ? t('scan.stoppedToast') : t('scan.doneToast'), 'ok');
-    // the run added what it tested to main's history
     window.api.scanPresets().then(p => paintTested(p && p.tested)).catch(() => {});
   }
 
-  /** Events of a run that is no longer the current one are somebody else’s. */
   function onProgress(ev) {
     if (!ev || !run || ev.runId !== run.runId) return;
     if (prog) {
@@ -740,35 +770,47 @@
 
   /* ----------------------------- row and toolbar actions ----------------------------- */
 
-  async function useIp(r) {
-    const req = Object.assign(rowSource(), { ip: r.ip, engine: r.engine });
-    if (!req.serverId && !req.link) return toast(t('scan.err.noServer'), 'err');
+  const targetOf = (r) => ({ addr: r.addr || r.ip, port: r.port, sni: r.sni });
+
+  async function copyLinks(list) {
+    const src = rowSource();
+    if (!src.serverId && !src.link) return toast(t('scan.err.noServer'), 'err');
     let res;
-    try { res = await window.api.scanApply(req); }
+    try { res = await window.api.scanLinks(Object.assign({ rows: list.map(targetOf) }, src)); }
+    catch (e) { return toast((e && e.message) || String(e), 'err'); }
+    const links = (res && res.links) || [];
+    if (!links.length) return toast(t('scan.noRows'), 'err');
+    await copyText(links.join('\n'));
+    return toast(links.length === 1 ? t('scan.linkCopied') : fill(t('scan.linksCopied'), { n: links.length }), 'ok');
+  }
+
+  async function saveRow(r) {
+    const src = rowSource();
+    if (!src.serverId && !src.link) return toast(t('scan.err.noServer'), 'err');
+    let res;
+    try { res = await window.api.scanApply(Object.assign(targetOf(r), { engine: r.engine }, src)); }
     catch (e) { return toast((e && e.message) || String(e), 'err'); }
     if (!res || res.error) return toast(errText(res && res.error), 'err');
-    state.servers.push(res);
-    renderServers();
-    renderPicker();
-    refreshSourcePicker();
-    toast(t('scan.applied'), 'ok');
+    if (Array.isArray(res.servers) && typeof setServers === 'function') setServers(res.servers);
+    return toast(t('scan.applied'), 'ok');
   }
 
-  function copyIp(ip) {
-    copyText(ip);
-    toast(t('scan.copied'), 'ok');
-  }
-
-  /** The best N rows the filter left alive, each back through phase 2 alone. */
-  function retestTop() {
-    const n = Math.max(1, Math.round(numOf('#scanRetopN', 10)));
-    const list = [...rows.values()]
-      .map(e => e.result)
-      .filter(r => (Number(r.score) || 0) > 0)
-      .sort((a, b) => (b.score - a.score))
-      .slice(0, n);
-    if (!list.length) return toast(t('scan.err.noRows'), 'err');
-    retest(list);
+  /**
+   * The best N live rows in the table's current order. For links each target
+   * counts once, by its best core's row (a target scanned on two cores is one
+   * link); a speed re-test takes every row, each core its own.
+   */
+  function topRows(perTarget = true) {
+    const n = Math.max(1, Math.round(numOf('#scanTopN', 10)));
+    const seen = new Set(), out = [];
+    for (const k of order) {
+      const r = rows.get(k).result;
+      if (!((Number(r.score) || 0) > 0) || (perTarget && seen.has(r.key))) continue;
+      seen.add(r.key);
+      out.push(r);
+      if (out.length >= n) break;
+    }
+    return out;
   }
 
   async function exportAs(format) {
@@ -780,61 +822,56 @@
     if (typeof text !== 'string') return toast(t('scan.failed'), 'err');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([text], { type: format === 'csv' ? 'text/csv' : 'application/json' }));
-    a.download = 'irnetfree-scan-' + new Date().toISOString().slice(0, 10) + '.' + format;
+    a.download = 'irnetfree-plus-scan-' + new Date().toISOString().slice(0, 10) + '.' + format;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-    toast(t('scan.exported'), 'ok');
+    return toast(t('scan.exported'), 'ok');
   }
 
   /* ----------------------------- wiring ----------------------------- */
 
   function wire() {
-    $('#scanSourceSeg').onclick = (e) => {
-      const btn = e.target.closest('.seg-btn');
-      if (btn) setMode(btn.dataset.src);
-    };
+    $('#scanSourceSeg').onclick = (e) => { const b = e.target.closest('.seg-btn'); if (b) setMode(b.dataset.src); };
+    let linkTimer = 0;
+    $('#scanLink').oninput = () => { clearTimeout(linkTimer); linkTimer = setTimeout(refreshFacts, 400); };
     $('#scanPreset').onclick = (e) => {
-      const btn = e.target.closest('.seg-btn');
-      if (btn) applyPreset(btn.dataset.preset);
+      const b = e.target.closest('.seg-btn');
+      const p = b && (presets.presets || {})[b.dataset.preset];
+      if (p) fillLimits(p);
     };
-    // the mark says which preset the numbers ARE, so it has to follow the typing
-    $$('.scan-limits input').forEach(el => { el.oninput = paintPreset; });
-    $('#scanBatch').oninput = paintPreset;
+    $$('.scan-limits input, #scanConc').forEach(el => { el.oninput = paintPreset; });
 
     $('#scanIps').oninput = updateCount;
-    $('#btnScanCf').onclick = () => { $('#scanIps').value = (presets.cfRanges || []).join('\n'); updateCount(); };
-    $('#scanPickSeg').onclick = (e) => {
-      const btn = e.target.closest('.seg-btn');
-      if (btn) setPick(btn.dataset.pick);
-    };
+    $('#scanPorts').oninput = updateCount;
+    $('#scanSnis').oninput = updateCount;
     $('#scanPerRange').oninput = updateCount;
+    $('#scanAddrPresets').onclick = (e) => { const b = e.target.closest('button[data-preset]'); if (b) applyAddrPreset(b.dataset.preset); };
+    $$('button[data-ports]').forEach(b => { b.onclick = () => applyPortsPreset(b.dataset.ports); });
+    $('#scanPickSeg').onclick = (e) => { const b = e.target.closest('.seg-btn'); if (b) setPick(b.dataset.pick); };
     $('#btnScanForget').onclick = async () => {
       let r;
-      try { r = await window.api.scanForget(); }
-      catch (e) { return toast((e && e.message) || String(e), 'err'); }
+      try { r = await window.api.scanForget(); } catch (e) { return toast((e && e.message) || String(e), 'err'); }
       paintTested(r && r.tested);
-      toast(t('scan.forgotToast'), 'ok');
+      return toast(t('scan.forgotToast'), 'ok');
     };
     $('#btnScanFile').onclick = () => $('#scanFile').click();
     $('#scanFile').onchange = async () => {
       const f = $('#scanFile').files[0];
       $('#scanFile').value = '';
       if (!f) return;
-      try { $('#scanIps').value = await f.text(); }
-      catch { return toast(t('scan.fileErr'), 'err'); }
+      try { $('#scanIps').value = await f.text(); } catch { toast(t('scan.fileErr'), 'err'); return; }
       updateCount();
     };
 
-    $('#btnScanStart').onclick = () => start(null);
+    $('#btnScanStart').onclick = start;
     $('#btnScanStop').onclick = () => { $('#btnScanStop').disabled = true; window.api.scanStop(); };
 
     $('#scanTable').onclick = (e) => {
       const th = e.target.closest('th[data-sort]');
       if (!th) return;
       const key = th.dataset.sort;
-      // a new column starts the way that column reads best: names up, numbers down
       if (sort.key === key) sort.dir = -sort.dir;
-      else sort = { key, dir: (key === 'ip' || key === 'engine') ? 1 : -1 };
+      else sort = { key, dir: (key === 'addr' || key === 'sni' || key === 'engine') ? 1 : -1 };
       resortAll();
     };
 
@@ -843,52 +880,56 @@
       if (!tr) return;
       const entry = rows.get(tr.dataset.key);
       if (!entry) return;
+      const r = entry.result;
       const btn = e.target.closest('button[data-act]');
       if (!btn) {
-        if (e.target.closest('.scan-c-ip')) copyIp(entry.result.ip);
+        if (e.target.closest('.scan-c-ip')) { copyText(addrPort(r.addr || r.ip, r.port)); toast(t('scan.copied'), 'ok'); }
         return;
       }
-      if (btn.dataset.act === 'copy') copyIp(entry.result.ip);
-      else if (btn.dataset.act === 'use') useIp(entry.result);
-      else if (btn.dataset.act === 'retest') retest([entry.result]);
+      if (btn.dataset.act === 'link') copyLinks([r]);
+      else if (btn.dataset.act === 'use') saveRow(r);
+      else if (btn.dataset.act === 'retest') retest([r]);
     };
 
-    $('#btnScanRetop').onclick = retestTop;
+    $('#btnScanCopyTop').onclick = () => { const list = topRows(); if (!list.length) toast(t('scan.noRows'), 'err'); else copyLinks(list); };
+    $('#btnScanRetop').onclick = () => { const list = topRows(false); if (!list.length) toast(t('scan.err.noRows'), 'err'); else retest(list); };
     $('#btnScanExportCsv').onclick = () => exportAs('csv');
     $('#btnScanExportJson').onclick = () => exportAs('json');
-    $('#btnScanClear').onclick = () => { clearTable(); updateCount(); setError(''); };
+    $('#btnScanClear').onclick = () => { clearTable(); updateCount(); setError(''); notes = []; paintNotes(); };
   }
 
-  /**
-   * applyI18n re-translates [data-i18n] nodes; the strip, the count line, the
-   * engine names and the row titles are written by this file and are out of its
-   * reach, so redraw them when the document’s language changes.
-   */
+  /** The strip, the count, the facts and the row titles are written here, so a language switch redraws them. */
   function redrawText() {
-    paintEngineLabels();
+    renderEngines(presets.engines || []);
     paintCount();
     paintStrip();
     paintSortMarks();
+    paintFacts();
+    paintNotes();
     for (const e of rows.values()) {
       e.tr.cells[0].title = t('scan.copy');
+      e.tr.querySelectorAll('[data-i18n-title]').forEach(b => { b.title = t(b.dataset.i18nTitle); });
       if (!e.result.error && Number(e.result.phase) === 1) e.tr.title = t('scan.phase1');
     }
   }
 
+  /** A core was downloaded or changed in Settings: the core list follows. */
+  async function enginesChanged() {
+    try { presets = Object.assign(presets, await window.api.scanPresets()); } catch { return; }
+    renderEngines(presets.engines || []);
+  }
+
   /**
-   * Two things start this tab: app.js's plusInit loop, and the safety net at
-   * the bottom of this file. Whichever gets here first does the whole setup;
-   * the other only rebuilds the picker, because the loop is the one that knows
-   * state.servers has been filled.
+   * Two things start this page: app.js's plusInit loop and the safety net at
+   * the bottom. Whichever comes first does the setup; the other only rebuilds
+   * the picker, because the loop is the one that knows state.servers is filled.
    */
   async function initScan() {
     if (started) return refreshSourcePicker();
     started = true;
-    try { presets = Object.assign(presets, await window.api.scanPresets()); }
-    catch (e) { console.error(e); }
+    try { presets = Object.assign(presets, await window.api.scanPresets()); } catch (e) { console.error(e); }
     renderEngines(presets.engines || []);
     renderTests();
-    // the balanced preset is what the tab opens on; the last run overrides it
     fillLimits(presets.defaults || {});
     restore(presets.last);
     paintTested(presets.tested);
@@ -896,26 +937,17 @@
     wire();
     paintSortMarks();
     paintStrip();
+    paintSniColumn();
     updateCount();
     window.api.onScanProgress(onProgress);
-    new MutationObserver(redrawText)
-      .observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] });
+    new MutationObserver(redrawText).observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] });
+    return undefined;
   }
 
-  // nothing calls this yet; it is here so a change to the server list can
-  // rebuild the picker without this file exporting anything else
   window.plusScanRefresh = refreshSourcePicker;
-
+  window.plusScanUse = useConfig;
+  window.plusEnginesChanged = enginesChanged;
   window.plusInit = window.plusInit || [];
   window.plusInit.push(initScan);
-
-  /*
-   * And a net under it. app.js runs the plusInit loop the moment `app:init`
-   * answers, and in the browser panel that answer regularly arrives BEFORE
-   * this file has finished downloading — the loop then walks an array nobody
-   * has pushed to and the tab comes up dead. Starting it here as well costs
-   * one timer; initScan is idempotent, so when the loop does win the race it
-   * only refreshes the picker with the server list it knows about.
-   */
   setTimeout(initScan, 0);
 })();
