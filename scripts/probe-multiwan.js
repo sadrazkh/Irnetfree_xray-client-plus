@@ -59,7 +59,7 @@
  * Runs only where it is meant to: Linux, root and IRNF_MW_PROBE=1 (CI).
  *   IRNF_XRAY_EXE    the core under test, client and server (default bin/xray)
  *   IRNF_HOP_EXE     the server's core (default: the core under test)
- *   IRNF_PROBE_PORT  base port, default 41200 (never the app's own)
+ *   IRNF_PROBE_PORT  base port, default 23200 (never the app's own)
  *   IRNF_MW_RATE     each link's rate each way, tc tbf (default 100mbit; 0 = none)
  */
 const { spawn, spawnSync } = require('child_process');
@@ -88,7 +88,7 @@ const UUID = '36f3635c-789c-484d-adae-2ea7a5ad3519';
 const XHTTP_SNI = 'mw.test';
 let CERT = null;
 let PIN = '';
-const BASE = Number(process.env.IRNF_PROBE_PORT || 41200);
+const BASE = Number(process.env.IRNF_PROBE_PORT || 23200);
 const P = { tcp: BASE + 1, xhttp: BASE + 2, web: BASE + 3, socks: BASE + 10, http: BASE + 11, api: BASE + 12 };
 /** The app's own ports (the owner's IRNetFree runs on them): never these. */
 const APP_PORTS = [10808, 10809, 10085, 30808, 30809, 30085];
