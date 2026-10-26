@@ -20,7 +20,7 @@
  *   IRNF_XRAY_EXE     the client core (default bin/xray)
  *   IRNF_HOP_EXE      the core the hop runs (default: the client core)
  *   IRNF_SINGBOX_EXE  the WireGuard peer (default bin/sing-box)
- *   IRNF_PROBE_PORT   base port, default 40100
+ *   IRNF_PROBE_PORT   base port, default 22100
  */
 const fs = require('fs');
 const os = require('os');
@@ -33,7 +33,7 @@ const { buildConfig } = require('../src/main/configBuilder');
 const { createServer } = require('../src/main/parser');
 const W = require('../src/main/warp');
 
-const BASE = Number(process.env.IRNF_PROBE_PORT || 40100);
+const BASE = Number(process.env.IRNF_PROBE_PORT || 22100);
 const P = { hop: BASE + 1, wg: BASE + 2, socks: BASE + 10, web: BASE + 21 };
 const UUID = '36f3635c-789c-484d-adae-2ea7a5ad3519';
 const TARGET = '203.0.113.10';
