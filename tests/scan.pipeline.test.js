@@ -96,7 +96,7 @@ test('a space is walked a chunk at a time: a hundred million items, only the wal
   });
   assert.equal(counted.size, 100663296);
   assert.equal(out.cancelled, true);
-  assert.ok(asked <= 128, 'never more than two chunks read: ' + asked);
+  assert.ok(asked <= 128 * 6, 'a few chunks of the pre-check’s width read ahead, never the space: ' + asked);
   assert.ok(seen.length >= 30);
 });
 

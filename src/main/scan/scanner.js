@@ -64,7 +64,7 @@ const { scoreResult, delayStats, passes, reasonOf, PASS_RATIO } = require('./sco
 const probesMod = require('./probes');
 
 const SCAN_DEFAULTS = {
-  batch: 20, filterConcurrency: 16, prefilterConcurrency: 64, coresInParallel: 2, delaySamples: 3, passRatio: PASS_RATIO,
+  batch: 20, filterConcurrency: 16, prefilterConcurrency: 128, coresInParallel: 2, delaySamples: 3, passRatio: PASS_RATIO,
   tcpTimeout: 2000, prefilterTls: false,
   delayHost: 'cp.cloudflare.com', delayPort: 80, delayPath: '/', delayTimeout: 4000, delayExpect: '204',
   speedTop: 10, speedConcurrency: 1, speedRounds: 1, warmupMs: 300,
@@ -407,19 +407,31 @@ function chunkOf(ctx, source, from, to) {
 
 /**
  * Phase 1 over the whole source, a chunk at a time: the chunk's pre-check,
- * then its batches per engine into the shared core limit. The next chunk is
- * read (and pre-checked) while the cores work, but never more than a few
- * batches ahead of them — what is held at once is bounded, whatever the size.
+ * then its batches per engine into the shared core limit. Up to PRE_AHEAD
+ * chunks are pre-checked at once — one chunk waits for its slowest connect
+ * (a dead address costs the whole TCP timeout), and the next ones fill the
+ * pre-check limit meanwhile — but their batches go to the cores in the order
+ * of the source, and never more than a few batches ahead of the cores: what
+ * is held at once is bounded, whatever the size.
  */
+const PRE_AHEAD = 4;
 async function filterPhase(ctx, source, engines) {
   const enginesOf = (it) => (Array.isArray(it.engines) ? engines.filter((e) => it.engines.includes(e)) : engines);
-  const chunkSize = Math.max(64, ctx.batchSize * ctx.coresInParallel * 2);
+  const chunkSize = Math.max(64, ctx.batchSize * ctx.coresInParallel * 2, posInt(ctx.o.prefilterConcurrency, 64));
   const pending = new Set();
   const ahead = ctx.coresInParallel * 3;
-  for (let i = 0; i < source.size; i += chunkSize) {
+  const checks = [];
+  let next = 0;
+  const readAhead = () => {
+    while (checks.length < (prechecks(ctx) ? PRE_AHEAD : 1) && next < source.size && !ctx.token.cancelled) {
+      const items = chunkOf(ctx, source, next, Math.min(source.size, next + chunkSize));
+      next += chunkSize;
+      checks.push(prechecks(ctx) ? precheck(ctx, items, enginesOf) : Promise.resolve(items));
+    }
+  };
+  for (readAhead(); checks.length; readAhead()) {
     if (ctx.token.cancelled) break;
-    let items = chunkOf(ctx, source, i, Math.min(source.size, i + chunkSize));
-    if (prechecks(ctx)) items = await precheck(ctx, items, enginesOf);
+    const items = await checks.shift();
     if (ctx.token.cancelled) break;
     for (const engine of engines) {
       const mine = items.filter((it) => enginesOf(it).includes(engine));
@@ -431,6 +443,7 @@ async function filterPhase(ctx, source, engines) {
     }
     while (pending.size > ahead) await Promise.race(pending);
   }
+  await Promise.all(checks);     // a stop: the pre-checks in flight end on their own (they read the token), then the run does
   await Promise.all(pending);
 }
 
