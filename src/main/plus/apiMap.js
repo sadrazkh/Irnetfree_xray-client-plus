@@ -51,10 +51,13 @@ const INVOKE = {
   scanRetest: ['scan:retest', 'one'],
   scanPresets: ['scan:presets', 'none'],
   scanSuggest: ['scan:suggest', 'one'],
+  scanPlan: ['scan:plan', 'one'],
   scanApply: ['scan:apply', 'one'],
   scanLinks: ['scan:links', 'one'],
+  scanCopy: ['scan:copy', 'one'],
   scanExport: ['scan:export', 'one'],
-  scanForget: ['scan:forget', 'none']
+  scanForget: ['scan:forget', 'none'],
+  scanSets: ['scan:sets', 'one']
 };
 
 const EVENTS = {
