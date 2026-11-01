@@ -13,9 +13,12 @@
    dimmed cells of a row that has only been filtered.
    ========================================================================= */
 
+/* two columns at most (the config and the how; the wide "what to test" card
+   spans both under them), one below 2 × 280px — a track no card sits in would
+   stay empty beside them, because the wide card spans every track */
 .scan-forms {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(max(280px, calc((100% - 16px) / 2)), 1fr));
   gap: 16px;
   align-items: start;
 }
@@ -372,4 +375,205 @@
 @media (max-width: 900px) {
   .scan-elapsed { margin-inline-start: 0; }
   .scan-bar-label { min-inline-size: 44px; }
+}
+
+/* =========================================================================
+   2026-11-01: the input rows, the parameter matrix and the live summary.
+
+   The summary sticks to the top of the page while it scrolls — what the run
+   will be stays in sight from the addresses down to the last parameter. The
+   "what to test" card spans the whole row under the config and the "how"
+   cards (order 1: the grid places it after both, whatever the markup order),
+   and each input in it is a row: a switch, its name and a one-line hint, the
+   config's own value at the far end, and under them the values — hidden while
+   the switch is off, because off means "the config's own value".
+   ========================================================================= */
+
+.scan-summary {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-block: 4px 14px;
+  padding: 9px 14px;
+  background: var(--panel);
+  border: 1px solid var(--softline);
+  border-inline-start: 3px solid var(--accent);
+  border-radius: var(--r4);
+}
+.scan-summary.warn { border-inline-start-color: var(--warn); }
+.scan-summary-text {
+  font-family: var(--ui);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.6;
+  unicode-bidi: plaintext;
+}
+.scan-summary-note {
+  font-size: 11px;
+  color: var(--warn);
+  line-height: 1.5;
+}
+.scan-summary-note:empty { display: none; }
+
+.scan-card-wide { grid-column: 1 / -1; order: 1; }
+
+.scan-inrow {
+  padding-block: 10px;
+  border-block-end: 1px solid var(--line);
+}
+.scan-inrow:last-of-type { border-block-end: 0; }
+.scan-inrow-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.scan-inrow-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  flex: 1 1 auto;
+  min-inline-size: 0;
+}
+.scan-inrow-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink);
+  cursor: default;
+}
+.scan-inrow-hint {
+  font-size: 11px;
+  color: var(--ink3);
+  line-height: 1.5;
+}
+.scan-inrow-own {
+  font-family: var(--ui);
+  font-size: 11px;
+  color: var(--ink3);
+  white-space: nowrap;
+  max-inline-size: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  unicode-bidi: plaintext;
+}
+.scan-inrow-body { margin-block-start: 10px; padding-inline-start: 48px; }
+.scan-inrow.off .scan-inrow-name { color: var(--ink2); }
+.scan-inrow.na .scan-inrow-name { color: var(--ink3); }
+.scan-inrow.na .scan-inrow-hint { color: var(--warn); }
+.scan-inrow-why {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--warn);
+  line-height: 1.5;
+}
+
+/* the parameter matrix: folded until wanted */
+.scan-params {
+  margin-block-start: 6px;
+  border-block-start: 1px solid var(--line);
+  padding-block-start: 10px;
+}
+.scan-params > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink2);
+}
+.scan-params > summary:hover { color: var(--ink); }
+.scan-params-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.scan-params-intro { margin-block: 8px 2px; }
+.scan-dims { display: flex; flex-direction: column; }
+
+/* chips: a value chosen (filled), a preset one tap away (+, ghost), a value main could not read (red edge) */
+.scan-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.scan-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-inline-size: 100%;
+  padding: 4px 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  background: var(--soft);
+  border: 1px solid var(--softline);
+  border-radius: var(--r4);
+  cursor: pointer;
+  direction: ltr;
+  transition: border-color 140ms ease-out, background 140ms ease-out;
+}
+.scan-chip:hover { border-color: var(--dim); }
+.scan-chip.on {
+  color: var(--onAccent);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.scan-chip.preset { color: var(--ink3); background: none; border-style: dashed; }
+.scan-chip.bad { border-color: var(--danger); }
+.scan-chip-x { font-size: 13px; line-height: 1; opacity: .8; }
+.scan-chip-input {
+  inline-size: 170px;
+  min-inline-size: 0;
+  flex: 0 1 170px;
+  padding-block: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.scan-chips-empty { font-size: 11px; color: var(--warn); }
+
+.scan-limit-row, .scan-sets { align-items: center; flex-wrap: wrap; margin-block-start: 12px; }
+.scan-limit-hint { font-size: 11px; color: var(--ink3); line-height: 1.5; flex: 1 1 240px; }
+.scan-set-pick { inline-size: auto; min-inline-size: 140px; flex: 0 1 200px; }
+.scan-set-name { flex: 0 1 180px; min-inline-size: 0; }
+.scan-limits-check { display: flex; align-items: flex-end; }
+
+/* results: the parameters column, the per-variant summary, the failures by reason */
+.scan-no-var .scan-c-var { display: none; }
+.scan-c-var {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  white-space: nowrap;
+}
+.scan-score-val.reason {
+  font-family: var(--ui);
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--ink3);
+  white-space: nowrap;
+}
+.scan-vsum { margin-block-end: 14px; }
+.scan-vsum-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-block-end: 6px;
+}
+.scan-vsum-hint { font-size: 11px; color: var(--ink3); }
+.scan-vsum-table td { padding: 5px 8px; }
+.scan-fails { margin-block: 0 10px; color: var(--ink3); }
+
+/* the window's minimum: the rows' values start under the switch, not beside it */
+@media (max-width: 1100px) {
+  .scan-inrow-body { padding-inline-start: 0; }
+  .scan-inrow-own { max-inline-size: 30%; }
 }

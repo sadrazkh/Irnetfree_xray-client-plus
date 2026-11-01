@@ -114,3 +114,60 @@ test('the scripts load in the order the pages need: upstream i18n, the wrapper, 
   const order = [...HTML.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]);
   assert.deepEqual(order, ['theme-boot.js', 'vendor/qrcode.js', 'i18n.js', 'plus/i18n.js', 'plus/xserver.i18n.js', 'plus/scan.i18n.js', 'corePicker.js', 'app.js', 'plus/configs.js', 'plus/xserver.js', 'plus/scan.js']);
 });
+
+/* ----------------------------- the Scan page’s rows and parameters (2026-11-01) ----------------------------- */
+
+const SCAN_JS = read('plus/scan.js');
+
+test('the Scan page’s defaults: every input a row with a switch — the addresses on, the ports and SNIs off, the parameters folded', () => {
+  const box = (id) => (new RegExp(`<input[^>]*id="${id}"[^>]*>`).exec(HTML) || [''])[0];
+  assert.match(box('scanUseAddrs'), /type="checkbox"/);
+  assert.match(box('scanUseAddrs'), /\schecked/);
+  for (const id of ['scanUsePorts', 'scanUseSnis']) {
+    assert.match(box(id), /type="checkbox"/);
+    assert.doesNotMatch(box(id), /\schecked/, id + ' starts off: the config’s own value');
+  }
+  assert.match(HTML, /<div class="scan-inrow-body" id="scanPortsBody" hidden>/);
+  assert.match(HTML, /<div class="scan-inrow-body" id="scanSnisBody" hidden>/);
+  const params = (/<details class="scan-params" id="scanParams"[^>]*>/.exec(HTML) || [''])[0];
+  assert.ok(params, 'the parameters section is a <details>');
+  assert.doesNotMatch(params, /\sopen/, 'folded by default');
+  // the three address picks and the summary line above the forms
+  assert.deepEqual([...HTML.matchAll(/data-pick="(\w+)"/g)].map((m) => m[1]), ['all', 'sample', 'random']);
+  assert.ok(HTML.indexOf('id="scanSummary"') < HTML.indexOf('class="scan-forms"'), 'the summary sits above the forms');
+  assert.match(read('plus/scan.css'), /\.scan-summary \{[^}]*position: sticky/);
+});
+
+test('the keys the Scan page builds — each dimension’s name, hint and plural, each failure reason — say something in fa and in en', () => {
+  const V = require('../src/main/scan/variants');
+  const { REASONS } = require('../src/main/scan/probes');
+  const keys = [];
+  for (const id of V.DIM_IDS) keys.push(`scan.dim.${id}`, `scan.dim.${id}.hint`, `scan.dim.${id}.many`);
+  for (const r of REASONS) keys.push(`scan.reason.${r}`);
+  for (const k of ['scan.err.singbox', 'scan.err.tooMany', 'scan.err.noVariant', 'scan.pick.sample', 'scan.pickN', 'scan.perRange']) keys.push(k);
+  const missing = [];
+  for (const k of keys) for (const lang of ['fa', 'en']) if (!has(lang, k)) missing.push(`${lang}:${k}`);
+  assert.deepEqual(missing, []);
+  // and the page's own maps name exactly main's dimensions and reasons
+  for (const id of V.DIM_IDS) assert.ok(SCAN_JS.includes(`${/^[a-z]+$/i.test(id) ? id : `'${id}'`}: ['scan.dim.${id}', 'scan.dim.${id}.hint', 'scan.dim.${id}.many']`), 'DIM_KEYS: ' + id);
+  for (const r of REASONS) assert.ok(SCAN_JS.includes(`'scan.reason.${r}'`), 'REASON_KEYS: ' + r);
+  // main's refusal codes the page turns into sentences
+  for (const code of ['singbox only', 'too many variants', 'no variant runs']) assert.ok(SCAN_JS.includes(`'${code}': 'scan.err.`), code);
+});
+
+test('the Scan page’s scripts parse, and no Persian string carries a straight apostrophe', () => {
+  const vm = require('node:vm');
+  for (const f of ['plus/scan.js', 'plus/scan.i18n.js']) assert.doesNotThrow(() => new vm.Script(read(f), { filename: f }), f);
+  for (const [k, v] of read('plus/scan.i18n.js').matchAll(/'([A-Za-z0-9_.-]+)':\s*'([^'\n]*)'/g)) assert.ok(!/[؀-ۿ]'/.test(v), k);
+});
+
+test('the request the page sends reads as main sanitizes it: the variants, the pick with its count, the accuracy options', () => {
+  // the names buildReq/buildOpts write, as main's sanitizers read them
+  for (const name of ['variants: buildSpec()', 'count: pickCount()', 'o.passRatio', 'o.delayExpect', 'o.prefilterTls', "'prefilterConcurrency'"]) assert.ok(SCAN_JS.includes(name), name);
+  const { sanitizeOpts, sanitizePick } = require('../src/main/scan/index');
+  const o = sanitizeOpts({ passRatio: 1, delayExpect: '200-299', prefilterTls: true, prefilterConcurrency: 300 });
+  assert.deepEqual([o.passRatio, o.delayExpect, o.prefilterTls, o.prefilterConcurrency], [1, '200-299', true, 300]);
+  assert.equal(sanitizeOpts({ delayExpect: 'nonsense' }).delayExpect, '204', 'an expectation that does not read falls back to the default page’s');
+  assert.equal(sanitizeOpts({ delayHost: 'example.org' }).delayExpect, '', 'another page: any 2xx/3xx');
+  assert.deepEqual(sanitizePick({ mode: 'sample', count: 500 }), { mode: 'sample', perRange: 20, count: 500, fresh: true });
+});
