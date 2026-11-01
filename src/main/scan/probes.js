@@ -18,10 +18,10 @@
  */
 const net = require('net');
 const tls = require('tls');
-const { socks5Connect, httpThroughProxy } = require('../netutils');
-const { delayStats } = require('./score');
+const { socks5Connect } = require('../netutils');
+const { delayStats, needOf } = require('./score');
 
-const DELAY_DEFAULTS = { n: 3, host: 'cp.cloudflare.com', port: 80, path: '/', timeout: 8000 };
+const DELAY_DEFAULTS = { n: 3, host: 'cp.cloudflare.com', port: 80, path: '/', timeout: 8000, expect: '204', passRatio: 0.66 };
 const DOWN_DEFAULTS = { host: 'speed.cloudflare.com', port: 443, path: '/__down?bytes=10000000', tls: true, bytes: 10e6, maxMs: 6000, timeout: 8000, warmupMs: 300, rejectUnauthorized: true };
 const UP_DEFAULTS = { host: 'speed.cloudflare.com', port: 443, path: '/__up', tls: true, bytes: 2e6, timeout: 20000, rejectUnauthorized: true };
 const UA = 'IRNetFree-scan';
@@ -199,21 +199,166 @@ function uploadThroughProxy(socksPort, opts = {}) {
   });
 }
 
+/* --------------------------- what a pass means (2026-11-01) --------------------------- */
+
+/*
+ * The owner: "a result must mean what it says — fewer false positives and
+ * negatives". What the code did before, and why it was not enough:
+ *  - the delay probe was upstream's httpThroughProxy, which counts ANY status
+ *    below 500 as an answer — a 403 or 404 page some box in the path wrote
+ *    passed as a working tunnel. The probe below takes the status the probe
+ *    page is known to give (cp.cloudflare.com and the probe's own page: 204)
+ *    and calls anything else a wrong answer;
+ *  - a row with one answered sample out of two was alive (loss < 1) — one
+ *    lucky answer was a pass. score.js now asks for passRatio of the samples;
+ *  - the first failed sample ended the series, so one dropped packet on a
+ *    good target made it dead. Now a TIMEOUT — the failure a busy machine or a
+ *    slow moment makes — is tried again; a definitive no (the tunnel closed,
+ *    the proxy refused, a wrong answer) still ends it at once, and so does a
+ *    series that can no longer pass;
+ *  - a failure said only "timeout" or "closed"; every probe now says WHERE it
+ *    failed (`reason`), and the row shows it.
+ */
+
+/** The reasons a row can carry, in the order a target meets them. */
+const REASONS = ['no-tcp', 'tls', 'core', 'proxy-refused', 'proxy-closed', 'timeout', 'wrong-answer', 'unstable', 'download-failed'];
+/** A failure that is an answer: trying the same thing again would only cost the time. */
+const DEFINITIVE = new Set(['core', 'proxy-refused', 'proxy-closed', 'wrong-answer']);
+
 /**
- * delaySeries(socksPort, { n, host, port, path, timeout }) → delayStats
- * `n` GETs in a row through the tunnel. A first request that fails ends the
- * series with the rest counted as lost: a dead IP costs one timeout, not n.
+ * readExpect('204' | '200-299' | '200,204' | '2xx' | '') → (status) → boolean, or null when it does not read.
+ * Empty is 200–399: a page that answers at all, as long as it is not an error.
+ */
+function readExpect(text) {
+  const s = String(text == null ? '' : text).trim().toLowerCase();
+  if (!s) return (c) => c >= 200 && c < 400;
+  const parts = s.split(/[\s,]+/).filter(Boolean);
+  const tests = [];
+  for (const p of parts) {
+    let m;
+    if ((m = /^([1-5])xx$/.exec(p))) { const h = Number(m[1]) * 100; tests.push((c) => c >= h && c < h + 100); continue; }
+    if ((m = /^(\d{3})(?:-(\d{3}))?$/.exec(p))) {
+      const a = Number(m[1]), b = m[2] ? Number(m[2]) : a;
+      if (a < 100 || b > 599 || b < a) return null;
+      tests.push((c) => c >= a && c <= b);
+      continue;
+    }
+    return null;
+  }
+  return (c) => tests.some((t) => t(c));
+}
+
+/** A socks5Connect failure, by where it happened. */
+function socksReason(e) {
+  const m = String((e && (e.code || e.message)) || e || '');
+  if (/ECONNREFUSED|ECONNRESET.*127\.0\.0\.1/i.test(m)) return 'core';
+  if (/timeout/i.test(m)) return 'timeout';
+  if (/connect failed code/i.test(m)) return 'proxy-refused';
+  return 'proxy-closed';
+}
+
+/**
+ * tunnelGet(socksPort, { host, port, path, timeout, expect }) → { ok, ms, status, reason, error }
+ *
+ * One GET through the core: SOCKS5 CONNECT, the request, the status line —
+ * timed from before the CONNECT (what a user's first request waits). `ok`
+ * only when the status is one `expect` accepts (readExpect). `reason`:
+ * 'core' (nothing listens on the SOCKS port), 'proxy-refused' (the core
+ * refused the CONNECT), 'proxy-closed' (the tunnel closed before an answer:
+ * the server refused the handshake or could not be reached), 'timeout',
+ * 'wrong-answer' (`status` says which).
+ */
+function tunnelGet(socksPort, opts = {}) {
+  const o = Object.assign({}, DELAY_DEFAULTS, opts);
+  const accept = typeof o.expect === 'function' ? o.expect : (readExpect(o.expect) || readExpect(''));
+  const start = Date.now();
+  const bad = (reason, error, extra) => Object.assign({ ok: false, ms: -1, status: 0, reason, error: error || reason }, extra);
+  return socks5Connect('127.0.0.1', socksPort, o.host, o.port, o.timeout).then((socket) => new Promise((resolve) => {
+    let done = false, buf = '';
+    const finish = (r) => { if (done) return; done = true; clearTimeout(to); try { socket.destroy(); } catch { /* gone */ } resolve(r); };
+    const left = Math.max(1, o.timeout - (Date.now() - start));
+    const to = setTimeout(() => finish(bad('timeout')), left);
+    socket.on('data', (d) => {
+      buf += d.toString('latin1');
+      const nl = buf.indexOf('\r\n');
+      if (nl === -1) { if (buf.length > 8192) finish(bad('wrong-answer', 'no status line')); return; }
+      const status = statusOf(buf.slice(0, nl));
+      if (!status) return finish(bad('wrong-answer', 'not HTTP'));
+      if (!accept(status)) return finish(bad('wrong-answer', 'HTTP ' + status, { status }));
+      return finish({ ok: true, ms: Date.now() - start, status, reason: '', error: null });
+    });
+    socket.on('error', (e) => finish(bad('proxy-closed', errName(e))));
+    socket.on('close', () => finish(bad('proxy-closed', 'closed')));
+    socket.write(`GET ${o.path} HTTP/1.1\r\nHost: ${o.host}\r\nUser-Agent: ${UA}\r\nAccept: */*\r\nConnection: close\r\n\r\n`);
+  }), (e) => bad(socksReason(e), errName(e)));
+}
+
+/**
+ * delaySeries(socksPort, { n, host, port, path, timeout, expect, passRatio }) → delayStats + { reason, status }
+ *
+ * `n` GETs in a row through the tunnel (tunnelGet). A definitive failure
+ * before any success ends the series — a dead target costs one try, not n —
+ * and so does a series that can no longer reach passRatio; a timeout is
+ * tried again. Every sample not taken counts as lost. `reason` is the first
+ * failure's ('' when none), `status` a wrong answer's.
  */
 async function delaySeries(socksPort, opts = {}) {
   const o = Object.assign({}, DELAY_DEFAULTS, opts);
   const n = Math.max(1, Math.floor(Number(o.n) || DELAY_DEFAULTS.n));
+  const need = needOf(n, o.passRatio);
+  const get = typeof o.get === 'function' ? o.get : tunnelGet;
   const samples = [];
+  let reason = '', status = 0, okCount = 0, failed = 0;
   for (let i = 0; i < n; i++) {
-    const r = await httpThroughProxy(socksPort, { host: o.host, port: o.port, path: o.path, timeout: o.timeout });
+    const r = await get(socksPort, { host: o.host, port: o.port, path: o.path, timeout: o.timeout, expect: o.expect });
     samples.push(r.ok ? r.ms : -1);
-    if (i === 0 && !r.ok) { while (samples.length < n) samples.push(-1); break; }
+    if (r.ok) { okCount++; continue; }
+    failed++;
+    if (!reason) { reason = r.reason || 'timeout'; status = r.status || 0; }
+    const hopeless = n - failed < need;
+    if (hopeless || (okCount === 0 && DEFINITIVE.has(r.reason))) break;
   }
-  return delayStats(samples);
+  while (samples.length < n) samples.push(-1);
+  return Object.assign(delayStats(samples), { reason, status });
 }
 
-module.exports = { downloadThroughProxy, uploadThroughProxy, delaySeries, throughputMeter, DELAY_DEFAULTS, DOWN_DEFAULTS, UP_DEFAULTS };
+/**
+ * tlsPing(host, port, { servername, timeout }) → { ok, ms, reason, error }
+ *
+ * The pre-check's TLS step: a TCP connect and a TLS handshake under the SNI
+ * the config sends, nothing more (no certificate check — a pin or a fronted
+ * name is the core's business; the question is only "does this address finish
+ * a handshake for this name"). 'no-tcp' when the connect fails, 'tls' when the
+ * handshake does. `ms` is the handshake's end.
+ */
+function tlsPing(host, port, opts = {}) {
+  const timeout = Number(opts.timeout) || 3000;
+  const start = Date.now();
+  return new Promise((resolve) => {
+    let connected = false, done = false;
+    const sock = net.connect({ host, port });
+    let secure = null;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(to);
+      try { (secure || sock).destroy(); } catch { /* gone */ }
+      resolve(r);
+    };
+    const fail = (e) => finish({ ok: false, ms: -1, reason: connected ? 'tls' : 'no-tcp', error: errName(e) });
+    const to = setTimeout(() => fail(new Error('timeout')), timeout);
+    sock.once('error', fail);
+    sock.once('connect', () => {
+      connected = true;
+      const o = { socket: sock, rejectUnauthorized: false, ALPNProtocols: Array.isArray(opts.alpn) && opts.alpn.length ? opts.alpn : undefined };
+      if (opts.servername && net.isIP(opts.servername) === 0) o.servername = opts.servername;
+      secure = tls.connect(o, () => finish({ ok: true, ms: Date.now() - start, reason: '', error: null }));
+      secure.once('error', fail);
+    });
+  });
+}
+
+module.exports = {
+  downloadThroughProxy, uploadThroughProxy, delaySeries, tunnelGet, tlsPing, readExpect, needOf, throughputMeter,
+  REASONS, DELAY_DEFAULTS, DOWN_DEFAULTS, UP_DEFAULTS
+};

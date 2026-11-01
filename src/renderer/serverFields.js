@@ -25,6 +25,13 @@
  *            one is labelled `sfo.<id>._` — and with `optionLabels: 'all'`
  *            every one, `sfo.<id>.<value>`
  *   emptyAs  what an empty value is written as, instead of deleting the key
+ *   module   the extension it belongs to (src/renderer/modules.js): the editor
+ *            does not draw it while that one is not installed; its value is
+ *            read and written all the same
+ *   presets  [{ name, value }] — a small picker beside a free field: a pick
+ *            fills the field with `value` (the form's own text: JSON as one
+ *            line), which stays editable; the picker shows the preset the
+ *            field holds now (presetOf), none for a value of one's own
  *
  * Labels are `sf.<id>`, hints `sf.<id>.hint` (when `hint: true`), both
  * languages in i18n.js.
@@ -39,12 +46,26 @@
 }(typeof self !== 'undefined' ? self : this, function () {
 
   const STREAM = ['vless', 'vmess', 'trojan', 'shadowsocks'];
-  const PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2', 'masque', 'wireguard', 'socks', 'http'];
-  /** Every protocol that can speak TLS: Hysteria2 and MASQUE never speak anything else. */
+  const PROTOCOLS = ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2', 'tuic', 'anytls', 'masque', 'wireguard', 'socks', 'http'];
+  /** Every protocol that can speak TLS on an Xray core: Hysteria2 and MASQUE never speak anything else. */
   const TLS_ANY = STREAM.concat('hysteria2', 'masque');
+  /**
+   * TUIC (QUIC) and AnyTLS (TLS over TCP): sing-box's alone, always over TLS.
+   * They take the TLS basics sing-box has — SNI, ALPN, allow insecure, ECH, and
+   * the pins shown so they can be cleared (sing-box keeps none: a pinned one
+   * does not connect) — never the Xray-only TLS knobs (the ECH outbound, the
+   * TLS versions and curves, the system CA store).
+   */
+  const SINGBOX_ONLY = ['tuic', 'anytls'];
+  const TLS_BASICS = TLS_ANY.concat(SINGBOX_ONLY);
   /** The transports the editor offers, in the core's own names (`tcp` is RAW). */
   const NETWORKS = ['tcp', 'ws', 'grpc', 'httpupgrade', 'xhttp', 'kcp'];
-  const FINGERPRINTS = ['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'random', 'randomized', 'unsafe'];
+  /**
+   * uTLS fingerprints, as the cores name them. hellochrome_120 is one of the
+   * official core's ModernFingerprints (transport/internet/tls/tls.go, 26.10.31),
+   * so it runs on both Xray cores; PattNG lists it right after chrome.
+   */
+  const FINGERPRINTS = ['chrome', 'hellochrome_120', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'random', 'randomized', 'unsafe'];
   const SS_METHODS = ['2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
     'aes-128-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305', 'none'];
 
@@ -52,9 +73,11 @@
   function securitiesOf(protocol) {
     if (protocol === 'vless' || protocol === 'trojan') return ['none', 'tls', 'reality'];
     if (protocol === 'vmess' || protocol === 'shadowsocks') return ['none', 'tls'];
-    if (protocol === 'hysteria2' || protocol === 'masque') return ['tls'];
+    if (protocol === 'hysteria2' || protocol === 'masque' || SINGBOX_ONLY.includes(protocol)) return ['tls'];
     return [];
   }
+  /** A protocol only sing-box runs (TUIC, AnyTLS): no core to pick, never in a chain, a group or a rule. */
+  const singboxOnly = (protocol) => SINGBOX_ONLY.includes(protocol);
   const hasTransport = (protocol) => STREAM.includes(protocol);
 
   /**
@@ -74,6 +97,7 @@
   const SO = 'streamSettings.sockopt.';
   const U0 = 'settings.vnext.0.users.0.';
   const MQ = 'streamSettings.masqueSettings.';
+  const S0 = 'settings.servers.0.';
 
   const on = (protocols, networks, securities) => {
     const w = {};
@@ -84,6 +108,36 @@
   };
   const RANGE = 'range';
 
+  /**
+   * PattNG's presets (patterniha's own client), name for name and value for
+   * value, for the three patterniha fields. The finalmask ones are JSON as the
+   * field holds it (one line): two ClientHello splits of two fragment masks
+   * each — a "0" length, which the official 26.3.27 refused ("LengthMin can't
+   * be 0"; a config with a finalmask runs on Xray-PattN: xrayManager.usesFinalmask)
+   * — 24 noise packets before a UDP handshake, and
+   * the fork's `merge` TCP mask (Xray-PattN 26.10.27 and newer only:
+   * xrayManager.pattnOobNeeds). The cipherSuites ones are the names joined by
+   * ':' (an official-core TLS field too); dialMode's is PattNG's "oob".
+   */
+  const frag = (packets, lengths, delays, maxSplit) => ({ type: 'fragment', settings: { packets, lengths, delays, maxSplit } });
+  const tlshello = (a, b, c) => ({ tcp: [frag('tlshello', [a, b, c], ['0'], '0'), frag('1-1', ['114', '1'], ['1'], '11')] });
+  const FINALMASK_PRESETS = [
+    { name: 'tlshello-0-len (0-104-1-0-0-114-1-1-11)', value: JSON.stringify(tlshello('0', '104', '1')) },
+    { name: 'tlshello (6-98-1-0-0-114-1-1-11)', value: JSON.stringify(tlshello('6', '98', '1')) },
+    { name: 'udp-noise (rnd-24-1200-1230)', value: JSON.stringify({ udp: [{ type: 'noise', settings: { reset: '28', noise: Array.from({ length: 24 }, () => ({ rand: '1200-1230', delay: '10' })) } }] }) },
+    { name: 'merge', value: JSON.stringify({ tcp: [{ type: 'merge', settings: { times: 100, delayMs: 30, maxBytes: 16384 } }] }) }
+  ];
+  const CIPHER_PRESETS = [
+    { name: 'semi-python-cipherSuites', value: ['TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384', 'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384', 'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
+      'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256', 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256', 'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
+      'TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA', 'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA', 'TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256', 'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256'].join(':') },
+    { name: 'real-firefox-cipherSuites', value: ['TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256', 'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256', 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
+      'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256', 'TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384', 'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
+      'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA', 'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA', 'TLS_RSA_WITH_AES_128_GCM_SHA256', 'TLS_RSA_WITH_AES_256_GCM_SHA384',
+      'TLS_RSA_WITH_AES_128_CBC_SHA', 'TLS_RSA_WITH_AES_256_CBC_SHA'].join(':') }
+  ];
+  const DIAL_MODE_PRESETS = [{ name: 'oob', value: 'oob.0' }];
+
   const FIELDS = [
     /* -------------------------------- basics -------------------------------- */
     { id: 'protocol', tab: 'basics', kind: 'protocol', special: true, key: 'protocol' },
@@ -92,7 +146,7 @@
     { id: 'port', tab: 'basics', kind: 'number', special: true, key: 'port', simple: true },
 
     /* ------------------------------- protocol ------------------------------- */
-    { id: 'uuid', tab: 'protocol', kind: 'uuid', special: true, key: 'id', when: on(['vless', 'vmess']), simple: true, span: 2 },
+    { id: 'uuid', tab: 'protocol', kind: 'uuid', special: true, key: 'id', when: on(['vless', 'vmess', 'tuic']), simple: true, span: 2 },
     { id: 'flow', tab: 'protocol', kind: 'select', path: U0 + 'flow', key: 'flow', when: on(['vless']), simple: true,
       options: ['', 'xtls-rprx-vision', 'xtls-rprx-vision-udp443'], optionLabels: true, hint: true },
     { id: 'encryption', tab: 'protocol', kind: 'encryption', path: U0 + 'encryption', key: 'encryption', when: on(['vless']),
@@ -101,7 +155,7 @@
       simple: true, emptyAs: 'auto', options: ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none', 'zero'] },
     { id: 'alterId', tab: 'protocol', kind: 'number', path: U0 + 'alterId', key: 'alterId', when: on(['vmess']), simple: true, emptyAs: 0, hint: true },
     { id: 'username', tab: 'protocol', kind: 'text', special: true, key: 'user', when: on(['socks', 'http']), simple: true },
-    { id: 'password', tab: 'protocol', kind: 'text', special: true, key: 'password', when: on(['trojan', 'shadowsocks', 'hysteria2', 'socks', 'http']), simple: true, span: 2 },
+    { id: 'password', tab: 'protocol', kind: 'text', special: true, key: 'password', when: on(['trojan', 'shadowsocks', 'hysteria2', 'tuic', 'anytls', 'socks', 'http']), simple: true, span: 2 },
     { id: 'method', tab: 'protocol', kind: 'select', path: 'settings.servers.0.method', key: 'method', when: on(['shadowsocks']),
       simple: true, options: SS_METHODS },
     { id: 'uot', tab: 'protocol', kind: 'switch', path: 'settings.servers.0.uot', key: 'uot', when: on(['shadowsocks']), local: true },
@@ -112,6 +166,14 @@
     { id: 'hopInterval', tab: 'protocol', kind: RANGE, special: true, key: 'hopInterval', when: on(['hysteria2']), placeholder: '30' },
     { id: 'up', tab: 'protocol', kind: 'text', special: true, key: 'up', when: on(['hysteria2']), placeholder: '50 mbps' },
     { id: 'down', tab: 'protocol', kind: 'text', special: true, key: 'down', when: on(['hysteria2']), placeholder: '200 mbps' },
+    // TUIC's own knobs, in sing-box's names; empty = sing-box's default (cubic,
+    // native, its 10 s heartbeat) — the record keeps '' / false, never a missing key
+    { id: 'tuicCongestion', tab: 'protocol', kind: 'select', path: S0 + 'congestionControl', key: 'congestion_control', when: on(['tuic']), simple: true,
+      options: ['', 'bbr', 'cubic', 'new_reno'], optionLabels: true, emptyAs: '' },
+    { id: 'tuicUdpRelay', tab: 'protocol', kind: 'select', path: S0 + 'udpRelayMode', key: 'udp_relay_mode', when: on(['tuic']), simple: true,
+      options: ['', 'native', 'quic'], optionLabels: true, emptyAs: '', hint: true },
+    { id: 'tuicZeroRtt', tab: 'protocol', kind: 'switch', path: S0 + 'zeroRtt', key: 'zero_rtt_handshake', when: on(['tuic']), simple: true, hint: true },
+    { id: 'tuicHeartbeat', tab: 'protocol', kind: 'text', path: S0 + 'heartbeat', key: 'heartbeat', when: on(['tuic']), emptyAs: '', placeholder: '10s' },
     { id: 'privateKey', tab: 'protocol', kind: 'text', special: true, key: 'secretKey', when: on(['wireguard']), simple: true, span: 2 },
     { id: 'localAddress', tab: 'protocol', kind: 'list', special: true, key: 'address', when: on(['wireguard']), simple: true },
     { id: 'publicKey', tab: 'protocol', kind: 'text', special: true, key: 'publicKey', when: on(['wireguard']), simple: true },
@@ -181,18 +243,25 @@
 
     /* ------------------------------- security ------------------------------- */
     { id: 'security', tab: 'security', kind: 'security', special: true, key: 'security', when: on(STREAM), simple: true, span: 2 },
-    { id: 'sni', tab: 'security', kind: 'text', special: true, key: 'serverName', when: on(TLS_ANY, null, ['tls', 'reality']), simple: true },
-    // MASQUE uses it over HTTP/2 only (uTLS); HTTP/3 is Go's own TLS
-    { id: 'fp', tab: 'security', kind: 'select', special: true, key: 'fingerprint', when: on(STREAM.concat('masque'), null, ['tls', 'reality']), simple: true, options: FINGERPRINTS },
-    { id: 'alpn', tab: 'security', kind: 'chips', special: true, key: 'alpn', when: on(STREAM.concat('hysteria2'), null, ['tls']), options: ['h3', 'h2', 'http/1.1'], span: 2, hint: true },
-    { id: 'pcs', tab: 'security', group: 'certificate', kind: 'text', special: true, key: 'pinnedPeerCertSha256', when: on(TLS_ANY, null, ['tls']), simple: true, placeholder: 'e3b0c442…, …' },
-    { id: 'vcn', tab: 'security', group: 'certificate', kind: 'text', special: true, key: 'verifyPeerCertByName', when: on(TLS_ANY, null, ['tls']), simple: true, placeholder: 'real.example.com' },
-    // never MASQUE's: the core refuses allowInsecure there outright (a pin is the way)
-    { id: 'allowInsecure', tab: 'security', group: 'certificate', kind: 'switch', special: true, key: 'allowInsecure', when: on(STREAM.concat('hysteria2'), null, ['tls']), simple: true, span: 2, hint: true },
+    { id: 'sni', tab: 'security', kind: 'text', special: true, key: 'serverName', when: on(TLS_BASICS, null, ['tls', 'reality']), simple: true },
+    // TUIC only: no SNI in its ClientHello at all (sing-box's disable_sni)
+    { id: 'tuicDisableSni', tab: 'security', kind: 'switch', path: TL + 'disableSni', key: 'disable_sni', when: on(['tuic']) },
+    // MASQUE uses it over HTTP/2 only (uTLS); HTTP/3 is Go's own TLS — and so is TUIC's QUIC
+    { id: 'fp', tab: 'security', kind: 'select', special: true, key: 'fingerprint', when: on(STREAM.concat('masque', 'anytls'), null, ['tls', 'reality']), simple: true, options: FINGERPRINTS },
+    { id: 'alpn', tab: 'security', kind: 'chips', special: true, key: 'alpn', when: on(STREAM.concat('hysteria2', SINGBOX_ONLY), null, ['tls']), options: ['h3', 'h2', 'http/1.1'], span: 2, hint: true },
+    { id: 'pcs', tab: 'security', group: 'certificate', kind: 'text', special: true, key: 'pinnedPeerCertSha256', when: on(TLS_BASICS, null, ['tls']), simple: true, placeholder: 'e3b0c442…, …' },
+    { id: 'vcn', tab: 'security', group: 'certificate', kind: 'text', special: true, key: 'verifyPeerCertByName', when: on(TLS_BASICS, null, ['tls']), simple: true, placeholder: 'real.example.com' },
+    // never MASQUE's: the core refuses allowInsecure there outright (a pin is the way);
+    // TUIC's and AnyTLS's is sing-box's `insecure` — no pin is learnt for them
+    { id: 'allowInsecure', tab: 'security', group: 'certificate', kind: 'switch', special: true, key: 'allowInsecure', when: on(STREAM.concat('hysteria2', SINGBOX_ONLY), null, ['tls']), simple: true, span: 2, hint: true },
     // the OS's CA store beside the core's own Mozilla roots (Xray 26.10.10+): a server with a private CA
     { id: 'useSystemCA', tab: 'security', group: 'certificate', kind: 'switch', path: TL + 'useSystemCA', key: 'useSystemCA', when: on(TLS_ANY, null, ['tls']), local: true, span: 2, hint: true },
-    { id: 'ech', tab: 'security', group: 'ech', kind: 'text', special: true, key: 'echConfigList', when: on(TLS_ANY, null, ['tls']), simple: true, span: 2, hint: true,
+    { id: 'ech', tab: 'security', group: 'ech', kind: 'text', special: true, key: 'echConfigList', when: on(TLS_BASICS, null, ['tls']), simple: true, span: 2, hint: true,
       placeholder: 'cloudflare-ech.com+udp://1.1.1.1' },
+    // PattN's: the outbound the core dials the ECH query through (configBuilder.applyEchOutbounds);
+    // its Example button writes echOutboundExample's pair
+    { id: 'echOutbound', tab: 'security', group: 'ech', kind: 'json', special: true, key: 'echOutbound', module: 'echOutbound', when: on(TLS_ANY, null, ['tls']), span: 2, hint: true,
+      placeholder: '{"protocol":"direct","settings":{"redirect":"1.1.1.1:443"},"streamSettings":{"security":"tls","tlsSettings":{…}}}' },
     { id: 'echForceQuery', tab: 'security', group: 'ech', kind: 'select', path: TL + 'echForceQuery', key: 'echForceQuery', when: on(TLS_ANY, null, ['tls']), local: true,
       options: ['', 'none', 'half', 'full'], optionLabels: true },
     { id: 'minVersion', tab: 'security', group: 'ech', kind: 'select', path: TL + 'minVersion', key: 'minVersion', when: on(TLS_ANY, null, ['tls']), local: true,
@@ -207,7 +276,8 @@
     { id: 'pqv', tab: 'security', kind: 'text', special: true, key: 'mldsa65Verify · pqv', when: on(STREAM, null, ['reality']), simple: true, span: 2 },
 
     /* ------------------------------- advanced ------------------------------- */
-    // (MASQUE runs on an Xray core only: the parser never stores sing-box for it, engineChoice never picks it)
+    // (MASQUE runs on an Xray core only: the parser never stores sing-box for it, engineChoice never picks it;
+    // TUIC and AnyTLS on sing-box only — the parser stores no engine for them, the editor shows sing-box alone)
     { id: 'engine', tab: 'advanced', kind: 'select', special: true, key: 'engine', simple: true, options: ['xray', 'xray-pattn', 'sing-box'], optionLabels: 'all', hint: true },
     { id: 'remoteDNS', tab: 'advanced', kind: 'list', path: 'settings.remoteDNS', key: 'remoteDNS', when: on(['masque']), local: true, span: 2, hint: true,
       placeholder: '1.1.1.1, 1.0.0.1' },
@@ -224,13 +294,18 @@
     // MASQUE: a fragment only over HTTP/2 (TCP), noise only over HTTP/3 (UDP) —
     // the `when` cannot say an HTTP version, so the parser drops the other one
     // and configBuilder.applyFragments never dials it
-    { id: 'fragment', tab: 'advanced', group: 'dpi', kind: 'text', special: true, key: 'fragment', simple: true, placeholder: 'tlshello,100-200,10-20', hint: true },
-    { id: 'noise', tab: 'advanced', group: 'dpi', kind: 'text', special: true, key: 'noise', simple: true, placeholder: 'rand:50-100:0;base64:FgMBAAA=:10-20', hint: true },
-    { id: 'cipherSuites', tab: 'advanced', group: 'pattn', kind: 'text', special: true, key: 'cipherSuites · cs', when: on(STREAM), simple: true, span: 2,
-      placeholder: 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256' },
+    { id: 'fragment', tab: 'advanced', group: 'dpi', kind: 'text', special: true, key: 'fragment', module: 'antiDpi', simple: true, placeholder: 'tlshello,100-200,10-20', hint: true },
+    { id: 'noise', tab: 'advanced', group: 'dpi', kind: 'text', special: true, key: 'noise', module: 'antiDpi', simple: true, placeholder: 'rand:50-100:0;base64:FgMBAAA=:10-20', hint: true },
+    { id: 'cipherSuites', tab: 'advanced', group: 'pattn', kind: 'text', special: true, key: 'cipherSuites · cs', module: 'antiDpi', when: on(STREAM), simple: true, span: 2,
+      placeholder: 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256', presets: CIPHER_PRESETS },
     // MASQUE's is the official core's own: UDP masks and quicParams over HTTP/3, TCP masks over HTTP/2
-    { id: 'finalMask', tab: 'advanced', group: 'pattn', kind: 'json', special: true, key: 'finalmask · fm', when: on(STREAM.concat('masque')), simple: true, span: 2, hint: true,
-      placeholder: '{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["3-5"],"delays":["10-20"]}}]}' }
+    { id: 'finalMask', tab: 'advanced', group: 'pattn', kind: 'json', special: true, key: 'finalmask · fm', module: 'antiDpi', when: on(STREAM.concat('masque')), simple: true, span: 2, hint: true,
+      placeholder: '{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["3-5"],"delays":["10-20"]}}]}', presets: FINALMASK_PRESETS },
+    // Xray-PattN's (26.10.27+, transport/internet/dialmode_oob.go): each byte sent as urgent (OOB) data
+    // with one of the first TCP writes; the official core has no such key and ignores it, an older
+    // PattN refuses it at dial time — a server with one runs on PattN (xrayManager, EngineChoice.kt)
+    { id: 'dialMode', tab: 'advanced', group: 'pattn', kind: 'text', path: SO + 'dialMode', key: 'dialMode', module: 'antiDpi', when: on(STREAM), local: true, hint: true,
+      placeholder: 'oob.0', presets: DIAL_MODE_PRESETS }
   ];
 
   const TABS = ['basics', 'protocol', 'transport', 'security', 'advanced'];
@@ -256,7 +331,7 @@
     if (w.protocols && !w.protocols.includes(c.protocol)) return false;
     if (w.networks && !(hasTransport(c.protocol) && w.networks.includes(c.network))) return false;
     if (w.securities) {
-      const sec = c.protocol === 'hysteria2' || c.protocol === 'masque' ? 'tls' : c.security;
+      const sec = c.protocol === 'hysteria2' || c.protocol === 'masque' || singboxOnly(c.protocol) ? 'tls' : c.security;
       if (!w.securities.includes(sec)) return false;
     }
     return true;
@@ -352,7 +427,52 @@
       try { if (!isPlain(JSON.parse(s))) return 'edit.err.json'; } catch { return 'edit.err.json'; }
     }
     if (field.kind === 'encryption') { const r = readEncryption(s); if (r && r.bad) return r.bad; }
+    if (field.id === 'dialMode') { const r = readDialMode(s); if (r && r.bad) return r.bad; }
     return null;
+  }
+
+  /**
+   * Xray-PattN's dialMode read back: `oob.<byte>[,<byte>…]`, each byte 0–255
+   * sent as urgent (out-of-band) data with one of the first TCP writes ("oob.0"
+   * one 0x00 with the first, "oob.0,32,65" the first three). The core takes
+   * nothing else — any other value fails every dial ("unsupported dialMode") —
+   * so the editor refuses it. { bytes } or { bad }; null when empty.
+   */
+  function readDialMode(v) {
+    const s = String(v == null ? '' : v).trim();
+    if (!s) return null;
+    if (!/^oob\.\d{1,3}(,\d{1,3})*$/.test(s)) return { bad: 'edit.err.dialMode' };
+    const bytes = s.slice(4).split(',').map(Number);
+    return bytes.every((b) => b <= 255) ? { bytes } : { bad: 'edit.err.dialMode' };
+  }
+
+  /** A JSON value with every object's keys in order: the same mask written in another key order is the same mask. */
+  function canonical(v) {
+    if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+    if (isPlain(v)) return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+    return JSON.stringify(v);
+  }
+
+  /**
+   * What a preset is compared by: a JSON field's canonical JSON (null when the
+   * text is no JSON at all), cipherSuites' names in their order (spaces around
+   * a ':' and an empty name are nothing), any other field's text.
+   */
+  function presetKey(field, v) {
+    const s = typeof v === 'string' ? v.trim() : (v == null ? '' : (typeof v === 'object' ? JSON.stringify(v) : String(v)));
+    if (!s) return null;
+    if (field.kind === 'json') { try { return canonical(JSON.parse(s)); } catch { return null; } }
+    if (field.id === 'cipherSuites') return s.split(':').map((x) => x.trim()).filter(Boolean).join(':');
+    return s;
+  }
+
+  /** The name of the field's preset its value equals ('' for none, or a value of one's own). */
+  function presetOf(field, v) {
+    const list = (field && field.presets) || [];
+    const key = list.length ? presetKey(field, v) : null;
+    if (key == null) return '';
+    const hit = list.find((p) => presetKey(field, p.value) === key);
+    return hit ? hit.name : '';
   }
 
   /**
@@ -468,9 +588,36 @@
     }
   }
 
+  /**
+   * The ECH outbound patterniha published on 2026-10-20 (PattN P34 / PattNG
+   * P67): the plain-DNS answer no longer carries the key and DoH to 1.1.1.1 is
+   * reset on its SNI, so the query is sent h2c to 1.1.1.1/dns-query and this
+   * outbound carries it to 1.1.1.1:443 under TLS with another name, the
+   * certificate checked against the resolver's own (`fromMitM`).
+   */
+  const ECH_OUTBOUND_EXAMPLE = {
+    tag: 'tls-repack-dns', protocol: 'direct', settings: { redirect: '1.1.1.1:443' },
+    streamSettings: { security: 'tls', tlsSettings: { serverName: 'www.microsoft.com', verifyPeerCertByName: 'fromMitM,www.microsoft.com', alpn: ['fromMitM'], fingerprint: 'chrome' } }
+  };
+
+  /**
+   * The editor's Example for the ECH outbound: the outbound above, and the ECH
+   * value it goes with — asked over h2c of 1.1.1.1, under the name the field
+   * already asks for (a query without one asks for the SNI, as before); an
+   * empty field or a base64 list gets cloudflare-ech.com, the post's.
+   */
+  function echOutboundExample(ech) {
+    const s = String(ech == null ? '' : ech).trim();
+    const sep = s.indexOf('://');
+    const plus = s.indexOf('+');
+    const name = sep > -1 ? (plus > -1 && plus < sep ? s.slice(0, plus) : '') : 'cloudflare-ech.com';
+    return { ech: (name ? name + '+' : '') + 'h2c://1.1.1.1/dns-query', echOutbound: JSON.stringify(ECH_OUTBOUND_EXAMPLE, null, 2) };
+  }
+
   return {
-    FIELDS, TABS, PROTOCOLS, NETWORKS, FINGERPRINTS, SS_METHODS, PATH_FIELDS,
-    securitiesOf, hasTransport, masqueHttpOf, contextOf, fieldApplies,
-    getPath, setPath, toForm, fromForm, validate, readEncryption, readPathFields, applyPathFields, specialsOf, ssPluginOf
+    FIELDS, TABS, PROTOCOLS, NETWORKS, FINGERPRINTS, SS_METHODS, PATH_FIELDS, SINGBOX_ONLY,
+    securitiesOf, hasTransport, singboxOnly, masqueHttpOf, contextOf, fieldApplies,
+    getPath, setPath, toForm, fromForm, validate, readEncryption, readDialMode, presetOf, readPathFields, applyPathFields, specialsOf, ssPluginOf,
+    ECH_OUTBOUND_EXAMPLE, echOutboundExample, FINALMASK_PRESETS, CIPHER_PRESETS, DIAL_MODE_PRESETS
   };
 }));

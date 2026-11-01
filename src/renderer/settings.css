@@ -183,6 +183,49 @@
   display: grid;
   gap: 8px;
 }
+/* The per-app list (app.js renderTunAppList): a row per app — its process
+   name, the config it rides, ✕. A process name is Latin in either language,
+   so it keeps its own direction and is the part that gives way (ellipsis, the
+   whole name in its title); the picker takes the rest and never drops below a
+   readable 150. Narrow (a phone, the router's page): the picker goes under
+   the name, the full width of the row. */
+.tunapp-list { display: grid; gap: 6px; }
+.tunapp-list:empty { display: none; }
+.tunapp-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 1.4fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding-block: 6px;
+  padding-inline: 10px 4px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r5);
+}
+.tunapp-name {
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  unicode-bidi: isolate;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* its own direction is LTR (a Latin name stays in order), but it sits where the page starts */
+[dir="rtl"] .tunapp-name { text-align: right; }
+.tunapp-target { min-width: 0; }
+.tunapp-target .ss { display: block; width: 100%; min-width: 0; }
+.tunapp-del { justify-self: end; }
+.tunapp-add { display: flex; gap: 8px; }
+.tunapp-add > .input { flex: 1; min-width: 0; }
+/* a process name is Latin: typed, it reads left to right; empty, the placeholder reads in the page's direction */
+.tunapp-add > .input:not(:placeholder-shown) { direction: ltr; font-family: var(--mono); }
+.tunapp-add > .btn { flex: none; }
+@media (max-width: 560px) {
+  .tunapp-item { grid-template-columns: minmax(0, 1fr) auto; }
+  .tunapp-target { grid-column: 1 / -1; grid-row: 2; }
+}
 #view-settings .setting-row:last-child { border-block-end: 0; }
 #view-settings .setting-row.disabled > .field-label,
 #view-settings .setting-row.disabled > .select { opacity: .5; }
@@ -853,6 +896,124 @@
    4.2:1. The spine says "error" just as loudly and costs nothing. */
 .log-error { color: var(--danger); border-inline-start-color: var(--danger); }
 
+/* ----------------------------- the tunnel's live connections (connections.js) -----------------------------
+   The Logs page's second tab. Its tabs sit in the view head beside the title
+   (a .seg no taller than the 36 px head, so the log box's calc above holds),
+   and the tab fills the same height the log box does: the bar, a status line,
+   and the list — the only part that scrolls. An app is a row folded to its
+   head; its connections are rows under it, the destination taking what is
+   left, the rest at their own width. A phone (the service's page) puts a
+   connection's figures on a line under its destination. */
+.logs-tabs .seg-btn { padding: 5px 14px; }
+.logs-tabs[hidden], #btnClearLogs[hidden], .logbox[hidden], .conns[hidden], .conns [hidden] { display: none; }
+.conns {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: calc(100vh - var(--tbh) - 120px);
+  min-height: 220px;
+}
+.cn-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cn-filter { flex: 1 1 240px; min-width: 0; }
+.cn-sum { font-size: 12px; color: var(--ink3); white-space: nowrap; }
+.cn-sum-rate { font-family: var(--mono); font-size: 12px; color: var(--ink2); white-space: nowrap; }
+.cn-tools { display: flex; gap: 4px; margin-inline-start: auto; }
+.cn-status { margin: 0; }
+.cn-status.cn-warn { color: var(--warn); }
+.cn-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r6);
+}
+.cn-app + .cn-app { border-block-start: 1px solid var(--line); }
+.cn-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding-block: 9px;
+  padding-inline: 12px;
+  background: none;
+  border: 0;
+  color: var(--ink);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.cn-head:hover { background: var(--soft); }
+.cn-caret { flex: 0 0 12px; color: var(--ink3); font-size: 11px; }
+/* the name and the destination are left to right (dir=ltr): grown, their text
+   would sit at their own left — mid-row in Persian. They keep their width and
+   this takes the rest, so they stay at the row's start in either direction. */
+.cn-fill { flex: 1 1 0; min-width: 0; }
+.cn-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+.cn-count { font-size: 11px; color: var(--ink3); white-space: nowrap; }
+.cn-rate { font-family: var(--mono); font-size: 11px; color: var(--accentInk); white-space: nowrap; }
+.cn-bytes { font-family: var(--mono); font-size: 11px; color: var(--ink3); white-space: nowrap; }
+.cn-conns { padding-block-end: 6px; }
+.cn-conn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-block: 3px;
+  padding-inline: 34px 8px;
+  font-size: 12px;
+}
+.cn-conn:hover { background: var(--soft); }
+.cn-dest {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  color: var(--ink2);
+}
+.cn-net { font-family: var(--mono); font-size: 10px; color: var(--ink3); padding-block: 1px; padding-inline: 5px; border: 1px solid var(--line); border-radius: var(--r2); }
+.cn-from { font-size: 11px; color: var(--info); white-space: nowrap; }
+.cn-age { font-size: 11px; color: var(--ink3); white-space: nowrap; }
+.cn-out {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--ink2);
+  padding-block: 2px;
+  padding-inline: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r2);
+}
+.cn-out-tunnel { color: var(--accentInk); border-color: var(--accentLine); }
+.cn-out-direct { color: var(--ink3); }
+.cn-x { flex: 0 0 auto; }
+/* closed, or gone since the read before: kept in place, dimmed, while the pointer is on the list */
+.cn-gone { opacity: .45; }
+.cn-more { margin: 4px 0 0; padding-inline-start: 34px; }
+@media (max-width: 560px) {
+  /* the spacer becomes the line break: the name — or the destination and its
+     close button — on the first line, the figures under them */
+  .cn-fill { flex-basis: 100%; height: 0; }
+  .cn-head { flex-wrap: wrap; row-gap: 2px; }
+  .cn-name { max-width: calc(100% - 22px); }
+  .cn-conn { flex-wrap: wrap; row-gap: 2px; padding-inline-start: 22px; }
+  .cn-dest { order: -3; max-width: calc(100% - 44px); }
+  .cn-x { order: -2; margin-inline-start: auto; }
+  .cn-conn .cn-fill { order: -1; }
+  .cn-sum-rate { white-space: normal; }
+}
+
 /* =========================================================================
    Choices with consequences, as cards
 
@@ -867,8 +1028,11 @@
    order and from any label association. */
 .vis-hidden {
   position: absolute;
-  width: 1px;
-  height: 1px;
+  /* !important: a narrow window's `.select { width: 100% }` once won, and the
+     four TUN selects pushed the Settings page sideways on a phone (537 px of 390) */
+  width: 1px !important;
+  height: 1px !important;
+  min-width: 0 !important;
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;
@@ -962,3 +1126,565 @@
 #view-settings .gw-meta { font-family: var(--mono); font-size: 11px; color: var(--ink3); direction: ltr; flex: none; }
 #view-settings .gw-direct { font-size: 12px; color: var(--ink2); flex: none; }
 #view-settings .gw-check { flex: none; }
+
+/* ----------------------------- several internets (multiWan.js) -----------------------------
+   The approved mockup (.superpowers/mockups/multi-internet.html), one card:
+   the switch, three mode cards, a box per internet (head row, then role /
+   share / cap in three columns with the usage bar under the cap), the split
+   pickers, the two live share bars, the buttons and the note. Every box in it
+   is the same soft panel with a hairline; numbers and addresses run left to
+   right even in Persian. The segments' colours are the tokens, in order. */
+#view-settings #multiWanCard .mi-body { display: flex; flex-direction: column; gap: 12px; }
+#view-settings #multiWanCard .mi-body[hidden] { display: none; }
+.mi-modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.mi-mode {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 11px 13px;
+  text-align: start;
+  color: inherit;
+  font: inherit;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 140ms ease-out, border-color 140ms ease-out;
+}
+.mi-mode:hover { border-color: var(--dim); }
+.mi-mode b { font-size: 13.5px; color: var(--ink); }
+.mi-mode span { font-size: 11.5px; line-height: 1.6; color: var(--ink3); }
+.mi-mode.on { background: var(--accentSoft); border-color: var(--accent); }
+.mi-mode.on b { color: var(--accentInk); }
+.mi-links { display: flex; flex-direction: column; gap: 10px; }
+.mi-links > .hint { margin: 0; }
+.mi-net, .mi-box { padding: 12px 14px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
+.mi-net.mi-gone .mi-row { opacity: .6; }
+.mi-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.mi-ic {
+  display: grid;
+  place-items: center;
+  flex: none;
+  inline-size: 30px;
+  block-size: 30px;
+  font-size: 15px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.mi-who { min-width: 0; }
+.mi-name { font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.mi-meta { font-family: var(--mono); font-size: 11.5px; color: var(--ink3); direction: ltr; unicode-bidi: isolate; overflow-wrap: anywhere; }
+.mi-ok, .mi-off { font-size: 11.5px; }
+.mi-ok { color: var(--ok); }
+.mi-off { color: var(--ink3); }
+.mi-spd {
+  display: flex;
+  gap: 12px;
+  margin-inline-start: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+.mi-spd .dn { color: var(--accentInk); }
+.mi-spd .up { color: var(--warn); }
+.mi-spd .mi-unit, .mi-spd .mi-wait { font-weight: 500; color: var(--ink3); }
+.mi-spd .mi-err { font-size: 11.5px; font-weight: 500; color: var(--danger); overflow-wrap: anywhere; }
+.mi-ctl { display: grid; grid-template-columns: 1.1fr 1fr 1.4fr; align-items: end; gap: 12px; margin-block-start: 11px; }
+.mi-field { min-width: 0; }
+#view-settings .mi-field > .field-label { margin-block-end: 5px; font-size: 11.5px; }
+.mi-cap { display: flex; gap: 6px; }
+#view-settings .mi-cap > .input { flex: none; inline-size: 76px; }
+.mi-cap > .select { flex: 1; min-width: 0; }
+/* a month's renew day: a small line under the cap, its number box narrow */
+.mi-renew { display: flex; align-items: center; gap: 6px; margin-block-start: 6px; font-size: 11.5px; color: var(--ink3); }
+.mi-renew[hidden], .mi-renewnote[hidden] { display: none; }
+#view-settings .mi-renew > .select { flex: none; inline-size: 70px; min-block-size: 30px; padding-block: 3px; }
+.mi-renewnote { margin-block-start: 4px; font-size: 11.5px; color: var(--ink3); }
+.mi-bar { block-size: 6px; margin-block-start: 6px; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.mi-bar[hidden] { display: none; }
+.mi-bar > i { display: block; block-size: 100%; background: var(--accent); }
+.mi-bar > i.warn { background: var(--warn); }
+.mi-bar > i.over { background: var(--danger); }
+.mi-quota { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 8px; margin-block-start: 5px; font-size: 11.5px; color: var(--ink3); }
+.mi-split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-block: 8px 10px; }
+.mi-splitbox > .hint { margin: 0; }
+.mi-splitbox > .hint + .hint { margin-block-start: 6px; }
+.mi-live { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.mi-live[hidden] { display: none; }
+.mi-share { display: flex; block-size: 10px; margin-block: 7px 4px; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.mi-share > i { display: block; block-size: 100%; }
+.mi-c0 { background: var(--accent); }
+.mi-c1 { background: var(--warn); }
+.mi-c2 { background: var(--ok); }
+.mi-c3 { background: var(--ink3); }
+.mi-legend { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 10px; font-size: 11px; color: var(--ink3); }
+.mi-leg { display: inline-flex; align-items: center; min-width: 0; overflow-wrap: anywhere; }
+.mi-dot { display: inline-block; flex: none; inline-size: 7px; block-size: 7px; margin-inline-end: 5px; vertical-align: middle; border-radius: 50%; }
+.mi-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.mi-actions .btn { display: inline-flex; align-items: center; gap: 6px; }
+/* "find again" turns while the internets are read (seconds on Windows) */
+.mi-spin {
+  inline-size: 10px;
+  block-size: 10px;
+  border: 1.5px solid var(--line);
+  border-block-start-color: var(--accent);
+  border-radius: 50%;
+  animation: mi-spin 800ms linear infinite;
+}
+@keyframes mi-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .mi-spin { animation: none; } }
+#view-settings .mi-shared { margin: 0; }
+#view-settings .mi-note {
+  margin: 0;
+  padding-block: 2px;
+  padding-inline: 10px;
+  font-size: 11.5px;
+  line-height: 1.8;
+  color: var(--ink3);
+  border-inline-start: 2px solid var(--accentLine);
+}
+@media (max-width: 680px) {
+  .mi-modes, .mi-ctl, .mi-split, .mi-live { grid-template-columns: 1fr; }
+}
+
+/* ----------------------------- extensions (extensions.js) — MOD-DESK block -----------------------------
+   The Extensions page: a count, then a section per category with its cards in
+   a grid — on a phone (the router's page) one column. A card: the icon, the
+   name and its one line, "Installed", the chips (in use / needs / needed by),
+   and its one button at the foot. An installed card wears the accent's
+   hairline. Words wrap; nothing scrolls sideways. */
+.mod-list { display: flex; flex-direction: column; gap: 22px; margin-block-start: 14px; }
+.mod-count { margin: 0; font: 600 11px var(--mono); letter-spacing: .04em; color: var(--ink3); }
+.mod-cat-title { margin-block: 0 10px; margin-inline: 0; font-size: 13px; font-weight: 650; color: var(--ink2); }
+.mod-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr)); gap: 12px; }
+.mod-card { display: flex; flex-direction: column; gap: 10px; margin: 0; min-inline-size: 0; }
+.mod-card.on { border-color: var(--accentLine); }
+.mod-head { display: flex; align-items: flex-start; gap: 12px; min-inline-size: 0; }
+.mod-ico {
+  flex: none;
+  inline-size: 38px; block-size: 38px;
+  display: grid;
+  place-items: center;
+  font-size: 19px;
+  line-height: 1;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.mod-card.on .mod-ico { background: var(--accentSoft); border-color: var(--accentLine); }
+.mod-titles { flex: 1; min-inline-size: 0; }
+.mod-name { font-size: 14px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.mod-desc { margin-block-start: 3px; font-size: 12px; line-height: 1.75; color: var(--ink3); overflow-wrap: anywhere; }
+.mod-badge {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ok);
+  background: var(--okSoft);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.mod-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.mod-chip { padding: 2px 8px; font-size: 11px; line-height: 1.7; color: var(--ink2); background: var(--soft); border: 1px solid var(--line); border-radius: 999px; overflow-wrap: anywhere; }
+.mod-chip.mod-use { color: var(--info); background: var(--infoSoft); border-color: transparent; }
+.mod-chip.mod-needs, .mod-chip.mod-by { color: var(--warn); background: var(--warnSoft); border-color: transparent; }
+.mod-actions { display: flex; justify-content: flex-end; margin-block-start: auto; }
+.mod-actions .btn { min-inline-size: 96px; justify-content: center; }
+/* Settings → one line to the page */
+#view-settings .mod-pointer {
+  margin-block: 0 16px;
+  margin-inline: 0;
+  padding-block: 8px;
+  padding-inline: 12px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--ink2);
+  background: var(--soft);
+  border-inline-start: 2px solid var(--accentLine);
+  border-radius: 8px;
+}
+#view-settings .mod-pointer .cg-link { color: var(--accentInk); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+@media (max-width: 560px) {
+  .mod-actions .btn { inline-size: 100%; }
+}
+
+/* ----------------------------- users on this network (lanUsers.js) -----------------------------
+   The Users page: the settings card (proxy accounts, the address to give people,
+   on the router the transparent mode), a box per user (who, the state, the live
+   rate, the password, the config, a bar per limit or the totals, the speed, the
+   expiry and hours, the last 30 days), on the router the devices list, and the
+   add / edit dialog with its limits' grid. The same soft panels
+   as the multi-internet card. Usernames, passwords, addresses, IPs and MACs are
+   inline spans set left to right inside lines that keep the page's direction,
+   so in Persian they still sit on the start side. One column on a phone. */
+#view-users .lu-intro { margin: 0 0 14px; max-inline-size: 72ch; }
+.lu-card { display: flex; flex-direction: column; gap: 12px; }
+#view-users .lu-card .switch-row { padding-block: 6px 12px; }
+#view-users .input, #view-users .select, .lu-form .input, .lu-form .select { border-radius: 9px; min-block-size: 40px; }
+.lu-body { display: flex; flex-direction: column; gap: 12px; }
+.lu-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.lu-head-words { flex: 1 1 160px; min-width: 0; }
+.lu-title { font-size: 14px; font-weight: 650; color: var(--ink); }
+.lu-meta { margin-block-start: 2px; font-size: 11.5px; color: var(--ink3); }
+.lu-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.lu-field { min-width: 0; }
+#view-users .lu-field > .field-label, .lu-form .lu-field > .field-label { margin-block-end: 5px; font-size: 11.5px; }
+.lu-mono { font-family: var(--mono); unicode-bidi: isolate; overflow-wrap: anywhere; }
+#view-users .lu-hint { margin: 0; }
+#view-users .lu-note {
+  margin: 0;
+  padding-block: 2px;
+  padding-inline: 10px;
+  font-size: 11.5px;
+  line-height: 1.8;
+  color: var(--ink3);
+  border-inline-start: 2px solid var(--accentLine);
+}
+/* the Windows hotspot note is how-to, not a caveat: the info ink */
+#view-users .lu-note.lu-hotspot { color: var(--ink2); border-inline-start-color: var(--info); }
+/* the address to give people: one line per address and protocol */
+.lu-addr { padding: 12px 14px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
+.lu-addr > .field-label { margin-block-end: 4px; font-size: 11.5px; }
+.lu-addr > .hint { margin: 0; }
+.lu-addr-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding-block: 3px; }
+.lu-proto { flex: none; min-inline-size: 58px; font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .04em; color: var(--ink3); }
+.lu-addr-row .lu-mono { font-size: 13.5px; font-weight: 600; color: var(--ink); }
+.lu-copy { margin-inline-start: auto; }
+.lu-addr-row .lu-hs { color: var(--info); border-color: var(--info); }
+/* users there and no way in for any of them: above everything, with the switch's own action */
+.lu-alert {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 14px;
+  background: var(--soft);
+  border: 1px solid var(--warn);
+  border-inline-start-width: 3px;
+  border-radius: 12px;
+}
+.lu-alert-text { flex: 1 1 220px; min-width: 0; font-size: 13px; font-weight: 600; color: var(--ink); }
+/* a user's link for a phone: the QR in the app's own white box (.qr-image — a scanner needs it on the dark skins), the link under it */
+.modal.lu-modal.lu-share { width: min(440px, 100%); }   /* beats .modal.lu-modal, declared below */
+/* …and a user's sign-in card (router): the same QR box and link, the password's switch under them */
+.modal.lu-modal.lu-cardm { width: min(420px, 100%); }
+.lu-share .lu-qr, .lu-cardm .lu-qr { align-self: center; inline-size: min(260px, 100%); }
+.lu-qrimg { display: block; inline-size: 100%; block-size: auto; image-rendering: pixelated; }
+.lu-share .lu-link, .lu-cardm .lu-link { padding: 8px 10px; font-size: 11.5px; background: var(--soft); border: 1px solid var(--line); border-radius: 9px; user-select: all; }
+.lu-cardm .lu-switchline { align-self: flex-start; min-block-size: 0; }
+.lu-cardm .hint[hidden] { display: none; }
+.lu-ips { display: flex; flex-wrap: wrap; gap: 6px; }
+/* the router's sign-in page (login mode): its addresses, its QR beside the print button */
+.lu-portal { margin-block-start: 10px; }
+.lu-portal > .hint { margin-block-start: 4px; }
+.lu-portal-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; margin-block-start: 8px; }
+.qr-image.lu-portal-qr { align-self: auto; width: 132px; padding: 6px; }
+/* the wall sheet (lanUsers.js printPortal): on paper only, and nothing else while it prints (its paper colours: styles.css) */
+.lu-printsheet { display: none; }
+@media print {
+  html.lu-printing body > :not(.lu-printsheet) { display: none !important; }
+  html.lu-printing .lu-printsheet { display: block; padding: 10mm; font: 16pt/1.5 Tahoma, system-ui, sans-serif; text-align: center; }
+  .lu-printsheet h1 { margin: 0 0 8mm; font-size: 26pt; }
+  .lu-ps-line { margin: 0 0 6mm; }
+  .lu-ps-en { display: block; font-size: 12pt; }
+  /* a user's sign-in card (lanUsers.js cardSheet): a card to cut out, its QR, the username (and the password when ticked) */
+  html.lu-printing .lu-printsheet.lu-pcard { padding: 6mm 0; font-size: 11pt; }
+  .lu-pc { inline-size: 92mm; margin: 0 auto; padding: 6mm 7mm; border: .4mm dashed currentColor; border-radius: 4mm; break-inside: avoid; }
+  .lu-pcard h1 { margin: 0 0 2mm; font-size: 16pt; }
+  .lu-pcard h1 .lu-ps-en { font-size: 10pt; font-weight: 400; }
+  .lu-pc-name { margin-block-end: 1mm; font-size: 14pt; font-weight: 700; overflow-wrap: anywhere; }
+  .lu-printsheet .lu-pc-qr { width: 44mm; margin: 2mm auto; }
+  .lu-pc-small { margin: 0 0 2mm; font-size: 9.5pt; }
+  .lu-pc-small .lu-ps-en { font-size: 8.5pt; }
+  .lu-pc-row { display: flex; align-items: baseline; justify-content: space-between; gap: 4mm; margin-block-end: 2mm; padding-block: 1.5mm; border-block-end: .2mm solid currentColor; }
+  .lu-pc-k { font-size: 9pt; }
+  .lu-pc-v { font: 700 14pt/1.3 Consolas, ui-monospace, monospace; unicode-bidi: isolate; overflow-wrap: anywhere; }
+  .lu-printsheet .lu-pc-url { margin: 1mm 0; font-size: 11pt; overflow-wrap: anywhere; }
+  .lu-ps-qr { display: block; width: 70mm; height: auto; margin: 4mm auto; image-rendering: pixelated; }
+  .lu-ps-url { margin: 2mm 0; font: 600 18pt/1.4 Consolas, ui-monospace, monospace; }
+}
+/* the hotspot check (Windows): a device per row, its addresses, whether the tunnel saw it */
+.lu-hscard .lu-note { margin-block-start: 2px; }
+.lu-hslist { display: flex; flex-direction: column; gap: 8px; }
+.lu-hsrow { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 10px 14px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
+.lu-hswho { display: flex; flex-wrap: wrap; gap: 2px 10px; flex: 1 1 180px; min-width: 0; font-size: 12.5px; }
+.lu-hsrow .lu-hs-yes { color: var(--ok); border-color: var(--ok); }
+.lu-hsrow .lu-hs-no { color: var(--ink3); }
+.lu-hsuse { flex-basis: 100%; }
+/* a box per user */
+.lu-list { display: flex; flex-direction: column; gap: 10px; }
+.lu-user { padding: 12px 14px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
+.lu-user.lu-dim .lu-who, .lu-user.lu-dim .lu-av { opacity: .6; }
+.lu-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
+.lu-av {
+  display: grid;
+  place-items: center;
+  flex: none;
+  inline-size: 30px;
+  block-size: 30px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accentInk);
+  background: var(--accentSoft);
+  border: 1px solid var(--accentLine);
+  border-radius: 50%;
+}
+.lu-who { min-width: 0; }
+.lu-name { font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.lu-uname { font-family: var(--mono); font-size: 11.5px; unicode-bidi: isolate; }
+.lu-state, .lu-tag { flex: none; padding-block: 2px; padding-inline: 8px; font-size: 11px; font-weight: 600; border: 1px solid var(--line); border-radius: 999px; }
+.lu-s-on { color: var(--ok); background: var(--okSoft); border-color: var(--okSoft); }
+.lu-s-off { color: var(--ink3); background: var(--panel); }
+.lu-s-expired { color: var(--warn); background: var(--warnSoft); border-color: var(--warnSoft); }
+.lu-s-over { color: var(--danger); background: var(--dangerSoft); border-color: var(--dangerSoft); }
+.lu-tag { font-weight: 500; color: var(--ink2); background: var(--panel); }
+.lu-acts { display: flex; align-items: center; gap: 4px; margin-inline-start: auto; }
+.lu-acts .switch { margin-inline: 4px 6px; }
+.lu-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; margin-block-start: 2px; }
+.lu-rate { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--accentInk); unicode-bidi: isolate; white-space: nowrap; }
+/* 212 px at the least: a limit's line ("VPN · this month   0.4 GB / 1.0 GB") fits a column of it */
+.lu-ctl { display: grid; grid-template-columns: repeat(auto-fill, minmax(212px, 1fr)); align-items: start; gap: 12px; margin-block-start: 11px; }
+.lu-pass { display: flex; align-items: center; gap: 2px; min-block-size: 40px; padding-inline: 11px 4px; background: var(--panel); border: 1px solid var(--softline); border-radius: 9px; }
+.lu-secret { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; color: var(--ink); unicode-bidi: isolate; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lu-pass .icon-btn { flex: none; font-size: 13px; }
+.lu-target .ss { display: block; width: 100%; min-width: 0; }
+/* the month the monthly limits follow: its calendar and renew day, a small line under the limits' grid */
+.lu-renew { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-block-start: 2px; font-size: 11.5px; color: var(--ink3); }
+.lu-renew[hidden] { display: none; }
+#view-users .lu-renew > .select, .lu-form .lu-renew > .select { flex: none; inline-size: 70px; min-block-size: 32px; padding-block: 4px; }
+.lu-form .lu-renew > .lu-cal { inline-size: auto; min-inline-size: 132px; margin-inline-end: 6px; }
+.lu-bar { block-size: 6px; margin-block-start: 6px; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.lu-bar > i { display: block; block-size: 100%; background: var(--accent); }
+.lu-bar > i.warn { background: var(--warn); }
+.lu-bar > i.over { background: var(--danger); }
+.lu-quota { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 8px; margin-block-start: 5px; font-size: 11.5px; color: var(--ink3); }
+/* a user's usage: a bar per limit (its kind and period, used of cap, what is left), else today's and this month's totals */
+.lu-meters { display: flex; flex-direction: column; gap: 9px; }
+.lu-mline { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 2px 8px; font-size: 11.5px; }
+.lu-mlabel { font-weight: 600; color: var(--ink2); }
+.lu-mnum { font-family: var(--mono); font-size: 11.5px; color: var(--ink); unicode-bidi: isolate; white-space: nowrap; }
+.lu-meter .lu-bar { margin-block-start: 4px; }
+.lu-mfoot { margin-block-start: 3px; font-size: 11px; color: var(--ink3); }
+.lu-m-near .lu-mfoot { color: var(--warn); }
+.lu-m-over .lu-mfoot { color: var(--danger); }
+.lu-extra { font-family: var(--mono); color: var(--ok); unicode-bidi: isolate; }
+.lu-tot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; padding-block: 2px; font-size: 11.5px; color: var(--ink3); }
+.lu-totp { min-inline-size: 64px; font-weight: 600; color: var(--ink2); }
+.lu-totk > bdi { font-family: var(--mono); color: var(--ink); }
+/* the speed the router gives them now, and why */
+/* one line of text (its reasons wrap as words do, not as boxes) */
+.lu-speed { margin-block-start: 8px; font-size: 11.5px; line-height: 1.6; color: var(--ink3); }
+.lu-speed[hidden] { display: none; }
+.lu-speed-k { margin-inline-end: 6px; font-weight: 600; color: var(--ink2); }
+.lu-speed-rate { font-family: var(--mono); font-weight: 600; color: var(--accentInk); unicode-bidi: isolate; white-space: nowrap; }
+.lu-useacts { display: flex; flex-wrap: wrap; gap: 6px; margin-block-start: 8px; }
+/* a hold's pill: when it lifts, in the same pill */
+.lu-until { font-weight: 500; }
+.lu-s-novpn, .lu-s-nodirect { color: var(--warn); background: var(--warnSoft); border-color: var(--warnSoft); }
+.lu-s-schedule { color: var(--info); background: var(--infoSoft); border-color: var(--infoSoft); }
+.lu-route, .lu-hours { color: var(--ink2); }
+.lu-hours > bdi { font-family: var(--mono); }
+/* the last 30 days: a bar a day, VPN under direct (paintChart draws it in SVG; its colours are the skin's) */
+.lu-hist { margin-block-start: 12px; padding-block-start: 10px; border-block-start: 1px dashed var(--line); }
+.lu-chead { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; font-size: 11px; color: var(--ink3); }
+.lu-ctitle { margin-inline-end: auto; font-weight: 600; color: var(--ink2); }
+.lu-ckey { display: inline-flex; align-items: center; gap: 5px; }
+.lu-ckey > bdi { font-family: var(--mono); color: var(--ink2); }
+.lu-csw { display: inline-block; inline-size: 9px; block-size: 9px; border-radius: 2px; }
+.lu-csw-vpn { background: var(--accent); }
+.lu-csw-direct { background: var(--info); }
+.lu-chart { display: block; inline-size: 100%; block-size: 46px; margin-block-start: 6px; }
+.lu-cvpn { fill: var(--accent); }
+.lu-cdirect { fill: var(--info); }
+.lu-chit { fill: transparent; }
+.lu-cbar:hover .lu-chit { fill: var(--accentSoft); }
+.lu-cbase { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.lu-exp { display: flex; align-items: center; gap: 4px; }
+.lu-exp > .input { flex: 1; min-width: 0; }
+/* the date box's own calendar button in the theme's ink */
+[data-theme="dark"] .lu-date { color-scheme: dark; }
+[data-theme="light"] .lu-date { color-scheme: light; }
+.lu-sub { margin-block-start: 4px; font-size: 11.5px; color: var(--ink3); overflow-wrap: anywhere; }
+.lu-sub.lu-bad { color: var(--warn); }
+/* the router's devices: dot, who, user, block, usage — two lines on a phone */
+.lu-devs { display: flex; flex-direction: column; gap: 8px; }
+.lu-dev {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1.3fr) minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.lu-dev.lu-gone .lu-who { opacity: .6; }
+.lu-dot { inline-size: 8px; block-size: 8px; border-radius: 50%; background: var(--dim); }
+.lu-dot.on { background: var(--ok); }
+#view-users .lu-devname { min-block-size: 32px; padding-block: 5px; font-weight: 600; }
+.lu-addrs { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 11px; }
+.lu-ip { color: var(--ink2); }
+.lu-mac { color: var(--ink3); }
+.lu-dcell { min-width: 0; }
+.lu-block { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--ink3); }
+/* its bytes over its rate, at the row's end edge */
+.lu-use { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; font-size: 11.5px; }
+.lu-use > span { white-space: nowrap; }
+.lu-bytes { color: var(--ink2); }
+.lu-devrate { color: var(--accentInk); }
+/* the add / edit dialog */
+.modal.lu-modal { width: min(620px, 100%); }
+.modal.lu-topup { width: min(420px, 100%); }
+/* its parts in panels of their own: the limits' grid, the allowed hours, the router's speed */
+.lu-sect { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
+.lu-sect-title { font-size: 12.5px; font-weight: 650; color: var(--ink); }
+.lu-sect-sub { margin-block-start: 4px; font-size: 11.5px; font-weight: 600; color: var(--ink2); }
+.lu-sect > .lu-sub { margin-block-start: 0; }
+/* the colour alone: a .select's chevron is its background image */
+.lu-sect .input, .lu-sect .select { background-color: var(--panel); }
+/* the limits: a label column, then daily / monthly / one-off — each cell its GB, on the router its action under it */
+.lu-limits { display: grid; grid-template-columns: max-content repeat(3, minmax(0, 1fr)); align-items: start; gap: 6px 8px; }
+.lu-lhead { font-size: 11px; font-weight: 600; color: var(--ink3); text-align: center; }
+.lu-lkind { display: flex; align-items: center; min-block-size: 36px; padding-inline-end: 4px; font-size: 12px; font-weight: 600; color: var(--ink2); }
+.lu-lcell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.lu-form .lu-lcell .input, .lu-form .lu-lcell .select { min-block-size: 36px; padding-block: 6px; font-size: 12.5px; }
+.lu-lcell > [hidden] { display: none; }
+.lu-slow { display: flex; gap: 6px; }
+.lu-slow > .lu-ratein { flex: 1 1 0; }
+/* a speed box with its arrow (↓ download, ↑ upload) before it */
+.lu-ratein { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.lu-arrow { flex: none; font-size: 12px; font-weight: 600; color: var(--ink3); }
+.lu-form .lu-ratein > .input { flex: 1; min-width: 0; inline-size: auto; padding-inline: 7px; }
+/* a switch line inside a panel, or alone in the dialog, sits at the start (a grid cell's aligns to its row's end) */
+.lu-sect > .lu-switchline, .lu-form > .lu-switchline { align-self: flex-start; min-block-size: 0; }
+/* the days of the week as chips, the hours beside them */
+.lu-days { display: flex; flex-wrap: wrap; gap: 5px; }
+.lu-day { padding-block: 5px; padding-inline: 10px; font: inherit; font-size: 12px; color: var(--ink3); background: var(--panel); border: 1px solid var(--softline); border-radius: 999px; cursor: pointer; }
+.lu-day:hover { color: var(--ink); border-color: var(--dim); }
+.lu-day[aria-pressed="true"] { color: var(--accentInk); background: var(--accentSoft); border-color: var(--accentLine); }
+.lu-day:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lu-hrs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 12px; color: var(--ink3); }
+.lu-hr { display: inline-flex; align-items: center; gap: 6px; }
+/* wide enough for a 12-hour clock ("06:00 PM") as well */
+.lu-form .lu-time { flex: none; inline-size: 132px; }
+/* the router's peak-hour windows: a panel each, its days, hours and two speeds */
+.lu-wins { display: flex; flex-direction: column; gap: 8px; }
+.lu-wins:empty { display: none; }
+.lu-win { display: flex; flex-direction: column; gap: 8px; padding: 10px; background: var(--panel); border: 1px solid var(--softline); border-radius: 10px; }
+.lu-win .input, .lu-win .lu-day { background: var(--soft); }
+.lu-win-top { display: flex; align-items: flex-start; gap: 6px; }
+.lu-win-top > .lu-days { flex: 1; min-width: 0; }
+.lu-win-rates { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.lu-win-rates > .lu-ratein { flex: 1 1 76px; }
+.lu-winadd { align-self: flex-start; }
+/* the desktop: where the speed would be, the line that it is the router's */
+.lu-form .lu-speednote { margin: 0; padding-block: 2px; padding-inline: 10px; font-size: 11.5px; line-height: 1.8; color: var(--ink3); border-inline-start: 2px solid var(--accentLine); }
+.lu-modal .modal-head .tb-btn { margin-inline-start: auto; }
+.lu-modal .modal-title { flex: 0 1 auto; }
+.lu-pwrow { display: flex; align-items: center; gap: 4px; }
+.lu-pwrow > .input { flex: 1; min-width: 0; font-family: var(--mono); }
+.lu-form .input[aria-invalid="true"] { border-color: var(--danger); }
+.lu-err { margin-block-start: 5px; font-size: 11.5px; color: var(--danger); }
+.lu-err:empty { display: none; }
+.lu-formerr { margin: 0; padding-block: 9px; padding-inline: 12px; font-size: 12px; color: var(--danger); background: var(--dangerSoft); border-radius: var(--r5); }
+.lu-switchline { display: flex; align-items: center; gap: 10px; align-self: end; min-block-size: 40px; font-size: 12.5px; color: var(--ink2); }
+.lu-modal .modal-foot .lu-del { margin-inline-end: auto; }
+/* v1.40 — the bar over the blocks: Users | Vouchers (each with how many), then the module's own files at the end edge */
+.lu-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-block-end: 14px; }
+.lu-tabs .seg-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; }
+.lu-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lu-tabn { font: 600 11px var(--mono); line-height: 17px; padding-inline: 7px; color: var(--ink3); background: var(--soft); border: 1px solid var(--line); border-radius: 999px; }
+.seg-btn.active .lu-tabn { color: var(--accentInk); border-color: var(--accentLine); }
+.lu-tabreq { font-size: 11px; font-weight: 700; line-height: 17px; padding-inline: 6px; color: var(--warn); background: var(--warnSoft); border-radius: 999px; }
+/* on the open tab's accent: the panel's own ink, read on any skin */
+.seg-btn.active .lu-tabreq { color: var(--ink); background: var(--panel); }
+.lu-tbacts { display: flex; flex-wrap: wrap; gap: 6px; margin-inline-start: auto; }
+.lu-pane, .lu-vpane { min-width: 0; }
+/* the user's status page (router, login mode): a note, a contact, top-up requests — under the sign-in page's addresses */
+.lu-ptset { display: flex; flex-direction: column; gap: 8px; margin-block-start: 12px; padding-block-start: 10px; border-block-start: 1px dashed var(--line); }
+.lu-boxtitle { font-size: 12px; font-weight: 650; color: var(--ink2); }
+.lu-ptgrid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 10px 12px; }
+.lu-ptset .input, .lu-shaping .input { background-color: var(--panel); }
+#view-users .lu-ptset .switch-row, #view-users .lu-shaping .switch-row { padding-block: 2px; }
+/* the speed shaping (router): the line's speed, smooth limits, what the router does now, the packages to install */
+.lu-shaping { display: flex; flex-direction: column; gap: 8px; }
+.lu-shaping > .field-label { margin-block-end: 0; }
+/* two speeds of a few digits: no need for the card's whole width */
+.lu-shaping > .lu-grid { max-inline-size: 460px; }
+.lu-shaping .lu-ratein > .input { flex: 1; min-width: 0; }
+.lu-shpnow { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--ink2); }
+.lu-dot.lu-dot-warn { background: var(--warn); }
+.lu-cmd { padding-block: 5px; padding-inline: 10px; background: var(--panel); border: 1px solid var(--softline); border-radius: 9px; }
+.lu-cmdline { flex: 1 1 240px; min-width: 0; font-size: 12px; color: var(--ink); user-select: all; }
+.lu-shaping > .lu-sub { margin-block-start: 0; }
+.lu-shpwhy { font-family: var(--mono); font-size: 11px; }
+.lu-shpbusy, .lu-shpprio { font-weight: 600; }
+/* a user's box: the tags under the name (filter, priority, remembered devices), the days left, a top-up request */
+.lu-tags { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-block-start: 8px; }
+.lu-chip { padding-block: 1px; padding-inline: 8px; font-size: 11px; line-height: 1.6; color: var(--ink2); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-wrap: anywhere; }
+.lu-chip-filter { color: var(--info); border-color: var(--infoSoft); }
+.lu-chip-prio.lu-prio-high { color: var(--accentInk); background: var(--accentSoft); border-color: var(--accentLine); }
+.lu-chip-prio.lu-prio-low { color: var(--ink3); }
+.lu-chip-rem { color: var(--ink2); }
+.lu-left { white-space: nowrap; }
+.lu-left.lu-soon { font-weight: 600; color: var(--warn); }
+.lu-req { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-block-start: 10px; padding-block: 7px; padding-inline: 12px; background: var(--warnSoft); border: 1px solid var(--warn); border-inline-start-width: 3px; border-radius: 10px; }
+.lu-req-ico { flex: none; font-size: 14px; }
+.lu-req-text { flex: 1 1 180px; min-width: 0; font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.lu-req-text > bdi { font-family: var(--mono); font-weight: 500; }
+/* luReports.js on a box: the 12 months behind a toggle, the CSV, a month's statement */
+.lu-reps { margin-block-start: 10px; }
+.lu-reps-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.lu-billpick { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-inline-start: auto; }
+#view-users .lu-billpick > .select { inline-size: auto; min-block-size: 32px; padding-block: 4px; font-size: 12px; }
+.lu-months { margin-block-start: 8px; }
+.lu-months[hidden] { display: none; }
+/* the devices: one a sign-in gave its user for good */
+.lu-remembered { color: var(--accentInk); }
+/* the restore dialog: what the file holds, when it was made, the two ways in */
+.modal.lu-restore { width: min(480px, 100%); }
+.lu-bksum { font-size: 14px; font-weight: 650; color: var(--ink); }
+.lu-bksum > bdi { font-family: var(--mono); }
+.lu-bkway { padding-block: 9px; padding-inline: 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 10px; }
+.lu-bkway-t { font-size: 12.5px; font-weight: 650; color: var(--ink); }
+.lu-bkway > .lu-sub { margin-block-start: 2px; }
+.lu-formerr[hidden] { display: none; }
+/* the dialog: the content filter (categories as chips — a blocked one in the danger ink —, safe search, domains), the priority, remember devices */
+.lu-cats { display: flex; flex-wrap: wrap; gap: 5px; }
+.lu-cat[aria-pressed="true"] { color: var(--danger); background: var(--dangerSoft); border-color: var(--danger); }
+.lu-sect > .lu-nogeo, .lu-sect > .lu-safegroup { margin-block-start: 0; }
+.lu-safegroup[hidden] { display: none; }
+.lu-sw-t { display: block; font-weight: 600; color: var(--ink2); }
+.lu-sw-s { display: block; margin-block-start: 1px; }
+.lu-form .lu-domains { display: block; inline-size: 100%; min-block-size: 84px; padding-block: 8px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; resize: vertical; }
+.lu-prio { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-block-start: 4px; }
+.lu-prio > .lu-sect-sub { margin-block-start: 0; }
+.lu-form .lu-prio > .select { inline-size: 150px; }
+/* the three forms of a blocked line, each beside what it blocks */
+.lu-fltex { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: baseline; gap: 2px 12px; font-size: 11.5px; color: var(--ink3); }
+.lu-fltex-c { font-size: 11.5px; color: var(--ink2); }
+.lu-fltex-w { min-width: 0; }
+.lu-form .lu-remrow { padding-block: 10px; padding-inline: 14px; background: var(--soft); border: 1px solid var(--line); border-radius: 12px; }
+@media (max-width: 680px) {
+  .lu-grid, .lu-ctl { grid-template-columns: 1fr; }
+  .lu-ptgrid { grid-template-columns: 1fr; }
+  .lu-billpick { margin-inline-start: 0; }
+  /* a phone's column is narrow: the avatar keeps its name beside it, the boxes give back their padding */
+  #view-users .lu-card { padding: 14px; }
+  .lu-user { padding: 10px; }
+  .lu-who { flex: 1 1 110px; }
+  .lu-dev { grid-template-columns: 10px minmax(0, 1fr); }
+  .lu-dev > .lu-dcell { grid-column: 2 / -1; }
+  .lu-use { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; }
+  /* the limits' grid keeps its three columns, narrower: a cell's two speeds one over the other */
+  .lu-sect { padding: 10px; }
+  .lu-limits { gap: 6px 5px; }
+  .lu-slow { flex-direction: column; }
+  /* the dialog nearly edge to edge on a phone, its foot still on screen */
+  .lu-overlay { padding: 10px; }
+  .lu-overlay .lu-modal { max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px); }
+}

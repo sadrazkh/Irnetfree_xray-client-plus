@@ -320,4 +320,4 @@ function withAddress(server, ip) {
   return applyTarget(server, { addr: ip });
 }
 
-module.exports = { SUPPORTED_PROTOCOLS: SUPPORTED.slice(), dialOf, transportOf, sniSupport, applyTarget, withAddress };
+module.exports = { SUPPORTED_PROTOCOLS: SUPPORTED.slice(), dialOf, transportOf, sniSupport, applyTarget, withAddress, protocolOf, mirrorIntoJson };

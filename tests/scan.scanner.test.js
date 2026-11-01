@@ -31,12 +31,12 @@ const until = async (pred, ms = 5000, what = 'condition') => {
   const t0 = Date.now();
   while (!pred()) { if (Date.now() - t0 > ms) throw new Error(`${what} not met within ${ms}ms`); await tick(5); }
 };
-const RESULT_KEYS = ['addr', 'delay', 'down', 'engine', 'error', 'ip', 'key', 'phase', 'port', 'score', 'sni', 'tcp', 'up'];
+const RESULT_KEYS = ['addr', 'delay', 'down', 'engine', 'error', 'ip', 'key', 'phase', 'port', 'reason', 'score', 'sni', 'tcp', 'up'];
 /** The fake rig's cores never listen: the readiness wait is answered at once. */
 const ready = async () => true;
 /** A stored SOCKS proxy: nothing a target can be put into (the scan's one refusal left, with JSON chains). */
 const SOCKS = Object.assign(parseLink('socks://1.2.3.4:1080#socks'), { id: 'sv-socks' });
-const PROGRESS_KEYS = ['alive', 'done', 'etaMs', 'speedDone', 'speedTotal', 'stage', 'total'];
+const PROGRESS_KEYS = ['alive', 'done', 'etaMs', 'reasons', 'speedDone', 'speedTotal', 'stage', 'total'];
 
 /* ----------------------------- the fake rig ----------------------------- */
 
@@ -189,13 +189,13 @@ test('engines run side by side: up to coresInParallel cores alive at once, never
 
 test('never more than filterConcurrency probes in flight inside a batch; the v2.0 name `concurrency` still means that', async () => {
   const rig = fakeRig({ probeMs: 15 });
-  await run(rig, { opts: { batch: 20, filterConcurrency: 2, speedTop: 0 } }).promise;
+  await run(rig, { opts: { batch: 20, filterConcurrency: 2, prefilterConcurrency: 2, speedTop: 0 } }).promise;
   assert.equal(rig.peak.filter, 2);
 
   const legacy = fakeRig({ probeMs: 15 });
   await runScan({
     server: F.VLESS_WS_TLS, ips: IPS, engines: ['xray'], tests: { tcp: true, delay: true, down: false, up: false },
-    opts: { batch: 20, concurrency: 3, probes: legacy.probes, getFreePorts: legacy.getFreePorts, waitReady: ready },
+    opts: { batch: 20, concurrency: 3, prefilterConcurrency: 3, probes: legacy.probes, getFreePorts: legacy.getFreePorts, waitReady: ready },
     xray: legacy.xray
   });
   assert.equal(legacy.peak.filter, 3, 'a caller that only knows `concurrency` gets it, not the 16 default');
@@ -306,19 +306,26 @@ test('a failed TCP connect ends the row; a tunnel that never answers is alive to
   assert.equal(progress.at(-1).alive, 3);
 });
 
-test('results are sorted by score desc, then median delay asc', async () => {
-  const mbps = { '1.1.1.1': 1, '1.1.1.2': 9, '1.1.1.3': 9, '1.1.1.4': 3, '1.1.1.5': 0.5 };
-  const rig = fakeRig({
-    mbps: (ip) => mbps[ip],
-    delay: (ip) => (ip === '1.1.1.3' ? delayStats([20, 20, 20]) : delayStats([80, 80, 80]))
-  });
+test('results rank by success first, then the median delay, then the jitter — the download does not reorder them', async () => {
+  const mbps = { '1.1.1.1': 50, '1.1.1.2': 1, '1.1.1.3': 9, '1.1.1.4': 3, '1.1.1.5': 99 };
+  const series = {
+    '1.1.1.1': [20, 20, -1],        // fast, but a third lost
+    '1.1.1.2': [80, 80, 80],
+    '1.1.1.3': [100, 100, 100],
+    '1.1.1.4': [40, 80, 120],       // the same median as .2, more jitter
+    '1.1.1.5': [10, -1, -1]         // one lucky answer: not a pass
+  };
+  const rig = fakeRig({ mbps: (ip) => mbps[ip], delay: (ip) => delayStats(series[ip]) });
   const { promise } = run(rig, { opts: { batch: 20, speedTop: 5 } });
   const { results } = await promise;
-  assert.deepEqual(results.map(r => r.ip), ['1.1.1.3', '1.1.1.2', '1.1.1.4', '1.1.1.1', '1.1.1.5']);
-  for (let i = 1; i < results.length; i++) assert.ok(results[i - 1].score >= results[i].score);
-  const a = { score: 5, delay: { loss: 0, median: 30 } }, b = { score: 5, delay: { loss: 0, median: 20 } };
-  assert.ok(byRank(a, b) > 0, 'equal score: the lower median first');
-  assert.ok(byRank({ score: 5, delay: null }, b) > 0, 'no delay sorts after one');
+  assert.deepEqual(results.map(r => r.ip), ['1.1.1.2', '1.1.1.4', '1.1.1.3', '1.1.1.1', '1.1.1.5']);
+  assert.equal(results.find(r => r.ip === '1.1.1.5').score, 0);
+  assert.equal(results.find(r => r.ip === '1.1.1.5').phase, 1, 'a row that did not pass gets no speed test');
+  const a = { score: 10050, delay: { loss: 0, median: 30, jitter: 0 } }, b = { score: 10050, delay: { loss: 0, median: 20, jitter: 9 } };
+  assert.ok(byRank(a, b) > 0, 'the same step: the lower median first');
+  assert.ok(byRank({ score: 10050, delay: { loss: 0, median: 20, jitter: 1 } }, b) < 0, 'the same median: the lower jitter first');
+  assert.ok(byRank({ score: 10099, delay: null }, b) > 0, 'no delay sorts after one');
+  assert.ok(byRank({ score: 6799, delay: { loss: 1 / 3, median: 1, jitter: 0 } }, a) > 0, 'a lower success step loses whatever its latency');
 });
 
 /* ----------------------------- progress ----------------------------- */
@@ -341,10 +348,10 @@ test('progress: stage filter → speed → done, the counters, and an ETA once t
   assert.equal(filter[4].etaMs, 0, 'nothing left in the stage');
   assert.equal(filter[4].alive, 4);
 
-  assert.deepEqual(progress[5], { stage: 'speed', done: 5, total: 5, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null });
+  assert.deepEqual(progress[5], { stage: 'speed', done: 5, total: 5, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null, reasons: { 'no-tcp': 1 } });
   assert.deepEqual([progress[6].stage, progress[6].speedDone, progress[6].etaMs], ['speed', 1, null]);
   assert.deepEqual([progress[7].stage, progress[7].speedDone, progress[7].speedTotal, progress[7].etaMs], ['speed', 2, 2, 0]);
-  assert.deepEqual(progress[8], { stage: 'done', done: 5, total: 5, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0 });
+  assert.deepEqual(progress[8], { stage: 'done', done: 5, total: 5, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: { 'no-tcp': 1 } });
 });
 
 /* ----------------------------- stop ----------------------------- */
@@ -388,7 +395,8 @@ test('Stop in phase 2: no more transfers, every live core dies, the phase-1 rows
 
 test('Stop mid-probe kills the core early instead of waiting for the probes\' timeouts', async () => {
   const rig = fakeRig({ probeMs: 1500 });
-  const { promise, results, token } = run(rig, { opts: { batch: 20 } });
+  // no TCP pre-check: the core starts at once and the delay probes are what is in flight
+  const { promise, results, token } = run(rig, { tests: { tcp: false, delay: true, down: true, up: false }, opts: { batch: 20 } });
   const t0 = Date.now();
   await until(() => rig.cores.length === 1, 2000, 'core started');
   token.cancelled = true;
@@ -411,10 +419,11 @@ test('a core that fails to start in phase 1 marks that batch `error` and the run
   assert.deepEqual(failed.map(r => [r.ip, r.engine]).sort(), [['1.1.1.3', 'xray'], ['1.1.1.4', 'xray']]);
   for (const r of failed) {
     assert.equal(r.error, 'spawn failed');
-    assert.deepEqual([r.phase, r.tcp, r.delay, r.down, r.up, r.score], [1, null, null, null, null, 0]);
+    assert.equal(r.reason, 'core');
+    assert.deepEqual([r.phase, r.tcp, r.delay, r.down, r.up, r.score], [1, { ok: true, ms: 10 }, null, null, null, 0], 'the pre-check passed; the core did not start');
   }
   assert.equal(results.filter(r => r.engine === 'xray-pattn' && !r.error).length, 5);
-  assert.deepEqual(progress.at(-1), { stage: 'done', done: 10, total: 10, alive: 8, speedDone: 0, speedTotal: 0, etaMs: 0 });
+  assert.deepEqual(progress.at(-1), { stage: 'done', done: 10, total: 10, alive: 8, speedDone: 0, speedTotal: 0, etaMs: 0, reasons: { core: 2 } });
   assert.equal(out.results.at(-1).error, 'spawn failed', 'errors sort last');
 });
 
@@ -475,10 +484,10 @@ test('runSpeed: phase 2 alone on the rows given, in the speed stage from the sta
   assert.equal(a.down.mbps, 5);
   const b = results.find(r => r.ip === '1.1.1.2');
   assert.deepEqual([b.tcp, b.delay, b.down.mbps], [null, null, 5]);
-  assert.equal(b.score, 500, 'download alone is the base when no delay came along');
+  assert.equal(b.score, 10094, 'no delay came along: a full success ranked by the download’s first byte (10 ms)');
   assert.ok(a.score < b.score && a.score > 0);
-  assert.deepEqual(progress[0], { stage: 'speed', done: 2, total: 2, alive: 2, speedDone: 0, speedTotal: 2, etaMs: null });
-  assert.deepEqual(progress.at(-1), { stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0 });
+  assert.deepEqual(progress[0], { stage: 'speed', done: 2, total: 2, alive: 2, speedDone: 0, speedTotal: 2, etaMs: null, reasons: {} });
+  assert.deepEqual(progress.at(-1), { stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: {} });
   assert.equal(out.results.length, 2);
   assert.equal(out.cancelled, false);
 });
@@ -517,11 +526,11 @@ function setup(spec = {}, extra = {}) {
 }
 
 const progressOf = (events) => events.filter(e => e.ch === 'scan-progress').map(e => e.payload);
-const EVENT_KEYS = ['alive', 'done', 'etaMs', 'runId', 'speedDone', 'speedTotal', 'stage', 'total'];
+const EVENT_KEYS = ['alive', 'done', 'etaMs', 'reasons', 'runId', 'speedDone', 'speedTotal', 'stage', 'total'];
 
-test('register() puts exactly the nine scan channels on the context', () => {
+test('register() puts exactly the twelve scan channels on the context', () => {
   const s = setup();
-  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:export', 'scan:forget', 'scan:links', 'scan:presets', 'scan:retest', 'scan:start', 'scan:stop', 'scan:suggest']);
+  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:copy', 'scan:export', 'scan:forget', 'scan:links', 'scan:plan', 'scan:presets', 'scan:retest', 'scan:sets', 'scan:start', 'scan:stop', 'scan:suggest']);
   assert.equal(s.scan.busy(), false);
 });
 
@@ -530,9 +539,9 @@ test('scan:presets — the Cloudflare ranges, the exact defaults, the three pres
   const p = await s.handlers['scan:presets']();
   assert.equal(p.cfRanges.length, 15);
   const balanced = {
-    batch: 20, filterConcurrency: 16, coresInParallel: 2, delaySamples: 2,
-    tcpTimeout: 2000, delayTimeout: 4000,
-    delayHost: 'cp.cloudflare.com', delayPort: 80, delayPath: '/',
+    batch: 20, filterConcurrency: 16, prefilterConcurrency: 128, coresInParallel: 2, delaySamples: 3, passRatio: 0.66,
+    tcpTimeout: 2000, delayTimeout: 4000, prefilterTls: false,
+    delayHost: 'cp.cloudflare.com', delayPort: 80, delayPath: '/', delayExpect: '204',
     speedTop: 10, speedConcurrency: 1, speedRounds: 1, warmupMs: 300,
     downBytes: 10e6, downMaxMs: 6000, downTimeout: 8000,
     downHost: 'speed.cloudflare.com', downPath: '/__down?bytes=10000000', downPort: 443, downTls: true,
@@ -541,8 +550,8 @@ test('scan:presets — the Cloudflare ranges, the exact defaults, the three pres
   };
   assert.deepEqual(p.defaults, balanced);
   assert.deepEqual(p.presets.balanced, balanced, 'balanced is the defaults');
-  assert.deepEqual(p.presets.fast, Object.assign({}, balanced, { delaySamples: 1, tcpTimeout: 1500, delayTimeout: 3000, filterConcurrency: 32, coresInParallel: 3, speedTop: 5 }));
-  assert.deepEqual(p.presets.accurate, Object.assign({}, balanced, { delaySamples: 4, filterConcurrency: 8, speedTop: 20, speedRounds: 2, speedConcurrency: 1 }));
+  assert.deepEqual(p.presets.fast, Object.assign({}, balanced, { delaySamples: 2, tcpTimeout: 1500, delayTimeout: 3000, filterConcurrency: 24, prefilterConcurrency: 256, coresInParallel: 3, speedTop: 5 }));
+  assert.deepEqual(p.presets.accurate, Object.assign({}, balanced, { delaySamples: 5, filterConcurrency: 8, prefilterConcurrency: 64, tcpTimeout: 3000, speedTop: 20, speedRounds: 2, speedConcurrency: 1 }));
   for (const [name, preset] of Object.entries(p.presets)) assert.deepEqual(sanitizeOpts(preset), preset, name + ' is a full, in-range opts object');
   assert.deepEqual(PRESET_DEFAULTS, balanced);
   assert.equal(p.last, null);
@@ -551,7 +560,10 @@ test('scan:presets — the Cloudflare ranges, the exact defaults, the three pres
     { id: 'xray-pattn', label: 'Xray-PattN (patterniha)', installed: false }
   ]);
   assert.equal(p.tested, 0, 'nothing tested yet');
-  assert.deepEqual(Object.keys(p).sort(), ['cfRanges', 'defaults', 'engines', 'last', 'presets', 'ranges', 'tested']);
+  assert.deepEqual(Object.keys(p).sort(), ['cfRanges', 'defaults', 'dimensions', 'engines', 'last', 'limits', 'presets', 'ranges', 'sets', 'tested']);
+  assert.deepEqual(p.dimensions.map((d) => d.id), ['fingerprint', 'alpn', 'cipherSuites', 'fragment', 'finalMask', 'dialMode', 'mux', 'xhttpMode']);
+  assert.deepEqual([p.limits.variants, p.limits.sampleMax, p.limits.pick], [300, 1000000, { mode: 'all', perRange: 20, count: 1000, fresh: true }]);
+  assert.deepEqual(p.sets, []);
   assert.deepEqual(Object.keys(p.ranges).sort(), ['cf', 'cf-plain-ports', 'cf-tls-ports', 'warp-masque', 'warp-wg']);
 });
 
@@ -596,14 +608,15 @@ test('scan:start runs in the background and streams scan-progress: one event per
     assert.equal(p.result.phase, 1);
     assert.equal(p.finished, undefined);
   });
-  assert.deepEqual(ev[6], { runId: reply.runId, stage: 'done', done: 6, total: 6, alive: 6, speedDone: 0, speedTotal: 0, etaMs: 0, finished: true, cancelled: false });
+  assert.deepEqual(ev[6], { runId: reply.runId, stage: 'done', done: 6, total: 6, alive: 6, speedDone: 0, speedTotal: 0, etaMs: 0, reasons: {}, finished: true, cancelled: false });
   assert.equal(s.scan.busy(), false);
   assert.deepEqual(s.rig.calls.map(c => c.engine).sort(), ['xray', 'xray', 'xray-pattn', 'xray-pattn']);
 
   // the last request is remembered without results, with the engines it actually ran and the v2.1 option names
   const last = s.data.scan;
-  assert.deepEqual(Object.keys(last).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests']);
-  assert.deepEqual(last.pick, { mode: 'all', perRange: 20, fresh: true }, 'a request without a pick is every address');
+  assert.deepEqual(Object.keys(last).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'variants']);
+  assert.deepEqual(last.pick, { mode: 'all', perRange: 20, count: 1000, fresh: true }, 'a request without a pick is every address');
+  assert.deepEqual(last.variants, { dims: {}, limit: 300 }, 'no parameter dimensions: the plain run');
   assert.equal(last.serverId, 'sv-vless');
   assert.equal(last.ipsText, req.ipsText);
   assert.deepEqual(last.engines, ['xray', 'xray-pattn']);
@@ -629,10 +642,10 @@ test('scan:start with a download ticked: a stage event without a result when pha
     ['speed', 2, false], ['speed', 2, false],
     ['done', null, true]
   ]);
-  assert.deepEqual(ev[4], { runId: reply.runId, stage: 'speed', done: 4, total: 4, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null });
+  assert.deepEqual(ev[4], { runId: reply.runId, stage: 'speed', done: 4, total: 4, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null, reasons: {} });
   assert.deepEqual(ev[5].result.ip, '1.1.1.1');
   assert.ok(ev[5].result.down.ok);
-  assert.deepEqual(ev[7], { runId: reply.runId, stage: 'done', done: 4, total: 4, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0, finished: true, cancelled: false });
+  assert.deepEqual(ev[7], { runId: reply.runId, stage: 'done', done: 4, total: 4, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: {}, finished: true, cancelled: false });
 });
 
 test('scan:start with a pasted link and no engines list runs on every installed core; out-of-range options are clamped', async () => {
@@ -649,7 +662,7 @@ test('scan:start with a pasted link and no engines list runs on every installed 
   const o = s.data.scan.opts;
   assert.deepEqual(
     [o.filterConcurrency, o.batch, o.delaySamples, o.speedTop, o.coresInParallel, o.speedConcurrency, o.speedRounds, o.warmupMs, o.tcpTimeout, o.delayTimeout],
-    [64, 1, 2, 50, 1, 4, 1, 2000, 500, 60000]
+    [64, 1, 3, 50, 1, 4, 1, 2000, 500, 60000]
   );
   const rows = progressOf(s.events).filter(p => p.result).map(p => p.result);
   assert.deepEqual(rows.map(r => r.phase), [1, 2], 'tests default to tcp+delay+down');
@@ -716,7 +729,7 @@ test('scan:retest runs phase 2 alone on the rows given, in the speed stage from 
     assert.equal(p.result.phase, 2);
     assert.ok(p.result.down.ok && p.result.up.ok);
   });
-  assert.deepEqual(ev[2], { runId: reply.runId, stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0, finished: true, cancelled: false });
+  assert.deepEqual(ev[2], { runId: reply.runId, stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: {}, finished: true, cancelled: false });
   const a = ev.find(p => p.result && p.result.ip === '1.1.1.1').result;
   assert.equal(a.delay.median, 40);
   assert.equal(downs(s.rig).length, 4, 'two rounds per row');
@@ -772,14 +785,14 @@ test('scan:export — CSV with the exact header, the phase and the median, empty
   const results = [
     { ip: '1.1.1.1', engine: 'xray', phase: 2, tcp: { ok: true, ms: 12 }, delay: { min: 40, median: 45, avg: 45.5, jitter: 2.5, loss: 0, samples: [40, 51] }, down: { ok: true, bytes: 1, ms: 1, ttfb: 1, mbps: 12.34, mbpsRaw: 11, warm: true, error: null }, up: null, score: 987.6, error: null },
     { ip: '1.1.1.2', engine: 'xray-pattn', tcp: { ok: false, ms: -1, error: 'timeout' }, delay: null, down: null, up: null, score: 0, error: null },
-    { ip: '1.1.1.3', engine: 'xray', phase: 1, tcp: null, delay: { min: 0, median: 0, avg: 0, jitter: 0, loss: 1, samples: [-1] }, down: { ok: false, bytes: 0, ms: -1, ttfb: -1, mbps: 0, mbpsRaw: 0, warm: false, error: 'timeout' }, up: { ok: true, bytes: 2, ms: 2, ttfb: 2, mbps: 1.5, error: null }, score: 0, error: 'spawn failed, "quoted"' }
+    { ip: '1.1.1.3', engine: 'xray', phase: 1, tcp: null, delay: { min: 0, median: 0, avg: 0, jitter: 0, loss: 1, samples: [-1] }, down: { ok: false, bytes: 0, ms: -1, ttfb: -1, mbps: 0, mbpsRaw: 0, warm: false, error: 'timeout' }, up: { ok: true, bytes: 2, ms: 2, ttfb: 2, mbps: 1.5, error: null }, score: 0, error: 'spawn failed, "quoted"', variant: 'fp=firefox~alpn=h2', variantLabel: 'fp=firefox · alpn=h2', reason: 'core' }
   ];
   const csv = await s.handlers['scan:export']({ format: 'csv', results });
   const lines = csv.split('\r\n');
-  assert.equal(lines[0], 'addr,port,sni,engine,phase,tcp_ms,delay_min,delay_median,delay_avg,jitter,loss,down_mbps,up_mbps,score,error');
-  assert.equal(lines[1], '1.1.1.1,,,xray,2,12,40,45,45.5,2.5,0,12.34,,987.6,', 'a v2 row (ip, no port or SNI) still exports');
-  assert.equal(lines[2], '1.1.1.2,,,xray-pattn,1,,,,,,,,,0,', 'a row without a phase is a phase-1 row');
-  assert.equal(lines[3], '1.1.1.3,,,xray,1,,,,,,1,,1.5,0,"spawn failed, ""quoted"""');
+  assert.equal(lines[0], 'addr,port,sni,engine,phase,tcp_ms,delay_min,delay_median,delay_avg,jitter,loss,down_mbps,up_mbps,score,error,variant,reason');
+  assert.equal(lines[1], '1.1.1.1,,,xray,2,12,40,45,45.5,2.5,0,12.34,,987.6,,,', 'a v2 row (ip, no port or SNI) still exports');
+  assert.equal(lines[2], '1.1.1.2,,,xray-pattn,1,,,,,,,,,0,,,', 'a row without a phase is a phase-1 row');
+  assert.equal(lines[3], '1.1.1.3,,,xray,1,,,,,,1,,1.5,0,"spawn failed, ""quoted""",fp=firefox · alpn=h2,core');
   assert.equal(lines[4], '');
   assert.equal(lines.length, 5);
 
@@ -798,21 +811,21 @@ test('scan:start with a random pick draws perRange from every range, remembers t
   const req = { serverId: 'sv-vless', ipsText: '1.1.1.0/30\n2.2.2.0/30', pick: { mode: 'random', perRange: 2 }, tests: FILTER_ONLY, opts: { batch: 20 } };
   const reply = await s.handlers['scan:start'](req);
   assert.equal(reply.total, 4, '2 per range × 2 ranges × 1 engine');
-  assert.deepEqual(reply.pick, { mode: 'random', perRange: 2, fresh: true });
+  assert.deepEqual(reply.pick, { mode: 'random', perRange: 2, count: 1000, fresh: true });
   assert.deepEqual([reply.ranges, reply.exhausted, reply.truncated], [2, 0, false]);
   await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
   const ips = s.rig.cores[0].ips.slice().sort();
   assert.equal(ips.length, 4);
   assert.equal(ips.filter(ip => ip.startsWith('1.1.1.')).length, 2);
   assert.equal(ips.filter(ip => ip.startsWith('2.2.2.')).length, 2);
-  assert.deepEqual(s.data.scan.pick, { mode: 'random', perRange: 2, fresh: true }, 'the pick is part of the remembered request');
-  assert.deepEqual(Object.keys(s.data.scan).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests']);
+  assert.deepEqual(s.data.scan.pick, { mode: 'random', perRange: 2, count: 1000, fresh: true }, 'the pick is part of the remembered request');
+  assert.deepEqual(Object.keys(s.data.scan).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'variants']);
   // the history: the four addresses, as integers, and the count in presets
   assert.equal(s.data.scanTested.length, 4);
   assert.ok(s.data.scanTested.every(n => typeof n === 'string'), 'v3 keeps normalised strings');
   assert.deepEqual(s.data.scanTested.slice().sort(), ips);
   assert.equal((await s.handlers['scan:presets']()).tested, 4);
-  assert.ok(s.logs.some(l => /fresh draw of 2 per range from 2 range\(s\), 0 tested before skipped/.test(l.line)), s.logs.map(l => l.line).join('\n'));
+  assert.ok(s.logs.some(l => /4 of 8 address\(es\), 2 from each of 2 range\(s\), 0 tested before skipped/.test(l.line)), s.logs.map(l => l.line).join('\n'));
 });
 
 test('a later random run skips the addresses tested before; once a range has run out it repeats and says so; forget empties the history', async () => {
@@ -848,7 +861,7 @@ test('a later random run skips the addresses tested before; once a range has run
   assert.equal(fourth.total, 4);
   assert.equal(fourth.exhausted, 0);
   await done();
-  assert.ok(s.logs.some(l => /fresh draw of 4 per range from 1 range\(s\)$/.test(l.line)));
+  assert.ok(s.logs.some(l => /4 of 4 address\(es\), 4 from each of 1 range\(s\)$/.test(l.line)));
 
   assert.deepEqual(await s.handlers['scan:forget'](), { ok: true, tested: 0 });
   assert.deepEqual(s.data.scanTested, []);
@@ -864,14 +877,15 @@ test('a plain (v2.1) request reads as pick `all`, still records what it tested, 
   const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS] });
   s.data.scanTested = [ip4ToInt('9.9.9.9'), 'junk', -1, 2 ** 32];
   const reply = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '1.1.1.1\n1.1.1.2', tests: FILTER_ONLY });
-  assert.deepEqual(reply.pick, { mode: 'all', perRange: 20, fresh: true });
-  assert.deepEqual([reply.ranges, reply.exhausted], [0, 0]);
+  assert.deepEqual(reply.pick, { mode: 'all', perRange: 20, count: 1000, fresh: true });
+  assert.deepEqual([reply.ranges, reply.exhausted, reply.addresses], [2, 0, { total: 2, taken: 2 }]);
   await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
-  assert.deepEqual(s.data.scan.pick, { mode: 'all', perRange: 20, fresh: true });
+  assert.deepEqual(s.data.scan.pick, { mode: 'all', perRange: 20, count: 1000, fresh: true });
   assert.equal(s.data.scanTested[0], '9.9.9.9', 'a v2.2 integer is read back as its address and stays first');
   assert.deepEqual(s.data.scanTested.slice(1).sort(), ['1.1.1.1', '1.1.1.2'], 'bad entries dropped, the run’s addresses added');
-  assert.deepEqual(sanitizePick({ mode: 'random', perRange: 0, fresh: 0 }), { mode: 'random', perRange: 1, fresh: false }, 'clamped, like every other number');
-  assert.deepEqual(sanitizePick({ mode: 'weird', perRange: 99999 }), { mode: 'all', perRange: 5000, fresh: true });
+  assert.deepEqual(sanitizePick({ mode: 'random', perRange: 0, fresh: 0 }), { mode: 'random', perRange: 1, count: 1000, fresh: false }, 'clamped, like every other number');
+  assert.deepEqual(sanitizePick({ mode: 'weird', perRange: 99999 }), { mode: 'all', perRange: 99999, count: 1000, fresh: true }, 'no 5000 cap any more');
+  assert.deepEqual(sanitizePick({ mode: 'sample', count: 5e9 }), { mode: 'sample', perRange: 20, count: 1000000, fresh: true }, 'a sample stops at MAX_SAMPLE');
   assert.deepEqual(sanitizePick(null), PICK_DEFAULTS);
 });
 
