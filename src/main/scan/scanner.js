@@ -34,7 +34,7 @@ const { buildMultiTestConfig } = require('../configBuilder');
 const { getFreePorts: realGetFreePorts } = require('../xrayManager');
 const { tcpPing, pLimit } = require('../netutils');
 const { applyTarget } = require('./substitute');
-const { scoreResult, delayStats } = require('./score');
+const { scoreResult, delayStats, passes } = require('./score');
 const probesMod = require('./probes');
 
 const SCAN_DEFAULTS = {
@@ -72,16 +72,22 @@ function emptyResult(target, engine, phase = 1) {
 
 const keyOf = (r) => `${r.key}|${r.engine}`;
 
-/** Score desc, then median delay asc; rows with no usable delay sort after those with one. */
+/**
+ * The owner's order (score.js): the success step first (score / 100, whole),
+ * then the median delay, then the jitter, then whatever is left of the score;
+ * a row with no usable delay sorts after one with it.
+ */
 const medianOf = (r) => (r.delay && r.delay.loss < 1 ? r.delay.median : Number.MAX_SAFE_INTEGER);
+const jitterOf = (r) => (r.delay && r.delay.loss < 1 ? r.delay.jitter || 0 : Number.MAX_SAFE_INTEGER);
+const stepOf = (r) => Math.floor((Number(r.score) || 0) / 100);
 function byRank(a, b) {
-  return (b.score - a.score) || (medianOf(a) - medianOf(b)) || 0;
+  return (stepOf(b) - stepOf(a)) || (medianOf(a) - medianOf(b)) || (jitterOf(a) - jitterOf(b)) || ((b.score || 0) - (a.score || 0)) || 0;
 }
 
-/** A row that passed phase 1: it answered whatever phase 1 asked of it. */
-function isAlive(r, tests) {
+/** A row that passed phase 1: it answered whatever phase 1 asked of it — a delay series, passRatio of it. */
+function isAlive(r, tests, passRatio) {
   if (r.error) return false;
-  if (tests.delay) return !!(r.delay && r.delay.loss < 1);
+  if (tests.delay) return passes(r.delay, passRatio);
   if (tests.tcp && r.tcp && !r.tcp.skipped) return !!r.tcp.ok;
   return true;
 }
@@ -159,7 +165,7 @@ function makeContext(args) {
     onResult: args.onResult
   };
   ctx.emit = (r) => {
-    r.score = r.error ? 0 : scoreResult(r);
+    r.score = r.error ? 0 : scoreResult(r, { passRatio: o.passRatio });
     ctx.latest.set(keyOf(r), r);
     ctx.progress.row(r, tests);
     if (ctx.onResult) ctx.onResult(r);
