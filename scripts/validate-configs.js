@@ -37,7 +37,7 @@ const { buildMultiTestConfig } = require('../src/main/configBuilder');
 const { adaptForCore } = require('../src/main/coreCompat');
 const { parseLink, parseMany, createServer } = require('../src/main/parser');
 const { SUGGESTED } = require('../src/main/coreVersions');
-const { usesMasque, usesMasqueWarp, versionBelow, MASQUE_SINCE, MASQUE_WARP_SINCE, PATTN_OOB_SINCE } = require('../src/main/xrayManager');
+const { usesMasque, usesMasqueWarp, versionBelow, MASQUE_SINCE, MASQUE_WARP_SINCE, PATTN_OOB_SINCE, PLAINTEXT_REJECT } = require('../src/main/xrayManager');
 const { applyTarget, sniSupport } = require('../src/main/scan/substitute');
 const F = require('../tests/fixtures');
 
@@ -65,7 +65,7 @@ console.log(`${path.basename(exe)} ${version}${DRY ? ' — dry run: every config
 const work = process.env.IRNF_VALIDATE_OUT || fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-validate-'));
 fs.mkdirSync(work, { recursive: true });
 const assetDir = path.dirname(exe);
-let failed = 0, total = 0, skipped = 0, forkSkipped = 0;
+let failed = 0, total = 0, skipped = 0, forkSkipped = 0, plainToFork = 0;
 
 /** One config: written for this core's version, then `run -test` — dry, only written. */
 function check(name, cfg) {
@@ -84,9 +84,19 @@ function check(name, cfg) {
     encoding: 'utf8', timeout: 15000, windowsHide: true
   });
   if (r.status === 0) { console.log('ok   ' + path.basename(file)); return; }
+  const said = ((r.stdout || '') + (r.stderr || '')).trim();
+  // The official core refuses VLESS/Trojan without TLS to a public address (26.10.31 measured it on the
+  // server tab's plaintext bridge links). The server tab runs such a config on Xray-PattN, as the client
+  // does (xserver/core.js, xrayManager's validateWithFallback) — so here it is that core's to prove: the
+  // PattN step (IRNF_XRAY_FORK=pattn) takes the same shape with no such allowance.
+  if (!FORK && PLAINTEXT_REJECT.test(said)) {
+    plainToFork++;
+    console.log(`fork ${path.basename(file)} — the official core refuses plaintext to a public address; it runs on Xray-PattN, whose step proves it`);
+    return;
+  }
   failed++;
   console.log('FAIL ' + path.basename(file));
-  console.log('     ' + ((r.stdout || '') + (r.stderr || '')).trim().split(/\r?\n/).slice(-3).join('\n     '));
+  console.log('     ' + said.split(/\r?\n/).slice(-3).join('\n     '));
 }
 
 // Server-tab shapes (plus): every golden inbound, the exit through a stored
@@ -314,6 +324,6 @@ if (DRY) {
   console.log(`\n${total} configs built for xray ${version} (${srvTotal} server shapes, ${scanTotal} scan shapes) in ${work} — no core was run`);
   process.exit(0);
 }
-const by = `${path.basename(exe)} ${version} (${srvTotal - srvFailed}/${srvTotal} server shapes, ${scanTotal - scanFailed}/${scanTotal} scan shapes${skipped ? `, ${skipped} MASQUE shape(s) skipped: this core is older than MASQUE` : ''}${forkSkipped ? `, ${forkSkipped} Xray-PattN shape(s) skipped: IRNF_XRAY_FORK=pattn runs them` : ''})`;
+const by = `${path.basename(exe)} ${version} (${srvTotal - srvFailed}/${srvTotal} server shapes, ${scanTotal - scanFailed}/${scanTotal} scan shapes${skipped ? `, ${skipped} MASQUE shape(s) skipped: this core is older than MASQUE` : ''}${forkSkipped ? `, ${forkSkipped} Xray-PattN shape(s) skipped: IRNF_XRAY_FORK=pattn runs them` : ''}${plainToFork ? `, ${plainToFork} plaintext shape(s) left to Xray-PattN: the official core refuses them` : ''})`;
 console.log(`\n${total - failed}/${total} configs accepted by ${by}`);
 process.exit(failed ? 1 : 0);
