@@ -31,12 +31,12 @@ const until = async (pred, ms = 5000, what = 'condition') => {
   const t0 = Date.now();
   while (!pred()) { if (Date.now() - t0 > ms) throw new Error(`${what} not met within ${ms}ms`); await tick(5); }
 };
-const RESULT_KEYS = ['addr', 'delay', 'down', 'engine', 'error', 'ip', 'key', 'phase', 'port', 'score', 'sni', 'tcp', 'up'];
+const RESULT_KEYS = ['addr', 'delay', 'down', 'engine', 'error', 'ip', 'key', 'phase', 'port', 'reason', 'score', 'sni', 'tcp', 'up'];
 /** The fake rig's cores never listen: the readiness wait is answered at once. */
 const ready = async () => true;
 /** A stored SOCKS proxy: nothing a target can be put into (the scan's one refusal left, with JSON chains). */
 const SOCKS = Object.assign(parseLink('socks://1.2.3.4:1080#socks'), { id: 'sv-socks' });
-const PROGRESS_KEYS = ['alive', 'done', 'etaMs', 'speedDone', 'speedTotal', 'stage', 'total'];
+const PROGRESS_KEYS = ['alive', 'done', 'etaMs', 'reasons', 'speedDone', 'speedTotal', 'stage', 'total'];
 
 /* ----------------------------- the fake rig ----------------------------- */
 
@@ -189,13 +189,13 @@ test('engines run side by side: up to coresInParallel cores alive at once, never
 
 test('never more than filterConcurrency probes in flight inside a batch; the v2.0 name `concurrency` still means that', async () => {
   const rig = fakeRig({ probeMs: 15 });
-  await run(rig, { opts: { batch: 20, filterConcurrency: 2, speedTop: 0 } }).promise;
+  await run(rig, { opts: { batch: 20, filterConcurrency: 2, prefilterConcurrency: 2, speedTop: 0 } }).promise;
   assert.equal(rig.peak.filter, 2);
 
   const legacy = fakeRig({ probeMs: 15 });
   await runScan({
     server: F.VLESS_WS_TLS, ips: IPS, engines: ['xray'], tests: { tcp: true, delay: true, down: false, up: false },
-    opts: { batch: 20, concurrency: 3, probes: legacy.probes, getFreePorts: legacy.getFreePorts, waitReady: ready },
+    opts: { batch: 20, concurrency: 3, prefilterConcurrency: 3, probes: legacy.probes, getFreePorts: legacy.getFreePorts, waitReady: ready },
     xray: legacy.xray
   });
   assert.equal(legacy.peak.filter, 3, 'a caller that only knows `concurrency` gets it, not the 16 default');
@@ -348,10 +348,10 @@ test('progress: stage filter → speed → done, the counters, and an ETA once t
   assert.equal(filter[4].etaMs, 0, 'nothing left in the stage');
   assert.equal(filter[4].alive, 4);
 
-  assert.deepEqual(progress[5], { stage: 'speed', done: 5, total: 5, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null });
+  assert.deepEqual(progress[5], { stage: 'speed', done: 5, total: 5, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null, reasons: { 'no-tcp': 1 } });
   assert.deepEqual([progress[6].stage, progress[6].speedDone, progress[6].etaMs], ['speed', 1, null]);
   assert.deepEqual([progress[7].stage, progress[7].speedDone, progress[7].speedTotal, progress[7].etaMs], ['speed', 2, 2, 0]);
-  assert.deepEqual(progress[8], { stage: 'done', done: 5, total: 5, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0 });
+  assert.deepEqual(progress[8], { stage: 'done', done: 5, total: 5, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: { 'no-tcp': 1 } });
 });
 
 /* ----------------------------- stop ----------------------------- */
@@ -395,7 +395,8 @@ test('Stop in phase 2: no more transfers, every live core dies, the phase-1 rows
 
 test('Stop mid-probe kills the core early instead of waiting for the probes\' timeouts', async () => {
   const rig = fakeRig({ probeMs: 1500 });
-  const { promise, results, token } = run(rig, { opts: { batch: 20 } });
+  // no TCP pre-check: the core starts at once and the delay probes are what is in flight
+  const { promise, results, token } = run(rig, { tests: { tcp: false, delay: true, down: true, up: false }, opts: { batch: 20 } });
   const t0 = Date.now();
   await until(() => rig.cores.length === 1, 2000, 'core started');
   token.cancelled = true;
@@ -418,10 +419,11 @@ test('a core that fails to start in phase 1 marks that batch `error` and the run
   assert.deepEqual(failed.map(r => [r.ip, r.engine]).sort(), [['1.1.1.3', 'xray'], ['1.1.1.4', 'xray']]);
   for (const r of failed) {
     assert.equal(r.error, 'spawn failed');
-    assert.deepEqual([r.phase, r.tcp, r.delay, r.down, r.up, r.score], [1, null, null, null, null, 0]);
+    assert.equal(r.reason, 'core');
+    assert.deepEqual([r.phase, r.tcp, r.delay, r.down, r.up, r.score], [1, { ok: true, ms: 10 }, null, null, null, 0], 'the pre-check passed; the core did not start');
   }
   assert.equal(results.filter(r => r.engine === 'xray-pattn' && !r.error).length, 5);
-  assert.deepEqual(progress.at(-1), { stage: 'done', done: 10, total: 10, alive: 8, speedDone: 0, speedTotal: 0, etaMs: 0 });
+  assert.deepEqual(progress.at(-1), { stage: 'done', done: 10, total: 10, alive: 8, speedDone: 0, speedTotal: 0, etaMs: 0, reasons: { core: 2 } });
   assert.equal(out.results.at(-1).error, 'spawn failed', 'errors sort last');
 });
 
@@ -484,8 +486,8 @@ test('runSpeed: phase 2 alone on the rows given, in the speed stage from the sta
   assert.deepEqual([b.tcp, b.delay, b.down.mbps], [null, null, 5]);
   assert.equal(b.score, 10094, 'no delay came along: a full success ranked by the download’s first byte (10 ms)');
   assert.ok(a.score < b.score && a.score > 0);
-  assert.deepEqual(progress[0], { stage: 'speed', done: 2, total: 2, alive: 2, speedDone: 0, speedTotal: 2, etaMs: null });
-  assert.deepEqual(progress.at(-1), { stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0 });
+  assert.deepEqual(progress[0], { stage: 'speed', done: 2, total: 2, alive: 2, speedDone: 0, speedTotal: 2, etaMs: null, reasons: {} });
+  assert.deepEqual(progress.at(-1), { stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: {} });
   assert.equal(out.results.length, 2);
   assert.equal(out.cancelled, false);
 });
@@ -524,7 +526,7 @@ function setup(spec = {}, extra = {}) {
 }
 
 const progressOf = (events) => events.filter(e => e.ch === 'scan-progress').map(e => e.payload);
-const EVENT_KEYS = ['alive', 'done', 'etaMs', 'runId', 'speedDone', 'speedTotal', 'stage', 'total'];
+const EVENT_KEYS = ['alive', 'done', 'etaMs', 'reasons', 'runId', 'speedDone', 'speedTotal', 'stage', 'total'];
 
 test('register() puts exactly the nine scan channels on the context', () => {
   const s = setup();
@@ -603,7 +605,7 @@ test('scan:start runs in the background and streams scan-progress: one event per
     assert.equal(p.result.phase, 1);
     assert.equal(p.finished, undefined);
   });
-  assert.deepEqual(ev[6], { runId: reply.runId, stage: 'done', done: 6, total: 6, alive: 6, speedDone: 0, speedTotal: 0, etaMs: 0, finished: true, cancelled: false });
+  assert.deepEqual(ev[6], { runId: reply.runId, stage: 'done', done: 6, total: 6, alive: 6, speedDone: 0, speedTotal: 0, etaMs: 0, reasons: {}, finished: true, cancelled: false });
   assert.equal(s.scan.busy(), false);
   assert.deepEqual(s.rig.calls.map(c => c.engine).sort(), ['xray', 'xray', 'xray-pattn', 'xray-pattn']);
 
@@ -636,10 +638,10 @@ test('scan:start with a download ticked: a stage event without a result when pha
     ['speed', 2, false], ['speed', 2, false],
     ['done', null, true]
   ]);
-  assert.deepEqual(ev[4], { runId: reply.runId, stage: 'speed', done: 4, total: 4, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null });
+  assert.deepEqual(ev[4], { runId: reply.runId, stage: 'speed', done: 4, total: 4, alive: 4, speedDone: 0, speedTotal: 2, etaMs: null, reasons: {} });
   assert.deepEqual(ev[5].result.ip, '1.1.1.1');
   assert.ok(ev[5].result.down.ok);
-  assert.deepEqual(ev[7], { runId: reply.runId, stage: 'done', done: 4, total: 4, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0, finished: true, cancelled: false });
+  assert.deepEqual(ev[7], { runId: reply.runId, stage: 'done', done: 4, total: 4, alive: 4, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: {}, finished: true, cancelled: false });
 });
 
 test('scan:start with a pasted link and no engines list runs on every installed core; out-of-range options are clamped', async () => {
@@ -723,7 +725,7 @@ test('scan:retest runs phase 2 alone on the rows given, in the speed stage from 
     assert.equal(p.result.phase, 2);
     assert.ok(p.result.down.ok && p.result.up.ok);
   });
-  assert.deepEqual(ev[2], { runId: reply.runId, stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0, finished: true, cancelled: false });
+  assert.deepEqual(ev[2], { runId: reply.runId, stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0, reasons: {}, finished: true, cancelled: false });
   const a = ev.find(p => p.result && p.result.ip === '1.1.1.1').result;
   assert.equal(a.delay.median, 40);
   assert.equal(downs(s.rig).length, 4, 'two rounds per row');
