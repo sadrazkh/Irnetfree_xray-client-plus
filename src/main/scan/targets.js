@@ -568,6 +568,246 @@ function buildTargets(opts = {}) {
   return { targets, truncated };
 }
 
+/* ------------------------------- lazy spaces ------------------------------- */
+
+/*
+ * 2026-11-01 (the owner: "remove the 5000 cap — all of them, or N random from
+ * all of them together, or N from each range"). A run no longer receives a
+ * LIST of targets: it receives a SPACE, `{ size, at(i) }`, and walks it. An
+ * IPv4 range stays two integers however big it is — a /8 is 16,777,216
+ * addresses and none of them is ever put in an array — so "all of them" costs
+ * the time to test them and nothing to hold. A segment is a stretch of one
+ * kind with one port; the space finds index i's segment by binary search over
+ * their start offsets. IPv6 blocks cannot be walked (a /32 is 2^96) and stay
+ * sampled, v6PerRange of each, as before. A sample of N "from all of them
+ * together" is N distinct indices drawn uniformly over the whole space — each
+ * range weighted by its size by construction — kept as N numbers, not N
+ * addresses.
+ */
+
+/** The most a sample ("N random", "N from each range") takes: past it, "all of them" walks without a list. */
+const MAX_SAMPLE = 1000000;
+
+/** The index of the last start ≤ i (starts ascending, starts[0] = 0). */
+function segmentAt(starts, i) {
+  let lo = 0, hi = starts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (starts[mid] <= i) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+/** A space over segments [{ size, port, addrAt(j) }]: `at(i)` → { addr, port }. */
+function spaceOf(segments, extra) {
+  const segs = segments.filter((s) => s.size > 0);
+  const starts = new Float64Array(segs.length);
+  let size = 0;
+  segs.forEach((s, k) => { starts[k] = size; size += s.size; });
+  const at = (i) => {
+    if (!(i >= 0 && i < size)) return null;
+    const k = segmentAt(starts, i);
+    const s = segs[k];
+    return { addr: s.addrAt(i - starts[k]), port: s.port };
+  };
+  return Object.assign({ size, segments: segs, at }, extra);
+}
+
+/** Interval subtraction: the parts of [a, b] no interval of `taken` (sorted, disjoint) covers. */
+function subtract(a, b, taken) {
+  const out = [];
+  let from = a;
+  for (const [s, e] of taken) {
+    if (e < from) continue;
+    if (s > b) break;
+    if (s > from) out.push([from, Math.min(b, s - 1)]);
+    from = Math.max(from, e + 1);
+    if (from > b) break;
+  }
+  if (from <= b) out.push([from, b]);
+  return out;
+}
+
+/** `taken` with [a, b] merged in, still sorted and disjoint. */
+function mergeInto(taken, a, b) {
+  const out = [];
+  let cur = [a, b], placed = false;
+  for (const iv of taken) {
+    if (iv[1] < cur[0] - 1) out.push(iv);
+    else if (iv[0] > cur[1] + 1) { if (!placed) { out.push(cur); placed = true; } out.push(iv); }
+    else cur = [Math.min(cur[0], iv[0]), Math.max(cur[1], iv[1])];
+  }
+  if (!placed) out.push(cur);
+  return out;
+}
+
+/**
+ * addressSpace(text, { v6PerRange, rng }) → { size, at(i), segments, ranges, errors, v6Sampled }
+ *
+ * Every address the box names, in the order written, the same address with
+ * the same port once: an IPv4 range less what an earlier range with the same
+ * port covered (interval arithmetic, not a lookup per address); a host name
+ * once per port; an IPv6 block min(size, v6PerRange) of its addresses (all of
+ * a small one, a random draw of a big one — `v6Sampled` counts the blocks
+ * drawn from). `size` is exact; nothing past the parse is listed.
+ */
+function addressSpace(text, opts = {}) {
+  const v6PerRange = posInt(opts.v6PerRange, DEFAULT_V6_PER_RANGE);
+  const rng = typeof opts.rng === 'function' ? opts.rng : Math.random;
+  const { ranges, errors } = parseTargetText(text);
+  const takenByPort = new Map();   // port → sorted disjoint [start, end] of the IPv4 ranges so far
+  const seen = new Set();          // `addr|port` of the hosts and IPv6 addresses
+  const segments = [];
+  let v6Sampled = 0;
+  for (const r of ranges) {
+    if (r.kind === 'v4') {
+      const key = String(r.port);
+      const taken = takenByPort.get(key) || [];
+      for (const [s, e] of subtract(r.start, r.end, taken)) {
+        segments.push({ kind: 'v4', size: e - s + 1, port: r.port, start: s, addrAt: (j) => intToIp4(s + j) });
+      }
+      takenByPort.set(key, mergeInto(taken, r.start, r.end));
+    } else {
+      const list = [];
+      if (r.kind === 'host') {
+        if (!seen.has(r.host + '|' + r.port)) { seen.add(r.host + '|' + r.port); list.push(r.host); }
+      } else {
+        if (r.count > BigInt(v6PerRange)) v6Sampled++;
+        for (const a of v6Sample(r, v6PerRange, rng, (x) => seen.has(x + '|' + r.port))) {
+          if (seen.has(a + '|' + r.port)) continue;
+          seen.add(a + '|' + r.port);
+          list.push(a);
+        }
+      }
+      if (list.length) segments.push({ kind: r.kind, size: list.length, port: r.port, addrAt: (j) => list[j] });
+    }
+  }
+  return spaceOf(segments, { ranges: ranges.length, errors, v6Sampled });
+}
+
+/** A space of a list [{ addr, port }] — a sample, a per-range draw — one segment per run of the same port. */
+function listSpace(items) {
+  const segments = [];
+  let i = 0;
+  while (i < items.length) {
+    let j = i;
+    while (j + 1 < items.length && items[j + 1].port === items[i].port) j++;
+    const from = i, port = items[i].port;
+    segments.push({ kind: 'list', size: j - i + 1, port, addrAt: (k) => items[from + k].addr });
+    i = j + 1;
+  }
+  return spaceOf(segments);
+}
+
+/**
+ * sampleSpace(space, n, { exclude, rng }) → { space, taken, repeated }
+ *
+ * "N random from all of them together": min(n, size) distinct indices,
+ * uniform over the whole space, so a /16 next to a /24 gives 256 times as
+ * many of its addresses — and the result in address order. `exclude` (a Set
+ * of normalized addresses tested before) is skipped while the space has
+ * others; when it has not, tested ones fill the rest and `repeated` counts
+ * them. Over half of a space is drawn by a partial shuffle of all of it
+ * (MAX_SAMPLE bounds that list); less, by drawing indices and throwing back
+ * a repeat — few in practice.
+ */
+function sampleSpace(space, n, opts = {}) {
+  const rng = typeof opts.rng === 'function' ? opts.rng : Math.random;
+  const exclude = opts.exclude instanceof Set && opts.exclude.size ? opts.exclude : null;
+  const M = space.size;
+  const want = Math.min(Math.max(0, Math.floor(Number(n) || 0)), M, MAX_SAMPLE);
+  const tested = (i) => !!exclude && exclude.has(space.at(i).addr);
+  const picked = [];
+  let repeated = 0;
+  if (want * 2 > M) {
+    const all = new Float64Array(M);
+    for (let i = 0; i < M; i++) all[i] = i;
+    for (let i = M - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); const t = all[i]; all[i] = all[j]; all[j] = t; }
+    const old = [];
+    for (let i = 0; i < M && picked.length < want; i++) { if (tested(all[i])) old.push(all[i]); else picked.push(all[i]); }
+    while (picked.length < want && old.length) { picked.push(old.shift()); repeated++; }
+  } else {
+    const chosen = new Set();
+    let tries = 0;
+    const budget = want * 30 + 100;
+    while (picked.length < want && tries++ < budget) {
+      const i = Math.floor(rng() * M);
+      if (chosen.has(i) || tested(i)) continue;
+      chosen.add(i);
+      picked.push(i);
+    }
+    // the untested part ran out: what was tested before fills the rest
+    for (let i = 0; picked.length < want && i < M; i++) {
+      const k = Math.floor(rng() * M);
+      const c = chosen.has(k) ? (() => { for (let d = 1; d < M; d++) { const x = (k + d) % M; if (!chosen.has(x)) return x; } return -1; })() : k;
+      if (c < 0) break;
+      chosen.add(c);
+      picked.push(c);
+      repeated++;
+    }
+  }
+  picked.sort((a, b) => a - b);
+  return { space: listSpace(picked.map((i) => space.at(i))), taken: picked.length, repeated };
+}
+
+/**
+ * targetSpace({ space, ports, snis, defaultAddr, defaultPort }) → { size, addresses, at(i) → { addr, port, sni, key } }
+ *
+ * buildTargets as a space: address, port, SNI in that order; an address with
+ * its own port on that port alone, the others on every port of `ports`
+ * (none → defaultPort); no SNIs → the config's own (null). An empty address
+ * space → the config's own address. `addresses` is the address count.
+ */
+function targetSpace(opts = {}) {
+  const base = opts.space && opts.space.size ? opts.space
+    : spaceOf([{ kind: 'own', size: 1, port: null, addrAt: () => opts.defaultAddr }]);
+  const portList = Array.isArray(opts.ports) && opts.ports.length ? opts.ports
+    : [opts.defaultPort == null || opts.defaultPort === '' ? null : opts.defaultPort];
+  const sniList = Array.isArray(opts.snis) && opts.snis.length ? opts.snis : [null];
+  const S = sniList.length;
+  const segs = base.segments.map((s) => ({ s, mult: (s.port != null ? 1 : portList.length) * S }));
+  const starts = new Float64Array(segs.length);
+  let size = 0;
+  segs.forEach((x, k) => { starts[k] = size; size += x.s.size * x.mult; });
+  const at = (i) => {
+    if (!(i >= 0 && i < size)) return null;
+    const k = segmentAt(starts, i);
+    const { s, mult } = segs[k];
+    const local = i - starts[k];
+    const a = Math.floor(local / mult), r = local % mult;
+    const port = s.port != null ? s.port : portList[Math.floor(r / S)];
+    const sni = sniList[r % S] || null;
+    const addr = s.addrAt(a);
+    return { addr, port, sni, key: addrPort(addr, port) + '|' + (sni || '') };
+  };
+  return { size, addresses: base.size, ports: portList.length, snis: S, at };
+}
+
+/**
+ * pickAddresses(text, pick, { exclude, rng, v6PerRange }) → { space, total, taken, ranges, errors, exhausted, repeated }
+ *
+ * The address box read the way the page's pick says:
+ *  - `all`: every address (addressSpace) — `taken` = `total`;
+ *  - `sample`: `count` random from all of them together (sampleSpace);
+ *  - `random`: `perRange` from each range, as drawTargets has always drawn.
+ * `total` is how many addresses the box names (IPv6 blocks counted as their
+ * sample), `taken` how many the run tests.
+ */
+function pickAddresses(text, pick = {}, opts = {}) {
+  const p = pick || {};
+  const all = addressSpace(text, opts);
+  const out = { total: all.size, ranges: all.ranges, errors: all.errors, exhausted: 0, repeated: 0, v6Sampled: all.v6Sampled };
+  if (p.mode === 'sample') {
+    const s = sampleSpace(all, p.count, opts);
+    return Object.assign(out, { space: s.space, taken: s.taken, repeated: s.repeated, exhausted: s.repeated ? 1 : 0 });
+  }
+  if (p.mode === 'random') {
+    const d = drawTargets(text, { perRange: Math.min(MAX_SAMPLE, posInt(p.perRange, DEFAULT_PER_RANGE)), max: MAX_SAMPLE, exclude: opts.exclude, rng: opts.rng });
+    return Object.assign(out, { space: listSpace(d.addrs), taken: d.addrs.length, exhausted: d.exhausted, truncated: d.truncated });
+  }
+  return Object.assign(out, { space: all, taken: all.size });
+}
+
 /* --------------------------------- presets --------------------------------- */
 
 /** Is IPv4 text `addr` inside one of the CIDRs? */
@@ -628,5 +868,6 @@ function suggestPreset(server) {
 
 module.exports = {
   parseTargetText, normalizeAddr, addrPort, expandTargets, drawTargets, parsePorts, parseSnis, buildTargets,
+  addressSpace, sampleSpace, listSpace, targetSpace, pickAddresses, MAX_SAMPLE,
   PRESETS, suggestPreset, CF_IPV4_RANGES, ip4ToInt, intToIp4
 };
