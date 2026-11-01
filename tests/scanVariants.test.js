@@ -109,14 +109,24 @@ test('sanitizeSpec keeps the dimensions with values, each value once, the errors
   assert.equal(V.sanitizeSpec(null).dims.length, 0);
 });
 
-test('the presets are upstream’s, value for value, once the synced serverFields has them (v1.41.0)', (t) => {
-  if (!SF.FINALMASK_PRESETS) return t.skip('serverFields is older than v1.41.0 — compared after the sync');
-  const short = (name) => String(name).split(' ')[0].replace(/-cipherSuites$/, '');
-  for (const p of SF.FINALMASK_PRESETS) assert.equal(V.canon(JSON.parse(p.value)), V.canon(V.FINALMASK_PRESETS[short(p.name)]), p.name);
-  for (const p of SF.CIPHER_PRESETS) assert.equal(p.value, V.CIPHER_PRESETS[short(p.name)], p.name);
-  assert.deepEqual(SF.DIAL_MODE_PRESETS.map((p) => p.value), ['oob.0']);
-  assert.deepEqual([...SF.FINGERPRINTS].sort(), [...V.FINGERPRINTS].sort());
-  return undefined;
+test('the presets are the synced editor’s (serverFields), under their short names, and still PattNG’s values', () => {
+  assert.deepEqual(Object.keys(V.FINALMASK_PRESETS), ['tlshello-0-len', 'tlshello', 'udp-noise', 'merge']);
+  assert.deepEqual(Object.keys(V.CIPHER_PRESETS).sort(), ['real-firefox', 'semi-python']);
+  for (const p of SF.FINALMASK_PRESETS) assert.ok(Object.values(V.FINALMASK_PRESETS).some((v) => V.canon(v) === V.canon(JSON.parse(p.value))), p.name);
+  assert.deepEqual(V.FINGERPRINTS, SF.FINGERPRINTS);
+  assert.ok(V.FINGERPRINTS.includes('hellochrome_120'));
+  // the brief's values, so a sync that changed them would say so here
+  const fm = V.FINALMASK_PRESETS;
+  assert.deepEqual(fm['tlshello-0-len'], { tcp: [
+    { type: 'fragment', settings: { packets: 'tlshello', lengths: ['0', '104', '1'], delays: ['0'], maxSplit: '0' } },
+    { type: 'fragment', settings: { packets: '1-1', lengths: ['114', '1'], delays: ['1'], maxSplit: '11' } }] });
+  assert.deepEqual(fm.tlshello.tcp[0].settings.lengths, ['6', '98', '1']);
+  assert.deepEqual(fm['udp-noise'].udp[0].settings.noise, Array.from({ length: 24 }, () => ({ rand: '1200-1230', delay: '10' })));
+  assert.equal(fm['udp-noise'].udp[0].settings.reset, '28');
+  assert.deepEqual(fm.merge, { tcp: [{ type: 'merge', settings: { times: 100, delayMs: 30, maxBytes: 16384 } }] });
+  assert.ok(V.CIPHER_PRESETS['real-firefox'].endsWith(':TLS_RSA_WITH_AES_128_CBC_SHA:TLS_RSA_WITH_AES_256_CBC_SHA'));
+  assert.ok(V.CIPHER_PRESETS['semi-python'].endsWith(':TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256'));
+  assert.deepEqual(V.catalog().find((d) => d.id === 'dialMode').presets, SF.DIAL_MODE_PRESETS.map((p) => p.value));
 });
 
 /* ------------------------------- what applies ------------------------------- */

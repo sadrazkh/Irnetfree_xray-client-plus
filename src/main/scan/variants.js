@@ -49,11 +49,11 @@
  */
 const crypto = require('crypto');
 const { MUX, muxEligible } = require('../mux');
-const { masqueHttpOf } = require('../../renderer/serverFields');
+const SF = require('../../renderer/serverFields');
+const { PATTN_OOB_SINCE, pattnOobNeeds, versionBelow } = require('../xrayManager');
 const { protocolOf, transportOf, mirrorIntoJson } = require('./substitute');
 
-/** Xray-PattN's dialMode and merge mask: this release and newer (upstream xrayManager.PATTN_OOB_SINCE). */
-const PATTN_OOB_SINCE = '26.10.27';
+const { masqueHttpOf } = SF;
 const PATTN = 'xray-pattn';
 
 /** At most this many variants in one run: the product of the dimensions' values is refused past it. */
@@ -65,38 +65,22 @@ const MAX_LIMIT = 1000000;
 const STREAM = new Set(['vless', 'vmess', 'trojan', 'shadowsocks']);
 
 /**
- * uTLS fingerprints as the cores name them (upstream serverFields.FINGERPRINTS
- * from v1.41.0). hellochrome_120 is one of the official core's
- * ModernFingerprints; a core that does not know a name refuses the config at
- * start, and the scanner then names the variant that did it (scanner.js).
+ * The presets are the editor's own (upstream serverFields, synced verbatim:
+ * PattNG's values, name for name), read here, never copied — a sync that
+ * changes one changes the scan's with it. Their names are the editor's labels
+ * ("tlshello-0-len (0-104-1-0-0-114-1-1-11)", "semi-python-cipherSuites");
+ * the scan names a value by the label's first word, without "-cipherSuites"
+ * ("tlshello-0-len", "semi-python"), short enough for a variant's label.
+ *
+ * Fingerprints: the cores' uTLS names (hellochrome_120 is one of the official
+ * core's ModernFingerprints); a core that does not know one refuses the config
+ * at start, and the scanner then names the variant that did it (scanner.js).
  */
-const FINGERPRINTS = ['chrome', 'hellochrome_120', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'random', 'randomized', 'unsafe'];
-
-/**
- * PattNG's finalmask presets, value for value (upstream serverFields
- * FINALMASK_PRESETS from v1.41.0; tests/scanVariants.test.js compares them
- * once the synced file has them): two ClientHello splits of two fragment masks
- * each, 24 noise packets before a UDP handshake, and the fork's `merge` mask.
- */
-const frag = (packets, lengths, delays, maxSplit) => ({ type: 'fragment', settings: { packets, lengths, delays, maxSplit } });
-const tlshello = (a, b, c) => ({ tcp: [frag('tlshello', [a, b, c], ['0'], '0'), frag('1-1', ['114', '1'], ['1'], '11')] });
-const FINALMASK_PRESETS = {
-  'tlshello-0-len': tlshello('0', '104', '1'),
-  tlshello: tlshello('6', '98', '1'),
-  'udp-noise': { udp: [{ type: 'noise', settings: { reset: '28', noise: Array.from({ length: 24 }, () => ({ rand: '1200-1230', delay: '10' })) } }] },
-  merge: { tcp: [{ type: 'merge', settings: { times: 100, delayMs: 30, maxBytes: 16384 } }] }
-};
-
-/** PattNG's cipherSuites presets (upstream serverFields CIPHER_PRESETS from v1.41.0), the names joined by ':'. */
-const CIPHER_PRESETS = {
-  'real-firefox': ['TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256', 'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256', 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
-    'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256', 'TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384', 'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
-    'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA', 'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA', 'TLS_RSA_WITH_AES_128_GCM_SHA256', 'TLS_RSA_WITH_AES_256_GCM_SHA384',
-    'TLS_RSA_WITH_AES_128_CBC_SHA', 'TLS_RSA_WITH_AES_256_CBC_SHA'].join(':'),
-  'semi-python': ['TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384', 'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384', 'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
-    'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256', 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256', 'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
-    'TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA', 'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA', 'TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256', 'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256'].join(':')
-};
+const shortName = (name) => String(name).split(' ')[0].replace(/-cipherSuites$/, '');
+const FINGERPRINTS = SF.FINGERPRINTS.slice();
+const FINALMASK_PRESETS = Object.fromEntries(SF.FINALMASK_PRESETS.map((p) => [shortName(p.name), JSON.parse(p.value)]));
+const CIPHER_PRESETS = Object.fromEntries(SF.CIPHER_PRESETS.map((p) => [shortName(p.name), p.value]));
+const DIAL_PRESETS = SF.DIAL_MODE_PRESETS.map((p) => p.value);
 
 /**
  * The dimensions, in the order a label names them. `none` is the value that
@@ -110,7 +94,7 @@ const DIMENSIONS = [
   { id: 'cipherSuites', short: 'cs', none: 'none', presets: Object.keys(CIPHER_PRESETS), start: ['none', 'real-firefox'] },
   { id: 'fragment', short: 'frag', none: 'off', presets: ['tlshello,100-200,10-20', 'tlshello,10-20,10-20', '1-3,1-5,1-2'], start: ['off', 'tlshello,100-200,10-20'] },
   { id: 'finalMask', short: 'fm', none: 'none', presets: Object.keys(FINALMASK_PRESETS), start: ['none', 'tlshello'] },
-  { id: 'dialMode', short: 'dm', none: 'none', presets: ['oob.0'], start: ['none', 'oob.0'] },
+  { id: 'dialMode', short: 'dm', none: 'none', presets: DIAL_PRESETS, start: ['none'].concat(DIAL_PRESETS.slice(0, 1)) },
   { id: 'mux', short: 'mux', options: ['off', 'on'], start: ['off', 'on'] },
   { id: 'xhttpMode', short: 'mode', options: ['auto', 'packet-up', 'stream-up', 'stream-one'], start: ['auto', 'packet-up'] }
 ];
@@ -128,14 +112,6 @@ function canon(v) {
   return JSON.stringify(v);
 }
 
-/** "26.9.9" below "26.10.27", as numbers; a string with no x.y.z in it is never below anything (xrayManager.versionBelow). */
-function versionBelow(v, min) {
-  const parse = (s) => { const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(s || '')); return m ? m.slice(1, 4).map(Number) : null; };
-  const a = parse(v), b = parse(min);
-  if (!a || !b) return false;
-  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i];
-  return false;
-}
 
 /* ------------------------------- values ------------------------------- */
 
@@ -192,7 +168,9 @@ function readValue(dimId, raw) {
     }
     case 'dialMode': {
       const v = text.toLowerCase();
-      if (!/^oob\.\d{1,3}(,\d{1,3})*$/.test(v) || !v.slice(4).split(',').every((b) => Number(b) <= 255)) {
+      // the editor's own reading (serverFields.readDialMode): oob.<byte>[,<byte>…], each 0–255
+      const read = SF.readDialMode(v);
+      if (!read || read.bad) {
         return { error: 'dialMode: oob.<byte>[,<byte>…], each byte 0–255 (oob.0): ' + text };
       }
       return { id: v, value: v, raw: v };
@@ -513,11 +491,8 @@ function linkLoses(variant) {
  * finalmask the VARIANT wrote → Xray-PattN of any version. `what` names it.
  */
 function engineNeed(record, variant) {
-  const ob = record && isObj(record.outbound) ? record.outbound : {};
-  const st = isObj(ob.streamSettings) ? ob.streamSettings : {};
-  const what = [];
-  if (isObj(st.sockopt) && typeof st.sockopt.dialMode === 'string' && st.sockopt.dialMode.trim()) what.push('dialMode');
-  if (isObj(st.finalmask) && Array.isArray(st.finalmask.tcp) && st.finalmask.tcp.some((m) => isObj(m) && m.type === 'merge')) what.push('merge');
+  // the app's own question (xrayManager.pattnOobNeeds), asked of this one outbound
+  const what = record && isObj(record.outbound) ? pattnOobNeeds({ outbounds: [record.outbound] }) : [];
   if (what.length) return { engine: PATTN, since: PATTN_OOB_SINCE, what };
   const set = (variant && variant.set) || {};
   if (set.finalMask) return { engine: PATTN, since: '', what: ['finalmask'] };
