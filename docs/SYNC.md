@@ -61,6 +61,17 @@ core (the official core ignores the key, as upstream's validate proves too).
 | `scripts/validate-configs.js`, `probe-reverse.js`, `probe-scan.js`, `sync-upstream.js` | the gates |
 | `tests/` | Plus's suite |
 
+### What the scanner reads from the synced files
+
+The scan's parameter matrix (`src/main/scan/variants.js`) copies nothing it can read: its finalMask, cipherSuites and
+dialMode presets and its fingerprint list are `serverFields.FINALMASK_PRESETS` / `CIPHER_PRESETS` /
+`DIAL_MODE_PRESETS` / `FINGERPRINTS` (named by the label's first word: `tlshello-0-len`, `semi-python`), a dialMode is
+read by `serverFields.readDialMode`, and what needs Xray-PattN is `xrayManager.pattnOobNeeds` / `PATTN_OOB_SINCE`. The
+service's gate (`src/main/scan/index.js`) uses `pattnOobNeeds`, `pattnOobWhat`, `usesEchOutbound`, `usesMasque*`,
+`usesEch` and `engineChoice.isSingboxOnly`; `usesFinalmask` is not exported upstream, so the service keeps its own
+copy of that one rule. A sync that renames any of them fails `tests/scanVariants.test.js` or
+`tests/scan.service.test.js` — read the new names there.
+
 ## History
 
 Until v2.2 Plus was a full fork of the client with two extra tabs, kept mergeable by marking every Plus line in
