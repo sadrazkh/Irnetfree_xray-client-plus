@@ -17,10 +17,18 @@
 const net = require('net');
 const { buildDnsPlan, DNS_TAG } = require('./dnsBuilder');
 const { normalizePin } = require('./certPin');
-const { planServers } = require('./engineChoice');
+const { planServers, isSingboxOnly, singboxOnlyError } = require('./engineChoice');
 const { MUX, muxEligible } = require('./mux');
 const { effectiveVia, advancedTargets } = require('./routingProfiles');
 const { masqueHttpOf } = require('../renderer/serverFields');
+const { isGroupRecord, serversOf, STRATEGIES: GROUP_STRATEGIES } = require('./groups');
+const { applies: multiWanApplies, applyMultiWan, finishSplit } = require('./multiWan');
+// the extensions (src/renderer/modules.js): multiWan not installed is multiWan disabled
+const { isOn: moduleOn } = require('../renderer/modules');
+// users and devices on the LAN (module lanUsers): their proxy, accounts and rules — only when installed and on
+const lanUsers = require('../modules/lanUsers/xray');
+// per-app configs under the sing-box TUN: a loopback inbound per app's config (main.js builds `appRoutes`)
+const appTargets = require('./tunAppTargets');
 
 /**
  * Private / reserved IPv4+IPv6 ranges. Used INSTEAD of `geoip:private` so that
@@ -88,9 +96,43 @@ function modeBypassRules(mode, geo) {
  * outbound belongs to — its certificate pin, if any, goes into tlsSettings.
  */
 function cloneOut(outbound, tag, server) {
+  // TUIC / AnyTLS: no Xray core has either (engineChoice.isSingboxOnly) — every
+  // server's outbound comes through here, so none reaches a config by another
+  // way; buildConfig has said it already, in the app's language, for a plan
+  if (outbound && isSingboxOnly({ outbound })) throw new Error(singboxOnlyError(server || { outbound }, 'plan', 'en'));
   const o = JSON.parse(JSON.stringify(outbound));
   o.tag = tag;
-  return applyCertPin(o, server);
+  return applyCertPin(wgTargetStrategy(o), server);
+}
+
+/**
+ * A WireGuard's "Destination name resolution" (the editor's wgDomainStrategy)
+ * is stored as `settings.domainStrategy` — which Xray stopped reading in
+ * 26.9.30 (infra/conf/wireguard.go has no such field since): the outbound's own
+ * `targetStrategy` says it now (infra/conf/xray.go OutboundDetourConfig, read in
+ * 26.10.31: AsIs, UseIP…, ForceIP, ForceIPv4, ForceIPv6, ForceIPv4v6,
+ * ForceIPv6v4). On the suggested cores the choice was silently ignored. Both
+ * are written: an older core reads the first and skips the key it does not
+ * know, a newer one the other way round. A `targetStrategy` the record already
+ * has (an imported JSON) wins.
+ */
+function wgTargetStrategy(o) {
+  if (!o || o.protocol !== 'wireguard' || !o.settings) return o;
+  const ds = typeof o.settings.domainStrategy === 'string' ? o.settings.domainStrategy.trim() : '';
+  if (ds && !o.targetStrategy) o.targetStrategy = ds;
+  return o;
+}
+
+/**
+ * A TUIC / AnyTLS server anywhere in the plan: refused by name, before
+ * anything is built — `xray run -test` would only say "unknown protocol".
+ * Alone it runs on sing-box (main.js / service.js buildActive), so here it is
+ * either missing that core or inside a chain, a group, a routing rule or the pool.
+ */
+function refuseSingboxOnly(plan, s) {
+  const alone = plan.mode === 'single' && !isGroupRecord(plan.server);
+  const hit = planServers(plan).find(isSingboxOnly);
+  if (hit) throw new Error(singboxOnlyError(hit, alone ? 'missing' : 'plan', s.lang));
 }
 
 /**
@@ -180,16 +222,66 @@ function echOverDoh(outbounds) {
 }
 
 /**
+ * A server's own ECH outbound (PattN's `echOutbound`, the link's
+ * `echOutbound=`): the outbound the core dials its ECH config query through —
+ * `echSockopt.dialerProxy`. What it is for (patterniha, 2026-10-20): the
+ * plain-DNS answer no longer carries the key and DoH to 1.1.1.1 is reset on
+ * its SNI, so the query goes `h2c://1.1.1.1/dns-query` through a `direct`
+ * outbound that redirects to 1.1.1.1:443 under TLS with another name
+ * (`www.microsoft.com`) and checks the certificate against the resolver's
+ * own (`fromMitM`; the core hands the query's host over from 26.10.10).
+ *
+ * The record keeps it in tlsSettings (`echOutbound`, never a core key): taken
+ * out here, given a tag of ours — `ech-<n>`, one per distinct outbound, so
+ * twenty servers with the same one share it and the user's own tag can clash
+ * with nothing — and appended after everything else. Without a list fetched
+ * from DNS (a base64 one is not fetched) it means nothing and is dropped.
+ * Every builder runs it, the pings' too: a test without it would ask for the
+ * key directly and fail where the connect works. Before bindDirectDials,
+ * which binds it to the NIC under TUN like any dial the core makes itself.
+ */
+function applyEchOutbounds(outbounds) {
+  const byKey = new Map();
+  const extra = [];
+  for (const o of outbounds) {
+    const tls = o && o.streamSettings && o.streamSettings.tlsSettings;
+    if (!tls || !Object.prototype.hasOwnProperty.call(tls, 'echOutbound')) continue;
+    const ob = tls.echOutbound;
+    delete tls.echOutbound;
+    if (!ob || typeof ob !== 'object' || Array.isArray(ob) || !ob.protocol || !echQueryOf(tls.echConfigList)) continue;
+    const body = JSON.parse(JSON.stringify(ob));
+    delete body.tag;
+    const key = JSON.stringify(body);
+    let tag = byKey.get(key);
+    if (!tag) {
+      tag = 'ech-' + (byKey.size + 1);
+      byKey.set(key, tag);
+      extra.push(Object.assign({ tag }, body));
+    }
+    tls.echSockopt = Object.assign({}, tls.echSockopt, { dialerProxy: tag });
+  }
+  return extra.length ? outbounds.concat(extra) : outbounds;
+}
+
+/**
  * The resolver addresses the running config fetches ECH configs from — what
  * the strict leak guard has to leave a hole for (the query is the core's own,
  * from the physical adapter). A resolver given by name is resolved before the
- * connect (entryHosts) and its addresses travel with the entry servers'.
+ * connect (entryHosts) and its addresses travel with the entry servers'. A
+ * query dialled through an ECH outbound (applyEchOutbounds) leaves for the
+ * address that outbound redirects to.
  */
 function echResolverIpsOf(config) {
   const out = [];
-  for (const tls of echQueryTls(config && config.outbounds)) {
+  const outbounds = (config && config.outbounds) || [];
+  const add = (ip) => { if (ip && net.isIP(ip) && !out.includes(ip)) out.push(ip); };
+  for (const tls of echQueryTls(outbounds)) {
     const q = echQueryOf(tls.echConfigList);
-    if (q && net.isIP(q.host) && !out.includes(q.host)) out.push(q.host);
+    if (q) add(q.host);
+    const via = tls.echSockopt && tls.echSockopt.dialerProxy;
+    const ob = via ? outbounds.find(x => x && x.tag === via) : null;
+    const to = ob && ob.settings && splitEndpoint(ob.settings.redirect);
+    if (to) add(to.host);
   }
   return out;
 }
@@ -219,7 +311,8 @@ function splitEndpoint(ep) {
 function wgEndpointHosts(planArg) {
   const plan = normalizePlan(planArg);
   const out = [];
-  const visit = (s) => {
+  // a group stands for its members (groups.serversOf)
+  const visit = (rec) => serversOf(rec).forEach((s) => {
     const ob = s && s.outbound;
     if (!ob || ob.protocol !== 'wireguard') return;
     for (const p of (ob.settings && ob.settings.peers) || []) {
@@ -227,7 +320,7 @@ function wgEndpointHosts(planArg) {
       if (!ep || net.isIP(ep.host) || out.includes(ep.host)) continue;
       out.push(ep.host);
     }
-  };
+  });
   if (plan.server) visit(plan.server);
   for (const s of plan.chain || []) visit(s);
   for (const s of Object.values(plan.serversById || {})) visit(s);
@@ -271,6 +364,8 @@ function dialsThrough(o) {
  */
 function entryOutbounds(server, whole) {
   if (!server || !server.outbound) return [];
+  // a group is entered at each of its members
+  if (isGroupRecord(server)) return serversOf(server).flatMap((m) => entryOutbounds(m, whole));
   if (server.source !== 'json') return [server.outbound];
   const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
   const list = whole && isObj(server.json) && Array.isArray(server.json.outbounds)
@@ -304,6 +399,7 @@ function dialAddressOf(o) {
  */
 function entryAddressesOf(server, whole) {
   if (!server) return [];
+  if (isGroupRecord(server)) return [...new Set(serversOf(server).flatMap((m) => entryAddressesOf(m, whole)))];
   if (server.source !== 'json') return [server.address];
   const out = [];
   for (const o of entryOutbounds(server, whole)) {
@@ -586,18 +682,71 @@ function withHelpers(o, server) {
  *
  * `viaTag`: the chain itself rides a base (makeRegistry) — its first hop then
  * dials through that, exactly as a later hop dials the hop before it.
+ * `hopBase`: what the hops are named after when not the exit (a group's chain
+ * variants name theirs outside the group's member prefix — expandGroups).
+ *
+ * A chain with a group in it: the hops before the group are built once and
+ * every member dials through them; from the group up to (not including) the
+ * next WireGuard the chain is a group of whole chains (groupOfChains) — one
+ * variant per member, in that hop's place; a WireGuard after a group is built
+ * ONCE and dials through that group's loopback. Copied per variant it would be
+ * one session per copy on one key, and the peer keeps only the newest
+ * handshake — every copy would cut the others off.
  */
-function buildChainOutbounds(servers, exitTag, viaTag) {
+function buildChainOutbounds(servers, exitTag, viaTag, hopBase) {
   exitTag = exitTag || 'proxy';
   const list = (servers || []).filter(s => s && s.outbound);
+  const hops = hopBase || exitTag;
   const last = list.length - 1;
+  const tagAt = (i) => (i === last ? exitTag : `${hops}-h${i}`);
   const outs = [];
-  for (let i = 0; i <= last; i++) {
-    const tag = i === last ? exitTag : `${exitTag}-h${i}`;
-    const prev = i > 0 ? `${exitTag}-h${i - 1}` : (viaTag || null);
+  let prev = viaTag || null;
+  for (let i = 0; i <= last;) {
+    if (last > 0 && isGroupRecord(list[i])) {
+      let end = i + 1;
+      while (end <= last && !isWgServer(list[end])) end++;
+      outs.push(groupOfChains(list.slice(i, end), tagAt(end - 1), prev));
+      prev = tagAt(end - 1);
+      i = end;
+      continue;
+    }
+    const tag = tagAt(i);
     outs.push(...(prev ? [behind(list[i], tag, prev)] : withHelpers(cloneOut(list[i].outbound, tag, list[i]), list[i])));
+    prev = tag;
+    i++;
   }
   return outs;
+}
+
+/** At most this many variants for a chain through groups (one per combination of their members). */
+const MAX_CHAIN_VARIANTS = 64;
+
+/**
+ * A stretch of a chain that starts with a group, as a group of whole chains:
+ * one variant per member, the member in the group's place — [G(m1, m2) → B] is
+ * G'([m1 → B], [m2 → B]), each variant's first hop dialling `viaTag` (the hops
+ * before the group); two groups make every combination (at most
+ * MAX_CHAIN_VARIANTS). A TCP hop never dials THROUGH a group: aimed at a
+ * group's loopback, the next hop's dialerProxy lost the end of a response now
+ * and then on both cores (scripts/probe-group.js, 2026-10-19), while a loopback
+ * as a route's target never did. Only a WireGuard does (buildChainOutbounds),
+ * its UDP never ending with a response. The variants take the first group's
+ * strategy.
+ */
+function groupOfChains(list, exitTag, viaTag) {
+  let variants = [[]];
+  for (const s of list) {
+    const opts = isGroupRecord(s) ? serversOf(s) : [s];
+    variants = variants.flatMap(v => opts.map(o => v.concat([o]))).slice(0, MAX_CHAIN_VARIANTS);
+  }
+  const g = list.find(isGroupRecord);
+  // each variant is known by the member(s) it takes from the group(s) — what the meter shows for it
+  const at = list.map((s, i) => (isGroupRecord(s) ? i : -1)).filter(i => i >= 0);
+  const mark = g.outbound._group;
+  const members = variants.map(chain => ({ chain, label: at.map(i => chain[i]) }));
+  const o = { tag: exitTag, protocol: 'loopback', settings: {}, _group: { id: mark.id, name: mark.name, strategy: mark.strategy, members } };
+  if (viaTag) o.streamSettings = { sockopt: { dialerProxy: viaTag } };
+  return o;
 }
 
 /**
@@ -655,7 +804,7 @@ function makeRegistry(plan, muxIds) {
     const s = (plan.serversById || {})[target];
     return s ? [s] : [];
   }
-  const sharesBase = (target) => bases.has(target) && members(target).some(s => s && s.outbound && isWgServer(s));
+  const sharesBase = (target) => bases.has(target) && members(target).some(s => s && s.outbound && isWgServer(s)) && !members(target).some(isGroupRecord);
 
   /** A target that is its own base's WireGuard: a freedom out through the base's exit (see above). */
   function exitAtBase(target, tag) {
@@ -673,8 +822,18 @@ function makeRegistry(plan, muxIds) {
     return 'direct';
   }
 
-  /** A via's base group, registered once: { key, tag } — its exit tag and the key a target through it is named by. */
+  /**
+   * A via's base group, registered once: { key, tag } — its exit tag and the
+   * key a target through it is named by. A base with a group in it (a group,
+   * or a chain holding one) registers nothing: each target through it is the
+   * whole chain [base → target] of its own (tagThrough) — a TCP hop never dials
+   * through a group (groupOfChains).
+   */
   function baseOf(via) {
+    // a base with a group in it: nothing of its own — each target through it is the whole chain [base → target]
+    const hops = via === 'chain' ? (plan.chain || [])
+      : (via.indexOf('chain:') === 0 ? ((plan.chainsById || {})[via.slice('chain:'.length)] || []) : [(plan.serversById || {})[via]]);
+    if (hops.some(isGroupRecord)) return { key: via === 'chain' ? 'chain' : (via.indexOf('chain:') === 0 ? 'chain-' + via.slice('chain:'.length) : via), tag: null, hops };
     if (via === 'chain') return { key: 'chain', tag: chainTag(plan.chain, 'base-chain') };
     if (via.indexOf('chain:') === 0) {
       const cid = via.slice('chain:'.length);
@@ -706,6 +865,10 @@ function makeRegistry(plan, muxIds) {
   /** `target` riding `base` (baseOf): its own outbound(s), the one that would dial by itself dialing the base. */
   function tagThrough(target, base) {
     const at = '@' + base.key;
+    if (base.hops) {
+      const name = target === 'chain' ? 'out-chain' : (typeof target === 'string' && target.indexOf('chain:') === 0 ? 'out-chain-' + target.slice('chain:'.length) : 'out-' + target);
+      return chainTag([...base.hops, ...members(target)], name + at);
+    }
     if (target === 'chain') return chainTag(plan.chain, 'out-chain' + at, base.tag);
     if (typeof target === 'string' && target.indexOf('chain:') === 0) {
       const cid = target.slice('chain:'.length);
@@ -775,13 +938,13 @@ function wgResolvers(server, outboundTag) {
 function wgResolverAddresses(planArg) {
   const plan = normalizePlan(planArg);
   const out = [];
-  const visit = (s) => {
+  const visit = (rec) => serversOf(rec).forEach((s) => {
     if (!isWgServer(s) || !Array.isArray(s.dns)) return;
     for (const d of s.dns) {
       const v = String(d == null ? '' : d).trim();
       if (v && !out.includes(v)) out.push(v);
     }
-  };
+  });
   if (plan.server) visit(plan.server);
   for (const s of plan.chain || []) visit(s);
   for (const s of Object.values(plan.serversById || {})) visit(s);
@@ -910,8 +1073,8 @@ function routingStrategy(s) {
 
 
 const SETTINGS_DEFAULTS = {
-  socksPort: 10808,
-  httpPort: 10809,
+  socksPort: 30808,
+  httpPort: 30809,
   allowLan: false,
   routingMode: 'global',
   advancedUseMode: false,   // advanced routing also applies routingMode
@@ -922,10 +1085,20 @@ const SETTINGS_DEFAULTS = {
   dnsDirect: ['178.22.122.100', '185.51.200.2'],
   ipv6: false,
   logLevel: 'warning',
-  apiPort: 10085,
+  apiPort: 30085,
   customRules: [],
   geoAssets: true   // geoip.dat/geosite.dat present? false -> skip geo rules
 };
+
+/**
+ * Several internets only with their extension installed (modules.js): settings
+ * that carry `modules` — main.js's and service.js's always do — build multiWan
+ * as disabled while it is not, byte for byte the config of multiWan off;
+ * settings with none (the tests, a builder called by hand) are not asked.
+ */
+function multiWanAllowed(s) {
+  return !(s && s.modules && typeof s.modules === 'object') || moduleOn(s, 'multiWan');
+}
 
 /**
  * The resolver addresses the TUN layer must route past the tunnel. Under TUN
@@ -972,6 +1145,7 @@ function buildConfig(planArg, settings) {
   const geo = s.geoAssets !== false;
 
   const plan = normalizePlan(planArg);
+  refuseSingboxOnly(plan, s);
   const listen = s.allowLan ? '0.0.0.0' : '127.0.0.1';
   const sniffing = s.enableSniffing
     ? { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: false }
@@ -1083,6 +1257,15 @@ function buildConfig(planArg, settings) {
     rules = [...base, ...normalizeCustomRules(s.customRules, geo), tail];
   }
 
+  // LAN users (src/modules/lanUsers/xray.js): each user's config as an outbound
+  // here, beside the plan's, so every pass below reaches it too; their inbounds
+  // and rules at the end. Not installed, or its proxy off: nothing changes.
+  const lu = lanUsers.applies(s) ? lanUsers.lanUsersOutbounds(s.lanUsers, lanUsersCtx(s, plan, exitTag, outbounds)) : null;
+  if (lu) outbounds = outbounds.concat(lu.outbounds);
+  // …and each per-app config's (tunAppTargets.js) the same way. None: nothing changes.
+  const pa = appTargets.applies(s) ? appTargets.appRouteOutbounds(s.appRoutes, appRoutesCtx(s, plan, exitTag, outbounds, lu)) : null;
+  if (pa) outbounds = outbounds.concat(pa.outbounds);
+
   // Name resolution (see dnsBuilder.js). Its rules go FIRST: the port-53 hijack
   // must beat the private-IP bypass, or a query to the tunnel peer 10.255.0.1
   // would be sent "direct" into nowhere instead of being answered.
@@ -1091,10 +1274,25 @@ function buildConfig(planArg, settings) {
   if (dnsPlan.hijackOutbound) outbounds.push(dnsPlan.hijackOutbound);
   rules = [...dnsPlan.rules, ...rules];
 
+  // multi-internet (multiWan.js): a server that dials by itself becomes a
+  // group over the connected internets, a group's members are multiplied over
+  // them — before expandGroups, which writes every group out. Off, or with
+  // nothing to combine, the outbounds are not touched at all.
+  const mw = multiWanAllowed(s) && multiWanApplies(s.multiWan, s.multiWanSkip);
+  if (mw) outbounds = applyMultiWan(outbounds, s.multiWan, s.multiWanSkip, { servers: serversByTag(plan), groupSkip: s.groupSkip });
+
+  // groups: their members, balancers, rules (first of all) and health check —
+  // less any member the app has set aside for not answering (groupEvict.js)
+  const grp = expandGroups(outbounds, s.groupSkip);
+  outbounds = grp.outbounds;
+  rules = [...grp.rules, ...rules];
+
   // Safety net: fix any WireGuard interface address that isn't /32 (/128).
   outbounds = (outbounds || []).map(sanitizeWgOutbound).map(o => applyWgEndpointIps(o, s.wgEndpointIps));
   const hosts = pinEntryHosts(outbounds, s.entryHostIps, s.ipv6);
-  outbounds = applyFragments(outbounds);
+  // a split's download leg pinned like its upload; the split outbounds, for the per-link meter
+  const mwSplit = mw ? finishSplit(outbounds) : null;
+  outbounds = applyEchOutbounds(applyFragments(outbounds));
   if (dropsUdpDirect(s)) echOverDoh(outbounds);
   bindDirectDials(outbounds, s.directInterface);
 
@@ -1109,7 +1307,7 @@ function buildConfig(planArg, settings) {
   // line back for a comparison.
   const level0 = { statsUserUplink: true, statsUserDownlink: true };
 
-  return {
+  const config = {
     log: { loglevel: s.logLevel },
     // Live traffic counters over HTTP (GET /debug/vars) instead of the gRPC-only
     // StatsService: one cheap request per second instead of spawning `xray api
@@ -1124,8 +1322,331 @@ function buildConfig(planArg, settings) {
     dns: withHosts(dnsPlan.dns, hosts),
     inbounds: localInbounds(s, listen, sniffing),
     outbounds,
-    routing: { domainStrategy: routingStrategy(s), rules }
+    routing: withBalancers({ domainStrategy: routingStrategy(s), rules }, grp),
+    ...(grp.observatory ? { observatory: grp.observatory } : {}),
+    ...groupApi(grp, s)
   };
+  // the users' inbounds and rules — after the groups' and the DNS rules, ahead of the plan's
+  if (lu) lanUsers.applyLanUsers(config, s.lanUsers, { tags: lu.tags, ruleAt: grp.rules.length + dnsPlan.rules.length, sniffing, exitTag, geo });
+  // the apps' loopback inbounds and rules — in the same place, beside the users'
+  if (pa) appTargets.applyAppRoutes(config, s.appRoutes, { tags: pa.tags, ruleAt: grp.rules.length + dnsPlan.rules.length, sniffing });
+  // every TCP dial through a hop over a loopback socket — last, see relayHopDials
+  relayHopDials(config, s.chainRelayPort);
+  return withGroupTags(config, grp, mwSplit);
+}
+
+/**
+ * What lanUsers.lanUsersOutbounds needs from the builder: the records the
+ * users' targets name (the plan's, and those ipc.js looked up — a single or
+ * chain plan carries none of its own), the outbound the plan already has for
+ * exactly that target, and the builder's own way to make a server's or a
+ * chain's outbounds — as the pool makes a target's (makeRegistry): mux on a
+ * server's own outbound, its JSON helpers beside it.
+ * `outs`: the plan's outbounds so far, before any pass.
+ * And the plan's own `direct` (`direct`, as it is before any pass): each
+ * user's direct outbound (`lu-d-<id>`) is a copy of it put beside it here, so
+ * every pass that binds the direct path — bindDirectDials' NIC binding under
+ * TUN above all — binds theirs the same way.
+ */
+function lanUsersCtx(s, plan, exitTag, outs) {
+  const direct = (outs || []).find(o => o && o.tag === 'direct') || null;
+  return Object.assign(targetCtx(s, plan, exitTag, outs, s.lanUsers || {}, null), { direct });
+}
+
+/**
+ * The same for the per-app configs (tunAppTargets.js), whose records main.js
+ * looked up (`s.appRoutes`). A target the users already ride (`lu`, their
+ * lanUsersOutbounds answer) shares that outbound too — one WireGuard session
+ * per key, whoever rides it. `outs`: every outbound so far, the users' too.
+ */
+function appRoutesCtx(s, plan, exitTag, outs, lu) {
+  return targetCtx(s, plan, exitTag, outs, s.appRoutes || {}, lu && lu.tags ? lu.tags : null);
+}
+
+/**
+ * targetOutbounds.js's ctx over a plan: `recs` the records the targets name
+ * beyond the plan's ({ serversById, chainsById, wgEndpointIps }), `shared` the
+ * tags another rider already made for a target ({ [target]: tag }, or null).
+ */
+function targetCtx(s, plan, exitTag, outs, recs, shared) {
+  const lu = recs || {};
+  const have = new Set((outs || []).map(o => o && o.tag));
+  const serversById = Object.assign({}, plan.serversById, lu.serversById);
+  const chainsById = Object.assign({}, plan.chainsById, lu.chainsById);
+  const ids = (list) => (Array.isArray(list) ? list : []).filter(x => x && x.outbound).map(x => x.id);
+  const mine = plan.mode === 'chain' ? ids(plan.chain) : (plan.mode === 'single' && plan.server ? [plan.server.id] : []);
+  const wgIps = Object.assign({}, lu.wgEndpointIps, s.wgEndpointIps);
+  return {
+    exitTag, serversById, chainsById,
+    // the selection itself (its exit is `proxy`), or a target / base the plan dials as that very target
+    existingTag(target) {
+      // (never another rider's 'block': whether a target can be dialled is this rider's own records' to say)
+      if (shared && Object.prototype.hasOwnProperty.call(shared, target) && shared[target] && shared[target] !== 'block') return shared[target];
+      if (target.indexOf('chain:') === 0) {
+        const cid = target.slice('chain:'.length);
+        const theirs = ids(chainsById[cid]);
+        if (plan.mode === 'chain' && theirs.length && theirs.join('\n') === mine.join('\n')) return 'proxy';
+        return ['out-chain-' + cid, 'base-chain-' + cid].find(t => have.has(t)) || null;
+      }
+      if (mine.length && mine[mine.length - 1] === target) return 'proxy';
+      return ['out-' + target, 'base-' + target].find(t => have.has(t)) || null;
+    },
+    server: (srv, tag) => withHelpers(applyMux(cloneOut(srv.outbound, tag, srv), srv, s.muxServerIds), srv).map(o => applyWgEndpointIps(o, wgIps)),
+    chain: (list, tag) => (list.length >= 2 ? buildChainOutbounds(list, tag) : withHelpers(cloneOut(list[0].outbound, tag, list[0]), list[0])).map(o => applyWgEndpointIps(o, wgIps)),
+    // A WireGuard endpoint by name that nobody resolved: never handed to the
+    // core (see lanUsersOutbounds). A group's members are written out later, by
+    // expandGroups, and only the connect's own names reach them there. Nor a
+    // TUIC / AnyTLS server (or a group holding one): no Xray core has them —
+    // the user's traffic is blocked, never the owner's whole connection refused.
+    unsafe: (rec) => {
+      if (planServers({ mode: 'single', server: rec }).some(isSingboxOnly)) return true;
+      const known = isGroupRecord(rec) ? (s.wgEndpointIps || {}) : wgIps;
+      return wgEndpointHosts({ mode: 'single', server: rec }).some(h => !known[h]);
+    }
+  };
+}
+
+/**
+ * The server record behind each outbound tag a plan gives a server of its
+ * own — what multi-internet names a link's copy after (its id and name, the
+ * address it dials): the selection's `proxy`, a target's `out-<id>`, a base's
+ * `base-<id>`; a chain of one is its member. (A base is never copied — the
+ * targets through it dial it — but naming it costs nothing.)
+ */
+function serversByTag(plan) {
+  const out = {};
+  const one = (list) => { const l = (list || []).filter(s => s && s.outbound); return l.length === 1 ? l[0] : null; };
+  if (plan.mode === 'single' && plan.server) out.proxy = plan.server;
+  if (plan.mode === 'chain' && one(plan.chain)) out.proxy = one(plan.chain);
+  for (const [id, s] of Object.entries(plan.serversById || {})) {
+    if (s) { out['out-' + id] = s; out['base-' + id] = s; }
+  }
+  for (const [cid, list] of Object.entries(plan.chainsById || {})) {
+    const s = one(list);
+    if (s) { out['out-chain-' + cid] = s; out['base-chain-' + cid] = s; }
+  }
+  if (one(plan.chain)) { out['out-chain'] = one(plan.chain); out['base-chain'] = one(plan.chain); }
+  return out;
+}
+
+/* ----------------------------------- groups ----------------------------------- */
+/**
+ * How a group's health check asks: the page every ping here asks, all members
+ * at once, every 10 s — a member that stops answering is out of the rotation
+ * within seconds, and one that answers again is back as fast (one tiny request
+ * per member each time). A group the links make (multiWan.js) asks for longer
+ * (`_group.probeEvery`, in seconds): each probe is a whole handshake on a link
+ * that may be a capped mobile one — multiWan.js PROBE_EVERY_S has the bytes.
+ * The core has one observatory for the whole config, so the longest interval
+ * a group asks for is everyone's.
+ */
+const GROUP_PROBE = { url: 'http://cp.cloudflare.com/', seconds: 10 };
+
+/**
+ * Groups (groups.js): every outbound a group record became — a `loopback`
+ * marked `_group`, tagged T wherever the plan put it (the selection, a rule's
+ * target, a base, a chain's hop) — expanded into what the core runs:
+ *  - its members `T~gm<i>`, each dialling through T's own dialerProxy when the
+ *    group rides one (a chain's later hop, a base) — the loopback itself dials
+ *    nothing; a JSON member's helpers are `T~gh<i>~<tag>`, outside the
+ *    balancer's prefix;
+ *  - T itself: `{ protocol: 'loopback', settings: { inboundTag: 'T~in' } }` —
+ *    what is routed to T comes back in on T~in;
+ *  - the balancer `T~bal` over the `T~gm` prefix, its fallback the first
+ *    member: Xray's roundRobin and random leave out a member the health check
+ *    found dead only when a fallback is set (app/router/balancing.go);
+ *  - the rule T~in → T~bal, which the caller puts FIRST in routing: what
+ *    loops back must meet its balancer before any other rule — a hop to a
+ *    bridge in Iran, say, before `geoip:ir → direct`;
+ *  - one observatory over every group's members, at the longest interval a
+ *    group asks for (GROUP_PROBE: 10 s, a multi-internet group's longer).
+ * Runs before every pass that reads the outbounds (pinEntryHosts,
+ * applyFragments, bindDirectDials …) so the members get them all.
+ * `map`: each group in the config — its tag, its id and name, its strategy,
+ * and who `T~gm<i>` is ({ id, name, address, port } of the server dialled; a
+ * chain variant by the group member it takes) — for the live meter.
+ * `map` also says which members the app could test on their own: `direct`
+ * false for a group dialled through a hop and for a chain variant.
+ * `skip`: the member keys (groupMemberKey) the app has set aside — left out,
+ * unless that would leave the group empty.
+ * → { outbounds, rules, balancers, observatory | null, map }
+ */
+function expandGroups(outbounds, skip) {
+  const skipped = new Set(Array.isArray(skip) ? skip : []);
+  const out = [];
+  const rules = [];
+  const balancers = [];
+  const subjects = [];
+  const map = [];
+  let every = GROUP_PROBE.seconds;
+  const who = (m) => {
+    const recs = Array.isArray(m.label) && m.label.length ? m.label : [m];
+    const r = recs[0] || {};
+    return { id: r.id || '', name: recs.map(x => (x && x.name) || '').filter(Boolean).join(' + '), address: r.address || '', port: r.port || 0 };
+  };
+  const queue = (outbounds || []).slice();
+  while (queue.length) {
+    const o = queue.shift();
+    const g = o && o.protocol === 'loopback' && o._group;
+    if (!g || typeof g !== 'object') { out.push(o); continue; }
+    const T = o.tag;
+    const so = o.streamSettings && o.streamSettings.sockopt;
+    const via = so && so.dialerProxy ? String(so.dialerProxy) : '';
+    out.push({ tag: T, protocol: 'loopback', settings: { inboundTag: T + '~in' } });
+    const all = (Array.isArray(g.members) ? g.members : []).filter(m => m && (m.outbound || Array.isArray(m.chain)));
+    const kept = skipped.size ? all.filter(m => !skipped.has(groupMemberKey(g.id, who(m)))) : all;
+    const members = kept.length ? kept : all;
+    members.forEach((m, i) => {
+      const tag = `${T}~gm${i}`;
+      // a chain variant (groupOfChains): its exit is the member, its hops `T~gh<i>-h<j>`
+      if (Array.isArray(m.chain)) { out.push(...buildChainOutbounds(m.chain, tag, via || null, `${T}~gh${i}`)); return; }
+      if (via) { out.push(behind(m, tag, via)); return; }
+      const ob = cloneOut(m.outbound, tag, m);
+      out.push(ob, ...helpersFor(m, ob, `${T}~gh${i}`));
+    });
+    if (!members.length) continue;
+    // The fallback (a WARP, say): `T~fb`, outside the members' prefix — never
+    // probed, never picked while a member answers; taken when none does. Not
+    // for a group of chain variants (each would need its own chain).
+    const fb = g.fallback && g.fallback.outbound && !members.some(m => Array.isArray(m.chain)) ? g.fallback : null;
+    if (fb) {
+      const tag = `${T}~fb`;
+      if (via) out.push(behind(fb, tag, via));
+      else { const ob = cloneOut(fb.outbound, tag, fb); out.push(ob, ...helpersFor(fb, ob, `${T}~fh`)); }
+    }
+    balancers.push({
+      tag: T + '~bal', selector: [T + '~gm'],
+      strategy: { type: GROUP_STRATEGIES.includes(g.strategy) ? g.strategy : 'roundRobin' },
+      fallbackTag: fb ? T + '~fb' : T + '~gm0'
+    });
+    rules.push({ type: 'field', inboundTag: [T + '~in'], balancerTag: T + '~bal' });
+    subjects.push(T + '~gm');
+    const asks = Number(g.probeEvery);
+    if (Number.isInteger(asks) && asks > every) every = asks;
+    map.push({ tag: T, groupId: g.id || '', name: g.name || '', strategy: GROUP_STRATEGIES.includes(g.strategy) ? g.strategy : 'roundRobin', direct: !via,
+      fallback: fb ? { id: fb.id || '', name: fb.name || '' } : null,
+      members: members.map(m => Object.assign(who(m), { direct: !via && !Array.isArray(m.chain) })) });
+  }
+  const observatory = subjects.length
+    ? { subjectSelector: subjects, probeUrl: GROUP_PROBE.url, probeInterval: every + 's', enableConcurrency: true }
+    : null;
+  return { outbounds: out, rules, balancers, observatory, map };
+}
+
+/**
+ * The core's control API (HandlerService) when a group runs and the connect
+ * gave it a port: what groupLive.js reaches to take a dead member out of the
+ * running core, and to put it back, without a restart. Loopback only.
+ */
+function groupApi(grp, s) {
+  if (!grp || !grp.observatory || !s || !s.apiCtlPort) return {};
+  return { api: { tag: 'api', listen: `127.0.0.1:${s.apiCtlPort}`, services: ['HandlerService'] } };
+}
+
+/** A group member as the app names it to set it aside: its group, the server dialled and the address it dials. */
+function groupMemberKey(groupId, m) {
+  return [groupId || '', (m && m.id) || '', (m && m.address) || '', (m && m.port) || 0].join('|');
+}
+
+/* --------------------------------- the chain relay --------------------------------- */
+/**
+ * A TCP dial through a hop rides a real loopback socket: a SOCKS inbound
+ * `chain-relay` on 127.0.0.1:<s.chainRelayPort>, one account per hop (named
+ * after it), routed by that account to the hop — the dial's dialerProxy names
+ * `chain-relay~<hop>`, a SOCKS outbound to that inbound.
+ *
+ * Straight through the hop (dialerProxy), the end of a response the far side
+ * closed was lost — on Xray 26.3.27 and 26.10.21 and Xray-PattN 26.10.22
+ * alike, group or not (scripts/probe-chain-tail.js, 2026-10-26): a hop whose transport ends
+ * with an error instead of EOF — WebSocket's close frame always does — has
+ * the core interrupt the in-memory pipe to the next hop
+ * (app/proxyman/outbound/handler.go), and an interrupted pipe drops whatever
+ * that hop had not read yet (transport/pipe/impl.go). On a 4-core Linux
+ * runner, 1–4 % of small pages and half the 256 KB ones through a ws hop came
+ * back cut short, many with nothing at all; through the relay the bytes are
+ * in the kernel before the hop's error, and none of 2,400 was. A group's
+ * loopback on an official core before 26.4.25 copies through a pipe of its own
+ * (XTLS/Xray-core#6005 made it hand the link on) and loses the same way, the
+ * relay or not: 26.3.27 cut every 256 KB page short through [H → group].
+ *
+ * Only a dial that carries everything in its TCP stream (vless, vmess, trojan,
+ * http over a TCP transport — and a LAN user's safe-search redirect, a freedom
+ * `lu-ss-*` whose rules give it TCP 443 alone: lanUsers/xray.js) through a
+ * proxy hop. A WireGuard or a UDP
+ * transport dialling the hop, a Shadowsocks or SOCKS exit (their UDP is UDP)
+ * and a hop that is a freedom (a fragment or interface dialer), a loopback or
+ * a WireGuard keep their dialerProxy. The accounts' level has no user
+ * counters: a LAN user may be called `proxy-h0` too (lanUsers/meter.js reads
+ * the core's user counters by name). Runs last, so no pass binds, pins or
+ * fragments the relay's own dial. No port (a test config, an older caller):
+ * nothing changes.
+ */
+const RELAY_IN = 'chain-relay';
+const RELAY_DIALS = new Set(['vless', 'vmess', 'trojan', 'http']);
+const TCP_NETWORKS = new Set(['raw', 'tcp', 'ws', 'websocket', 'httpupgrade', 'grpc', 'gun', 'h2', 'http', 'xhttp', 'splithttp']);
+const RELAY_LEVEL = 1;   // not in the policy's levels: the core's defaults, no user counters
+
+/** Does this outbound carry everything it is given inside one TCP stream? */
+function dialsTcpOnly(o) {
+  if (o && o.protocol === 'freedom' && String(o.tag || '').indexOf('lu-ss-') === 0 && o.settings && o.settings.redirect) return true;
+  if (!o || !RELAY_DIALS.has(o.protocol)) return false;
+  const ss = o.streamSettings || {};
+  const network = String(ss.network || 'raw').toLowerCase();
+  if (!TCP_NETWORKS.has(network)) return false;
+  // XHTTP over HTTP/3 is QUIC
+  const alpn = [].concat((ss.tlsSettings && ss.tlsSettings.alpn) || [], (ss.realitySettings && ss.realitySettings.alpn) || []);
+  return !((network === 'xhttp' || network === 'splithttp') && alpn.some(a => String(a).toLowerCase() === 'h3'));
+}
+
+function relayHopDials(config, port) {
+  port = parseInt(port, 10);
+  if (!config || !Array.isArray(config.outbounds) || !Number.isInteger(port) || port < 1 || port > 65535) return config;
+  // a port the config already listens on (a caller's mistake) would stop the core starting: no relay then
+  const taken = new Set((config.inbounds || []).map(i => parseInt(i && i.port, 10)));
+  for (const at of [config.metrics && config.metrics.listen, config.api && config.api.listen]) {
+    const m = /:(\d+)$/.exec(String(at || ''));
+    if (m) taken.add(Number(m[1]));
+  }
+  if (taken.has(port)) return config;
+  const byTag = new Map(config.outbounds.filter(Boolean).map(o => [o.tag, o]));
+  const hops = [];
+  for (const o of config.outbounds) {
+    const so = o && o.streamSettings && o.streamSettings.sockopt;
+    const hop = so && so.dialerProxy ? byTag.get(so.dialerProxy) : null;
+    if (!hop || hop.protocol === 'wireguard' || !PROXY_OUT.has(hop.protocol) || !dialsTcpOnly(o)) continue;
+    if (!hops.includes(hop.tag)) hops.push(hop.tag);
+    o.streamSettings.sockopt = Object.assign({}, so, { dialerProxy: `${RELAY_IN}~${hop.tag}` });
+  }
+  if (!hops.length) return config;
+  const pass = RELAY_IN;   // loopback only, and the app's own SOCKS port asks for none
+  for (const h of hops) {
+    config.outbounds.push({ tag: `${RELAY_IN}~${h}`, protocol: 'socks', settings: { servers: [{ address: '127.0.0.1', port, users: [{ user: h, pass }] }] } });
+  }
+  (config.inbounds || (config.inbounds = [])).push({
+    tag: RELAY_IN, listen: '127.0.0.1', port, protocol: 'socks',
+    settings: { auth: 'password', accounts: hops.map(h => ({ user: h, pass })), udp: false, userLevel: RELAY_LEVEL }
+  });
+  // first of all: what the relay hands over goes to its hop, whatever it is addressed to
+  const routing = config.routing || (config.routing = {});
+  routing.rules = [...hops.map(h => ({ type: 'field', inboundTag: [RELAY_IN], user: [h], outboundTag: h })), ...(routing.rules || [])];
+  return config;
+}
+
+/**
+ * The config, with the running groups (expandGroups' map) beside it — never
+ * written to disk: not enumerable. And `multiWanSplit`: the outbounds that
+ * upload on one internet and download on another ([{ tag, up, down }], or
+ * null; multiWan.finishSplit) — what multiWan.linkUsage counts them by.
+ */
+function withGroupTags(config, grp, mwSplit) {
+  Object.defineProperty(config, 'groupTags', { value: grp && grp.map && grp.map.length ? grp.map : null, enumerable: false });
+  Object.defineProperty(config, 'multiWanSplit', { value: mwSplit && mwSplit.length ? mwSplit : null, enumerable: false });
+  return config;
+}
+
+/** A routing object with the groups' balancers, when there are any. */
+function withBalancers(routing, grp) {
+  return grp && grp.balancers.length ? Object.assign(routing, { balancers: grp.balancers }) : routing;
 }
 
 /** The app's own local inbounds: SOCKS and HTTP on the ports from Settings (what the system proxy and TUN reach). */
@@ -1329,9 +1850,19 @@ function buildPoolConfig(plan, s, listen, sniffing) {
   const dnsPlan = buildDnsPlan(dnsSettingsFor(s, plan),
     { geoAssets: s.geoAssets !== false, exitTag: primaryTag, dropUdpDirect: dropsUdpDirect(s) });
   if (dnsPlan.hijackOutbound) reg.add(dnsPlan.hijackOutbound);
-  const outs = (reg.outs || []).map(sanitizeWgOutbound).map(o => applyWgEndpointIps(o, s.wgEndpointIps));
+  // LAN users — see buildConfig (a target an entry already dials shares its outbound)
+  const lu = lanUsers.applies(s) ? lanUsers.lanUsersOutbounds(s.lanUsers, lanUsersCtx(s, plan, primaryTag, reg.outs)) : null;
+  if (lu) lu.outbounds.forEach(o => reg.add(o));
+  // …and the per-app configs — see buildConfig
+  const pa = appTargets.applies(s) ? appTargets.appRouteOutbounds(s.appRoutes, appRoutesCtx(s, plan, primaryTag, reg.outs, lu)) : null;
+  if (pa) pa.outbounds.forEach(o => reg.add(o));
+  // multi-internet, then groups — see buildConfig
+  const mw = multiWanAllowed(s) && multiWanApplies(s.multiWan, s.multiWanSkip);
+  const grp = expandGroups(mw ? applyMultiWan(reg.outs, s.multiWan, s.multiWanSkip, { servers: serversByTag(plan), groupSkip: s.groupSkip }) : reg.outs, s.groupSkip);
+  const outs = grp.outbounds.map(sanitizeWgOutbound).map(o => applyWgEndpointIps(o, s.wgEndpointIps));
   const hosts = pinEntryHosts(outs, s.entryHostIps, s.ipv6);   // see buildConfig
-  const outbounds = applyFragments(outs);
+  const mwSplit = mw ? finishSplit(outs) : null;
+  const outbounds = applyEchOutbounds(applyFragments(outs));
   if (dropsUdpDirect(s)) echOverDoh(outbounds);
   bindDirectDials(outbounds, s.directInterface);
 
@@ -1342,11 +1873,12 @@ function buildPoolConfig(plan, s, listen, sniffing) {
   rules.push({ type: 'field', ip: PRIVATE_IPS.slice(), outboundTag: 'direct' });
   rules.push(...perInboundRules);
   rules.push({ type: 'field', port: '0-65535', outboundTag: primaryTag });
+  rules.unshift(...grp.rules);   // a group's loop back meets its balancer before anything else
 
   // See buildConfig: no per-connection buffer cap for a chained WireGuard.
   const level0 = { statsUserUplink: true, statsUserDownlink: true };
 
-  return {
+  const config = {
     log: { loglevel: s.logLevel },
     // See buildConfig: the metrics endpoint reports every outbound tag, which is
     // what makes the traffic meter work for a pool (exits are 'out-<serverId>').
@@ -1362,8 +1894,15 @@ function buildPoolConfig(plan, s, listen, sniffing) {
     // IPIfNonMatch on purpose: the pool emits no user ip rule (only the private
     // bypass), and on demand every entry's hostname connections would wait on
     // the PRIMARY's DoH — a dead primary costing the others ~8 s per new name.
-    routing: { domainStrategy: 'IPIfNonMatch', rules }
+    routing: withBalancers({ domainStrategy: 'IPIfNonMatch', rules }, grp),
+    ...(grp.observatory ? { observatory: grp.observatory } : {}),
+    ...groupApi(grp, s)
   };
+  // the users' inbounds and rules — after the groups' and the DNS rules, ahead of the private bypass and the entries
+  if (lu) lanUsers.applyLanUsers(config, s.lanUsers, { tags: lu.tags, ruleAt: grp.rules.length + dnsPlan.rules.length, sniffing, exitTag: primaryTag, geo: s.geoAssets !== false });
+  if (pa) appTargets.applyAppRoutes(config, s.appRoutes, { tags: pa.tags, ruleAt: grp.rules.length + dnsPlan.rules.length, sniffing });
+  relayHopDials(config, s.chainRelayPort);   // see buildConfig
+  return withGroupTags(config, grp, mwSplit);
 }
 
 /**
@@ -1377,12 +1916,14 @@ function buildPoolConfig(plan, s, listen, sniffing) {
  * test passes none, and its config is exactly as it was.
  */
 function buildTestConfig(target, socksPort, opts) {
-  const proxyOutbounds = Array.isArray(target)
+  // a group: its members and balancer, no health check — a ping is over before one would answer
+  const grp = expandGroups(Array.isArray(target)
     ? buildChainOutbounds(target, 'proxy')
-    : withHelpers(cloneOut(target.outbound, 'proxy', target), target);
+    : withHelpers(cloneOut(target.outbound, 'proxy', target), target));
+  const proxyOutbounds = grp.outbounds;
   const hosts = opts ? pinEntryHosts(proxyOutbounds, opts.entryHostIps, opts.ipv6) : null;
   // apply TLS fragment (if the config carries one) so the test matches reality
-  const outbounds = applyFragments(proxyOutbounds).concat([{ tag: 'direct', protocol: 'freedom' }]);
+  const outbounds = applyEchOutbounds(applyFragments(proxyOutbounds)).concat([{ tag: 'direct', protocol: 'freedom' }]);
   return {
     log: { loglevel: 'none' },
     ...(hosts ? { dns: { hosts } } : {}),
@@ -1396,7 +1937,7 @@ function buildTestConfig(target, socksPort, opts) {
     outbounds,
     // Unrouted traffic goes to the FIRST outbound — for a chain the entry hop
     // alone, so a dead exit measured green. Route the inbound to the exit.
-    routing: { rules: [{ type: 'field', inboundTag: ['socks-in'], outboundTag: 'proxy' }] }
+    routing: withBalancers({ rules: [...grp.rules, { type: 'field', inboundTag: ['socks-in'], outboundTag: 'proxy' }] }, grp)
   };
 }
 
@@ -1418,11 +1959,12 @@ function buildMultiTestConfig(targets, ports) {
     outbounds.push(...outs);
     rules.push({ type: 'field', inboundTag: [inTag], outboundTag: outTag });
   });
+  const grp = expandGroups(outbounds);   // see buildTestConfig
   return {
     log: { loglevel: 'none' },
     inbounds,
-    outbounds: applyFragments(outbounds).concat([{ tag: 'direct', protocol: 'freedom' }]),
-    routing: { rules }
+    outbounds: applyEchOutbounds(applyFragments(grp.outbounds)).concat([{ tag: 'direct', protocol: 'freedom' }]),
+    routing: withBalancers({ rules: [...grp.rules, ...rules] }, grp)
   };
 }
 
@@ -1499,13 +2041,18 @@ function applyFragments(outbounds) {
     // one shared with an unpinned name would send that name to xray's DNS,
     // which sits behind the very proxy being dialled.
     const strategy = sockopt.domainStrategy || '';
-    const key = frag + '|' + noise + '|' + strategy;
+    // An outbound bound to an interface (a multi-internet copy, multiWan.js)
+    // leaves by that internet: its dialer is the one that opens the socket,
+    // so the binding moves onto the dialer — one dialer per interface.
+    const iface = sockopt.interface || '';
+    const key = frag + '|' + noise + '|' + strategy + (iface ? '|' + iface : '');
     let tag = byKey[key];
     if (!tag) {
       tag = 'dpi-' + (Object.keys(byKey).length + 1);
       byKey[key] = tag;
-      extra.push(makeFragmentOutbound(tag, frag, noise, strategy));
+      extra.push(makeFragmentOutbound(tag, frag, noise, strategy, iface));
     }
+    if (iface) delete sockopt.interface;
     sockopt.dialerProxy = tag;
   }
   return extra.length ? outbounds.concat(extra) : outbounds;
@@ -1528,26 +2075,32 @@ function applyFragments(outbounds) {
  * up, only under tunMode); anything but a non-blank string leaves every
  * outbound exactly as it was, which the golden tests pin. Not applied to
  * buildTestConfig — a ping runs without TUN.
+ *
+ * One already bound to an interface keeps it: a multi-internet copy (and
+ * its dpi dialer) leaves by its own internet (multiWan.js), a raw config
+ * that names one by the one it names — both a physical NIC, never the tunnel.
  */
 function bindDirectDials(outbounds, name) {
   if (typeof name !== 'string' || !name.trim()) return outbounds;
   for (const o of outbounds) {
     if (!o || o.protocol === 'dns' || o.protocol === 'blackhole') continue;
     const ss = o.streamSettings || (o.streamSettings = {});
-    if (ss.sockopt && ss.sockopt.dialerProxy) continue;
+    if (ss.sockopt && (ss.sockopt.dialerProxy || ss.sockopt.interface)) continue;
     ss.sockopt = Object.assign({}, ss.sockopt, { interface: name });
   }
   // An ECH config fetched from DNS is fetched by the core itself, with its own
   // socket options (echSockopt), for a hop behind another hop as much as for
   // the first: bound to the NIC like any direct dial, or the query enters the
-  // tunnel that cannot come up without its answer.
+  // tunnel that cannot come up without its answer. One dialled through an
+  // ECH outbound (applyEchOutbounds) is that outbound's dial, bound above.
   for (const tls of echQueryTls(outbounds)) {
+    if (tls.echSockopt && tls.echSockopt.dialerProxy) continue;
     tls.echSockopt = Object.assign({}, tls.echSockopt, { interface: name });
   }
   return outbounds;
 }
 
-function makeFragmentOutbound(tag, fragStr, noiseStr, strategy) {
+function makeFragmentOutbound(tag, fragStr, noiseStr, strategy, iface) {
   const settings = { domainStrategy: strategy || 'AsIs' };
   if (fragStr) {
     const p = String(fragStr).split(',').map(s => s.trim());
@@ -1560,7 +2113,10 @@ function makeFragmentOutbound(tag, fragStr, noiseStr, strategy) {
   }
   const noises = noiseStr ? parseNoises(noiseStr) : [];
   if (noises.length) settings.noises = noises;
-  return { tag, protocol: 'freedom', settings };
+  const o = { tag, protocol: 'freedom', settings };
+  // the interface the outbound dialling through it was bound to (applyFragments)
+  if (iface) o.streamSettings = { sockopt: { interface: iface } };
+  return o;
 }
 
 // Named presets (also accepted from the link's &noise= value).
@@ -1609,4 +2165,4 @@ function fragRange(v, def, floor) {
   return min + '-' + max;
 }
 
-module.exports = { buildConfig, buildPoolConfig, buildTestConfig, buildMultiTestConfig, buildRoutingRules, buildChainOutbounds, resolverBypassIps, resolverBypassIpsOf, echResolverIpsOf, echQueryOf, wgResolvers, wgEndpointHosts, wgResolverAddresses, entryHosts, withHosts, serverAddressOf, buildRawConfig, rawServerOf, rawModeNotes, entryAddressesOf, isRawJson, rawApplies, dialerTagsOf };
+module.exports = { applyEchOutbounds, expandGroups, groupMemberKey, relayHopDials, buildConfig, buildPoolConfig, buildTestConfig, buildMultiTestConfig, buildRoutingRules, buildChainOutbounds, resolverBypassIps, resolverBypassIpsOf, echResolverIpsOf, echQueryOf, wgResolvers, wgEndpointHosts, wgResolverAddresses, entryHosts, withHosts, serverAddressOf, buildRawConfig, rawServerOf, rawModeNotes, entryAddressesOf, isRawJson, rawApplies, dialerTagsOf };

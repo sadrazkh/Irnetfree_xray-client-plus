@@ -9,7 +9,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { scoreResult, delayStats } = require('../src/main/scan/score');
+const { scoreResult, delayStats, passes, needOf, reasonOf, latencyPoints, PASS_RATIO } = require('../src/main/scan/score');
 
 const close = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-9, `${msg || ''} ${a} vs ${b}`);
 
@@ -48,60 +48,62 @@ test('delayStats rounds avg, median and jitter to one decimal', () => {
   assert.equal(delayStats([10, 11, 12, 15]).median, 11.5);
 });
 
-const delay = (median, jitter = 0, loss = 0, min = median) => ({ min, median, avg: median, jitter, loss, samples: [] });
-const down = (mbps, ok = true) => ({ ok, bytes: 0, ms: 0, ttfb: 0, mbps, mbpsRaw: mbps, warm: true, error: ok ? null : 'timeout' });
+const down = (mbps, ok = true, ttfb = 0) => ({ ok, bytes: 0, ms: 0, ttfb, mbps, mbpsRaw: mbps, warm: true, error: ok ? null : 'timeout' });
 
-test('the formula: base × (1 − loss) / (1 + median/200) / (1 + jitter/100), base = 100 × Mbps, one decimal', () => {
-  // 100 × 10 = 1000 → / (1 + 100/200) / (1 + 20/100) = 1000 / 1.5 / 1.2
-  assert.equal(scoreResult({ delay: delay(100, 20, 0), down: down(10) }), 555.6);
-  // a third lost
-  assert.equal(scoreResult({ delay: delay(100, 20, 1 / 3), down: down(10) }), 370.4);
-  // nothing to penalise
-  assert.equal(scoreResult({ delay: delay(0, 0, 0), down: down(2.5) }), 250);
+test('the formula: 100 × success% + round(99 / (1 + median/200)) — the page shows it / 100', () => {
+  assert.equal(latencyPoints(0), 99);
+  assert.equal(latencyPoints(200), 50);
+  assert.equal(latencyPoints(400), 33);
+  assert.equal(latencyPoints(1e9), 0);
+  assert.equal(scoreResult({ delay: delayStats([100, 120, 140]) }), 10000 + 62);    // median 120
+  assert.equal(scoreResult({ delay: delayStats([100, -1, 140]) }), 6700 + 62);       // 2 of 3, median 120
+  assert.equal(scoreResult({ delay: delayStats([0, 0, 0]) }), 10099);
 });
 
-test('the latency term is the median, not the mean; a row from before the median existed still ranks by its mean', () => {
-  const stats = delayStats([40, 42, 900]);                       // median 42, mean 327.3
-  const byMedian = scoreResult({ delay: Object.assign({}, stats, { jitter: 0 }) });
-  assert.equal(byMedian, 826.4);                                   // 1000 / (1 + 42/200)
-  assert.ok(byMedian > 1000 / (1 + 327.3 / 200) + 400, 'the mean would have halved it');
-  assert.equal(scoreResult({ delay: { min: 0, avg: 200, jitter: 0, loss: 0, samples: [] } }), 500);
+test('success first: three of three at 400 ms beats two of three at 20 ms; then the faster median wins', () => {
+  const steady = scoreResult({ delay: delayStats([380, 400, 420]) });
+  const lucky = scoreResult({ delay: delayStats([20, 20, -1]) });
+  assert.ok(steady > lucky, `${steady} > ${lucky}`);
+  assert.ok(scoreResult({ delay: delayStats([90, 100, 110]) }) > steady, 'the same success, a faster median');
+  assert.ok(Math.floor(steady / 100) === 100 && Math.floor(lucky / 100) === 67, 'the whole part is the success %');
 });
 
-test('more download is a higher score; latency, jitter and loss lower it', () => {
-  const base = scoreResult({ delay: delay(100, 10, 0), down: down(10) });
-  assert.ok(scoreResult({ delay: delay(100, 10, 0), down: down(20) }) > base, 'download');
-  assert.ok(scoreResult({ delay: delay(200, 10, 0), down: down(10) }) < base, 'latency');
-  assert.ok(scoreResult({ delay: delay(100, 40, 0), down: down(10) }) < base, 'jitter');
-  assert.ok(scoreResult({ delay: delay(100, 10, 0.5), down: down(10) }) < base, 'loss');
+test('a pass needs passRatio of the samples (two of three by default, at least one): one lucky answer is 0', () => {
+  assert.equal(PASS_RATIO, 0.66);
+  assert.deepEqual([needOf(3), needOf(2), needOf(5), needOf(1), needOf(3, 1), needOf(4, 0.5)], [2, 2, 4, 1, 3, 2]);
+  assert.equal(passes(delayStats([50, -1, -1])), false);
+  assert.equal(passes(delayStats([50, 60, -1])), true);
+  assert.equal(passes(delayStats([50, -1])), false, 'one of two is not two thirds');
+  assert.equal(passes(delayStats([50])), true);
+  assert.equal(passes(delayStats([50, -1, -1]), 0.3), true, 'a looser ratio when asked');
+  assert.equal(scoreResult({ delay: delayStats([50, -1, -1]) }), 0);
+  assert.equal(scoreResult({ delay: delayStats([50, -1, -1]) }, { passRatio: 0.3 }), 3300 + 79);
+  assert.equal(scoreResult({ delay: delayStats([-1, -1, -1]), tcp: { ok: true, ms: 5 } }), 0, 'no answer at all, whatever else was measured');
+  assert.equal(scoreResult({ delay: { min: 0, avg: 200, jitter: 0, loss: 0, samples: [] } }), 10050, 'a row from before the median existed ranks by its mean');
 });
 
-test('delay-only mode uses base 1000', () => {
-  assert.equal(scoreResult({ delay: delay(0, 0, 0), down: null }), 1000);
-  assert.equal(scoreResult({ delay: delay(200, 0, 0) }), 500);
-  assert.equal(scoreResult({ delay: delay(200, 100, 0) }), 250);
+test('a download that was tested and failed scores 0; one that worked leaves the score to the latency', () => {
+  assert.equal(scoreResult({ delay: delayStats([50, 50, 50]), down: down(0, false) }), 0);
+  assert.equal(scoreResult({ delay: delayStats([50, 50, 50]), down: down(5) }), scoreResult({ delay: delayStats([50, 50, 50]) }));
+  assert.equal(scoreResult({ tcp: { ok: true, ms: 30 }, down: down(4, true, 200) }), 10050, 'no delay: the download’s first byte is the latency');
 });
 
-test('no successful delay sample scores 0, whatever else was measured', () => {
-  assert.equal(scoreResult({ delay: delay(0, 0, 1), down: down(50) }), 0);
-  assert.equal(scoreResult({ delay: delayStats([-1, -1, -1]), tcp: { ok: true, ms: 5 } }), 0);
-});
-
-test('a download that was tested and failed scores 0 — it must not outrank a slow working one', () => {
-  assert.equal(scoreResult({ delay: delay(50), down: down(0, false) }), 0);
-  assert.ok(scoreResult({ delay: delay(50), down: down(0.5) }) > 0);
-});
-
-test('TCP-only: 1000 / (1 + ms/50), so a TCP-only scan still ranks; a failed connect is 0', () => {
-  assert.equal(scoreResult({ tcp: { ok: true, ms: 0 } }), 1000);
-  assert.equal(scoreResult({ tcp: { ok: true, ms: 50 } }), 500);
-  assert.equal(scoreResult({ tcp: { ok: true, ms: 200 } }), 200);
+test('TCP-only: a connect is a full success ranked by its time; a failed connect, an error and nothing are 0', () => {
+  assert.equal(scoreResult({ tcp: { ok: true, ms: 0 } }), 10099);
+  assert.equal(scoreResult({ tcp: { ok: true, ms: 200 } }), 10050);
   assert.equal(scoreResult({ tcp: { ok: false, ms: -1, error: 'timeout' } }), 0);
   assert.equal(scoreResult({ tcp: null, delay: null, down: null, up: null }), 0);
   assert.equal(scoreResult(null), 0);
   assert.equal(scoreResult({ error: 'spawn failed' }), 0);
 });
 
-test('download without delay: the download alone is the base', () => {
-  assert.equal(scoreResult({ tcp: { ok: true, ms: 30 }, down: down(4) }), 400);
+test('reasonOf: the probes’ own reason first; unstable for a series that answered too seldom; download-failed; no-tcp', () => {
+  assert.equal(reasonOf({ reason: 'core' }), 'core');
+  assert.equal(reasonOf({ delay: delayStats([50, -1, -1]) }), 'unstable');
+  assert.equal(reasonOf({ delay: Object.assign(delayStats([-1, -1, -1]), { reason: 'wrong-answer' }) }), 'wrong-answer');
+  assert.equal(reasonOf({ delay: delayStats([-1, -1, -1]) }), 'timeout');
+  assert.equal(reasonOf({ delay: delayStats([50, 60, 70]), down: down(0, false) }), 'download-failed');
+  assert.equal(reasonOf({ tcp: { ok: false, ms: -1 } }), 'no-tcp');
+  assert.equal(reasonOf({ tcp: { ok: false, skipped: true }, delay: delayStats([50, 50, 50]) }), '');
+  assert.equal(reasonOf(null), '');
 });

@@ -52,8 +52,10 @@ jobs:
           cp "$RUNNER_TEMP/x/geoip.dat" "$RUNNER_TEMP/x/geosite.dat" bin/ 2>/dev/null || true
       - name: Xray (suggested) accepts every config
         run: IRNF_XRAY_EXE="$RUNNER_TEMP/x/xray" node scripts/validate-configs.js
-      - name: Xray-PattN (suggested) accepts every config
-        run: IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" node scripts/validate-configs.js
+      - name: Xray-PattN (suggested) accepts every config, its own scan shapes included
+        # IRNF_XRAY_FORK: this core file is named xray, so the script is told it is the
+        # fork — the merge-mask and ClientHello-split scan shapes run only here.
+        run: IRNF_XRAY_FORK=pattn IRNF_XRAY_EXE="$RUNNER_TEMP/p/xray" node scripts/validate-configs.js
       - name: The reverse proxy carries a page, both cores (loopback)
         run: node scripts/probe-reverse.js
       - name: A scan finds the one good target among dead ones, both cores (loopback)

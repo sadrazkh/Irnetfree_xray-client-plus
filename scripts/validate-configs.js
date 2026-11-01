@@ -18,7 +18,10 @@
  * (coreCompat.adaptForCore with the core's own version), as the app does.
  * MASQUE needs Xray 26.9.30 (a WARP account 26.10.10): on an older core those
  * shapes are SKIPPED and said so — CI runs them on the suggested cores (the
- * `cores` job of .github/workflows/test.yml).
+ * `cores` job of .github/workflows/test.yml). Xray-PattN's own masks (the
+ * merge mask, PattNG's ClientHello splits — upstream v1.41) are refused by the
+ * official core, so those scan shapes run only when the core is the fork:
+ * IRNF_XRAY_FORK=pattn, or a core file named xray-pattn as the app installs it.
  *
  * Needs bin/xray(.exe) (`npm run get-xray`), or IRNF_XRAY_EXE.
  * IRNF_VALIDATE_DRY=1 runs no core: every config is built, adapted (for
@@ -34,13 +37,15 @@ const { buildMultiTestConfig } = require('../src/main/configBuilder');
 const { adaptForCore } = require('../src/main/coreCompat');
 const { parseLink, parseMany, createServer } = require('../src/main/parser');
 const { SUGGESTED } = require('../src/main/coreVersions');
-const { usesMasque, usesMasqueWarp, versionBelow, MASQUE_SINCE, MASQUE_WARP_SINCE } = require('../src/main/xrayManager');
+const { usesMasque, usesMasqueWarp, versionBelow, MASQUE_SINCE, MASQUE_WARP_SINCE, PATTN_OOB_SINCE, PLAINTEXT_REJECT } = require('../src/main/xrayManager');
 const { applyTarget, sniSupport } = require('../src/main/scan/substitute');
 const F = require('../tests/fixtures');
 
 const DRY = process.env.IRNF_VALIDATE_DRY === '1';
 const exe = process.env.IRNF_XRAY_EXE || path.join(__dirname, '..', 'bin', process.platform === 'win32' ? 'xray.exe' : 'xray');
 if (!DRY && !fs.existsSync(exe)) { console.error('no core at ' + exe + ' — run: npm run get-xray'); process.exit(2); }
+// Is this core the PattN fork? Its own shapes (scan-pattn-*) run then — and in a dry run.
+const FORK = process.env.IRNF_XRAY_FORK === 'pattn' || /pattn/i.test(path.basename(exe));
 
 /** The core's own version — the first x.y.z `<core> version` prints — which every config is written for. */
 function coreVersion() {
@@ -60,7 +65,7 @@ console.log(`${path.basename(exe)} ${version}${DRY ? ' — dry run: every config
 const work = process.env.IRNF_VALIDATE_OUT || fs.mkdtempSync(path.join(os.tmpdir(), 'irnf-validate-'));
 fs.mkdirSync(work, { recursive: true });
 const assetDir = path.dirname(exe);
-let failed = 0, total = 0, skipped = 0;
+let failed = 0, total = 0, skipped = 0, forkSkipped = 0, plainToFork = 0;
 
 /** One config: written for this core's version, then `run -test` — dry, only written. */
 function check(name, cfg) {
@@ -79,9 +84,19 @@ function check(name, cfg) {
     encoding: 'utf8', timeout: 15000, windowsHide: true
   });
   if (r.status === 0) { console.log('ok   ' + path.basename(file)); return; }
+  const said = ((r.stdout || '') + (r.stderr || '')).trim();
+  // The official core refuses VLESS/Trojan without TLS to a public address (26.10.31 measured it on the
+  // server tab's plaintext bridge links). The server tab runs such a config on Xray-PattN, as the client
+  // does (xserver/core.js, xrayManager's validateWithFallback) — so here it is that core's to prove: the
+  // PattN step (IRNF_XRAY_FORK=pattn) takes the same shape with no such allowance.
+  if (!FORK && PLAINTEXT_REJECT.test(said)) {
+    plainToFork++;
+    console.log(`fork ${path.basename(file)} — the official core refuses plaintext to a public address; it runs on Xray-PattN, whose step proves it`);
+    return;
+  }
   failed++;
   console.log('FAIL ' + path.basename(file));
-  console.log('     ' + ((r.stdout || '') + (r.stderr || '')).trim().split(/\r?\n/).slice(-3).join('\n     '));
+  console.log('     ' + said.split(/\r?\n/).slice(-3).join('\n     '));
 }
 
 // Server-tab shapes (plus): every golden inbound, the exit through a stored
@@ -253,19 +268,55 @@ let scanTotal = 0, scanFailed = 0;
     'warp-h3': masque(warp),
     'warp-h2-cover': masque(Object.assign({}, warp, { masqueHttp: 'h2', fp: 'chrome', sni: 'www.example.com', vcn: 'www.example.com' }))
   };
+  // Xray-PattN's dial tricks as a scan hands them on — applyTarget keeps a
+  // server's sockopt and finalmask (upstream v1.41, xrayManager.pattnOobNeeds).
+  // dialMode's OOB bytes are a sockopt key the official core does not know and
+  // ignores, so that shape runs on every core; the merge mask and PattNG's
+  // ClientHello splits the official core refuses ("unknown config id: merge"),
+  // so those run only on the fork (FORK above; the CI's cores job says which
+  // run that is). The presets are the editor's own (serverFields.js).
+  const SFP = require('../src/renderer/serverFields');
+  const withStream = (server, id, { sockopt, finalmask } = {}) => {
+    const s = JSON.parse(JSON.stringify(server));
+    s.id = id;
+    s.name = id;
+    const st = s.outbound.streamSettings || (s.outbound.streamSettings = {});
+    if (sockopt) st.sockopt = Object.assign({}, st.sockopt, sockopt);
+    if (finalmask) st.finalmask = finalmask;
+    return s;
+  };
+  const preset = (name) => {
+    const p = SFP.FINALMASK_PRESETS.find((x) => x.name === name);
+    if (!p) throw new Error('no finalmask preset named ' + name);
+    return JSON.parse(p.value);
+  };
+  servers['vless-ws-tls-dialmode'] = withStream(F.VLESS_WS_TLS, 'sv-oob', { sockopt: { dialMode: SFP.DIAL_MODE_PRESETS[0].value } });
+  const pattnServers = {
+    'vless-ws-tls-merge': withStream(F.VLESS_WS_TLS, 'sv-merge', { finalmask: preset('merge') }),
+    'trojan-tcp-tls-merge-dialmode': withStream(F.TROJAN_TCP_TLS, 'sv-merge-oob', { finalmask: preset('merge'), sockopt: { dialMode: 'oob.0' } }),
+    'vless-ws-tls-tlshello-0-len': withStream(F.VLESS_WS_TLS, 'sv-th0', { finalmask: preset('tlshello-0-len (0-104-1-0-0-114-1-1-11)') })
+  };
   const variants = [
     { addr: '104.16.0.1' },
     { addr: '2606:4700::1' },
     { addr: '104.16.0.2', port: 2053 },
     { addr: '104.16.0.3', sni: 'front.example.org' }
   ];
-  for (const [name, server] of Object.entries(servers)) {
+  const scanShape = (name, server) => {
     if (!server || !server.outbound) throw new Error('scan shape ' + name + ' did not parse');
     const sniOk = sniSupport(server).ok;
     const list = variants.filter(v => !v.sni || sniOk).map(v => applyTarget(server, v));
     const before = failed, beforeSkip = skipped;
     check(`scan-${name}`, buildMultiTestConfig(list, list.map((x, i) => 47600 + i)));
     if (skipped === beforeSkip) { scanTotal++; if (failed > before) scanFailed++; }
+  };
+  for (const [name, server] of Object.entries(servers)) scanShape(name, server);
+  for (const [name, server] of Object.entries(pattnServers)) {
+    if (DRY || (FORK && !versionBelow(version, PATTN_OOB_SINCE))) scanShape(`pattn-${name}`, server);
+    else {
+      forkSkipped++;
+      console.log(`skip scan-pattn-${name}.json — ${FORK ? `Xray-PattN ${version} is older than ${PATTN_OOB_SINCE}, which knows these masks` : `Xray-PattN's own (IRNF_XRAY_FORK=pattn runs it)`}`);
+    }
   }
 }
 
@@ -273,6 +324,6 @@ if (DRY) {
   console.log(`\n${total} configs built for xray ${version} (${srvTotal} server shapes, ${scanTotal} scan shapes) in ${work} — no core was run`);
   process.exit(0);
 }
-const by = `${path.basename(exe)} ${version} (${srvTotal - srvFailed}/${srvTotal} server shapes, ${scanTotal - scanFailed}/${scanTotal} scan shapes${skipped ? `, ${skipped} MASQUE shape(s) skipped: this core is older than MASQUE` : ''})`;
+const by = `${path.basename(exe)} ${version} (${srvTotal - srvFailed}/${srvTotal} server shapes, ${scanTotal - scanFailed}/${scanTotal} scan shapes${skipped ? `, ${skipped} MASQUE shape(s) skipped: this core is older than MASQUE` : ''}${forkSkipped ? `, ${forkSkipped} Xray-PattN shape(s) skipped: IRNF_XRAY_FORK=pattn runs them` : ''}${plainToFork ? `, ${plainToFork} plaintext shape(s) left to Xray-PattN: the official core refuses them` : ''})`;
 console.log(`\n${total - failed}/${total} configs accepted by ${by}`);
 process.exit(failed ? 1 : 0);

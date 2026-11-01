@@ -183,6 +183,29 @@ test('start() runs the config through xray.validate and stops there on a refusal
   } finally { h2.cleanup(); }
 });
 
+test('start(): the official core refusing a link without TLS to a public address runs the config on Xray-PattN; without PattN the refusal says what to do', async () => {
+  const PLAIN = 'infra/conf: failed to build outbound config with tag interconn > infra/conf: vless without TLS or other encryption is prohibited unless the server address is a private IP or domain';
+  const asked = [];
+  const h = harness({ vars: VARS, xray: { validate: async (cfg, id) => { asked.push(id || 'xray'); return id === 'xray-pattn' ? { ok: true } : { ok: false, error: PLAIN }; } } });
+  try {
+    assert.deepEqual(await h.core.start(), { ok: true });
+    assert.deepEqual(asked, ['xray', 'xray-pattn']);
+    assert.equal(h.spawns[0].bin, '/fake/bin/xray-pattn', 'it runs on the fork');
+    assert.ok(h.logs.some(l => /refuses this link without TLS.*Xray-PattN/.test(l)), h.logs.join('\n'));
+  } finally { h.cleanup(); }
+  // no PattN: the core's own words, and what to do about them
+  const h2 = harness({ vars: VARS, xray: {
+    validate: async () => ({ ok: false, error: PLAIN }),
+    resolveEngine: (id) => ({ id: id || 'xray', bin: id === 'xray-pattn' ? null : '/fake/bin/xray' })
+  } });
+  try {
+    const r = await h2.core.start();
+    assert.equal(r.ok, false);
+    assert.match(r.error, /prohibited.*install Xray-PattN.*TLS or REALITY/);
+    assert.equal(h2.spawns.length, 0);
+  } finally { h2.cleanup(); }
+});
+
 test('start() writes <dataDir>/xserver/config.json, spawns like startTest does, and goes starting → running once the metrics port answers', withCore({ vars: VARS }, async (h) => {
   assert.deepEqual(await h.core.start(), { ok: true });
   const s = h.spawns[0];

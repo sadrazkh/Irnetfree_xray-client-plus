@@ -26,6 +26,8 @@ const http = require('http');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 const { XrayManager, getFreePorts } = require('../src/main/xrayManager');
 const X = require('../src/main/xserver/config');
 const { createScan } = require('../src/main/scan');
@@ -65,12 +67,18 @@ async function main() {
   await new Promise((r) => web.listen(0, '127.0.0.1', r));
   const webPort = web.address().port;
 
-  const [pIn, pDead, apiPort] = await getFreePorts(3);
+  const [pIn, pDead, apiPort, pTls] = await getFreePorts(4);
   const inbound = X.newInbound('vless', { remark: 'probe', listen: '127.0.0.1', port: pIn, network: 'ws', path: '/scan', security: 'none' });
   const client = X.newClient('vless', { email: 'probe' });
   inbound.clients = [client];
-  const model = X.normalizeModel({ schema: 2, publicAddress: '127.0.0.1', inbounds: [inbound], outbounds: [X.newOutbound('freedom', { tag: 'direct' })] });
+  // the parameter matrix's server: raw TCP + TLS that speaks http/1.1 only, under a certificate the client pins
+  const pem = mintCert(xray, engines[0], tmp);
+  const tlsInbound = X.newInbound('vless', { remark: 'probe-tls', listen: '127.0.0.1', port: pTls, network: 'tcp', security: 'tls', tls: { certFile: pem.certFile, keyFile: pem.keyFile, serverName: 'localhost', alpn: ['http/1.1'] } });
+  const tlsClient = X.newClient('vless', { email: 'probe-tls' });
+  tlsInbound.clients = [tlsClient];
+  const model = X.normalizeModel({ schema: 2, publicAddress: '127.0.0.1', inbounds: [inbound, tlsInbound], outbounds: [X.newOutbound('freedom', { tag: 'direct' })] });
   const link = X.clientLink(inbound, client, model, { address: '127.0.0.1' });
+  const tlsLink = X.clientLink(model.inbounds[1], model.inbounds[1].clients[0], model, { address: '127.0.0.1' }).replace('#', `&pcs=${pem.pin}#`);
 
   const store = new Map();
   const events = [];
@@ -151,6 +159,15 @@ async function main() {
       console.log(`${engine} via ${where}: ${run.reply.targets} targets — good ${good}; dead ${dead} → ${v.ok ? 'PASS' : 'FAIL'}`);
       if (!v.ok) { if (run.rows) show(engine, run.rows); annotate('error', `${engine} via ${where}: FAIL — good ${good}; dead ${dead}`); failed++; }
     }
+
+    // the parameter matrix: fingerprint × ALPN × dialMode on the TLS server, every core at once
+    const vr = await variantRun(LOCAL);
+    let vres = vr;
+    if (!vr.ok && vr.tunnelUp) {
+      console.log('  variants: the local page was not reached through the server core — repeating against public pages');
+      vres = await variantRun(PUBLIC);
+    }
+    if (!vres.ok) failed++;
   } finally {
     try { await scan.stop(); } catch { /* none running */ }
     if (server) { try { server.cleanup(); } catch { /* gone */ } }
@@ -158,8 +175,99 @@ async function main() {
     await delay(300);
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* a core still closing */ }
   }
-  console.log(`scan probe: ${engines.length - failed} pass, ${failed} fail`);
+  console.log(`scan probe: ${engines.length + 1 - failed} pass, ${failed} fail (one run per core, then the parameter matrix)`);
   return failed ? 1 : 0;
+
+  /**
+   * The matrix on the TLS server (raw TCP + TLS, http/1.1 only, a pinned
+   * certificate): fingerprint {chrome, firefox} × ALPN {http/1.1, h2} ×
+   * dialMode {none, oob.0}, on the server's port and on a port nobody
+   * listens on, every installed core in ONE run — the gate decides which
+   * core each variant may use. What must hold:
+   *  - a dialMode variant never runs on the official core: on Xray-PattN
+   *    26.10.27+ it runs there alone, on an older PattN (or none) it is left
+   *    out with the reason in the reply — never measured somewhere it would
+   *    be ignored;
+   *  - the dead port fails every variant at the pre-check (no-tcp), so no core
+   *    ever dials it;
+   *  - the config's own combination (fp chrome, ALPN http/1.1, no dialMode)
+   *    passes on every core that ran it — through the expected 204, two
+   *    samples of three at least;
+   *  - every row that failed says why.
+   * What ALPN h2 does against an http/1.1-only server is printed, not judged:
+   * whether uTLS offers the configured ALPN is the core's business.
+   */
+  async function variantRun(targetsOpts) {
+    events.length = 0;
+    const reply = await handlers['scan:start']({
+      link: tlsLink, engines,
+      ipsText: '127.0.0.1', portsText: `${pTls}, ${pDead}`,
+      tests: { tcp: true, delay: true, down: false, up: false },
+      opts: Object.assign({ batch: 10, delaySamples: 3, tcpTimeout: 1500, delayTimeout: 6000, speedTop: 0 }, targetsOpts),
+      variants: { dims: { fingerprint: ['chrome', 'firefox'], alpn: ['http/1.1', 'h2'], dialMode: ['none', 'oob.0'] } }
+    });
+    if (reply.error) { console.log(`variants: refused — ${reply.error}`, JSON.stringify(reply.variants || {}).slice(0, 400)); return { ok: false }; }
+    const t0 = Date.now();
+    while (!events.some(e => e.finished) && Date.now() - t0 < 120000) await delay(100);
+    const rows = events.filter(e => e.result).map(e => e.result);
+    const list = reply.variants.list, skipped = reply.variants.skipped;
+    const problems = [];
+    const pv = await xray.version('xray-pattn').catch(() => '');
+    // the dialMode variants: on PattN only, or left out with the reason
+    const oob = rows.filter(r => /oob\.0/.test(r.variantLabel || ''));
+    if (oob.some(r => r.engine !== 'xray-pattn')) problems.push('a dialMode variant ran on ' + [...new Set(oob.map(r => r.engine))].join(', '));
+    const oobListed = list.filter(v => /oob\.0/.test(v.label));
+    const oobSkipped = skipped.filter(v => /oob\.0/.test(v.label));
+    // half of the 2 × 2 × 2 product carries oob.0: four, run or left out
+    if (oobListed.length + oobSkipped.length !== 4) problems.push(`dialMode variants: ${oobListed.length} run + ${oobSkipped.length} left out, not 4`);
+    if (list.length + skipped.length !== 8) problems.push(`${list.length + skipped.length} variants, not 8`);
+    if (oobListed.some(v => v.engines.join() !== 'xray-pattn')) problems.push('a dialMode variant was given a core other than Xray-PattN');
+    // the dead port: every variant × core it was given, failed at the pre-check
+    const dead = rows.filter(r => r.port === pDead);
+    const expectDead = list.reduce((s, v) => s + v.engines.length, 0);
+    if (dead.length !== expectDead) problems.push(`dead port: ${dead.length} rows, not ${expectDead}`);
+    if (dead.some(r => r.reason !== 'no-tcp' || r.score > 0)) problems.push('a dead-port row is not a no-tcp failure');
+    // the config's own combination passes on every core it ran on
+    const own = rows.filter(r => r.port === pTls && r.variantLabel === 'fp=chrome · alpn=http/1.1 · dm=none');
+    const ownEngines = (list.find(v => v.label === 'fp=chrome · alpn=http/1.1 · dm=none') || { engines: [] }).engines;
+    if (own.length !== ownEngines.length || own.some(r => !(r.score > 0))) problems.push(`the config's own combination: ${own.map(r => r.engine + ' ' + r.score + ' ' + (r.reason || '')).join(', ') || 'no rows'}`);
+    if (rows.some(r => !(r.score > 0) && !r.reason)) problems.push('a failed row without a reason');
+    // the table: what each variant did on the live port
+    console.log(`variants (${list.length} run, ${skipped.length} left out; Xray-PattN ${pv || 'missing'}):`);
+    for (const v of list) {
+      const mine = rows.filter(r => r.port === pTls && r.variant === v.key);
+      const cells = mine.map(r => `${r.engine} ${r.score > 0 ? (r.score / 100).toFixed(2) + ' (' + r.delay.median + ' ms)' : '× ' + r.reason}`).join(' · ');
+      console.log(`  ${v.label.padEnd(36)} ${cells}`);
+    }
+    for (const s of skipped) console.log(`  ${s.label.padEnd(36)} left out — ${s.reason}`);
+    const tunnelUp = own.some(r => r.tcp && r.tcp.ok);
+    const ok = !problems.length;
+    console.log(`variants via ${targetsOpts === LOCAL ? 'the local page' : 'public pages'}: ${ok ? 'PASS' : 'FAIL — ' + problems.join('; ')}`);
+    if (!ok) annotate('error', 'variants: ' + problems.join('; '));
+    return { ok, tunnelUp };
+  }
+}
+
+/**
+ * A certificate for localhost, fresh from the core itself (`xray tls cert`,
+ * two days), and its pin — the SHA-256 of the leaf the client is told to
+ * accept (pcs). The fixture pair in tests/ has expired; it is the fallback
+ * when the core cannot mint one.
+ */
+function mintCert(xray, engine, dir) {
+  let pair;
+  try {
+    const bin = xray.resolveEngine(engine, { quiet: true }).bin;
+    pair = JSON.parse(execFileSync(bin, ['tls', 'cert', '--domain=localhost', '--expire=48h'], { encoding: 'utf8', windowsHide: true, timeout: 15000 }));
+  } catch {
+    pair = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'tests', 'fixtures', 'selfsigned.json'), 'utf8'));
+  }
+  const cert = pair.certificate.join('\n') + '\n';
+  const certFile = path.join(dir, 'probe.crt'), keyFile = path.join(dir, 'probe.key');
+  fs.writeFileSync(certFile, cert);
+  fs.writeFileSync(keyFile, pair.key.join('\n') + '\n');
+  const pin = new crypto.X509Certificate(cert).fingerprint256.replace(/:/g, '').toLowerCase();
+  return { certFile, keyFile, pin };
 }
 
 main().then((code) => process.exit(code), (e) => { console.error(e); process.exit(1); });

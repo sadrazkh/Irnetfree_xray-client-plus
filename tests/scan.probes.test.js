@@ -288,22 +288,104 @@ test('upload: no answer is a timeout; a refused CONNECT is a failure', async () 
 test('delaySeries: n requests in a row, summarised with a median', async () => {
   await withRig(async (rig) => {
     const s = await delaySeries(rig.socksPort, { n: 3, host: 'plain.test', port: 80, path: '/', timeout: 2000 });
-    assert.deepEqual(Object.keys(s).sort(), ['avg', 'jitter', 'loss', 'median', 'min', 'samples']);
+    assert.deepEqual(Object.keys(s).sort(), ['avg', 'jitter', 'loss', 'median', 'min', 'reason', 'samples', 'status']);
     assert.equal(s.samples.length, 3);
     assert.equal(s.loss, 0);
+    assert.equal(s.reason, '');
     assert.ok(s.min >= 0 && s.median >= s.min && s.avg >= s.min);
     assert.equal(rig.log.filter(e => e.url === '/').length, 3);
   });
 });
 
-test('delaySeries: a first request that fails ends the series — the rest count as lost', async () => {
+test('delaySeries: a definitive first failure ends the series — the rest count as lost, the reason kept', async () => {
   await withRig(async (rig) => {
     const t0 = Date.now();
     const s = await delaySeries(rig.socksPort, { n: 3, host: 'nowhere.test', port: 80, path: '/', timeout: 500 });
     assert.equal(s.loss, 1);
     assert.deepEqual(s.samples, [-1, -1, -1]);
+    assert.equal(s.reason, 'proxy-refused');
     assert.ok(Date.now() - t0 < 1500, 'one failure, not three timeouts');
   });
+});
+
+/* ----------------------------- what a pass means (2026-11-01) ----------------------------- */
+
+const { tunnelGet, tlsPing, readExpect, needOf, REASONS } = require('../src/main/scan/probes');
+const freePort = () => new Promise((r) => { const s = net.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
+
+test('readExpect: a status, a range, a list, a class; empty is 200–399; junk does not read', () => {
+  const t = (s, c) => readExpect(s)(c);
+  assert.equal(t('204', 204), true);
+  assert.equal(t('204', 200), false);
+  assert.equal(t('200-299', 250), true);
+  assert.equal(t('200,204', 204), true);
+  assert.equal(t('2xx 3xx', 302), true);
+  assert.equal(t('2xx', 404), false);
+  assert.equal(t('', 302), true);
+  assert.equal(t('', 403), false, 'an error page is not an answer');
+  for (const bad of ['abc', '99', '600', '300-200', '6xx']) assert.equal(readExpect(bad), null, bad);
+});
+
+test('tunnelGet: the expected status is a pass, another one a wrong answer; each failure says where it happened', async () => {
+  await withRig(async (rig) => {
+    const ok = await tunnelGet(rig.socksPort, { host: 'plain.test', port: 80, path: '/', timeout: 2000, expect: '204' });
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    assert.equal(ok.status, 204);
+    assert.ok(ok.ms >= 0);
+    const wrong = await tunnelGet(rig.socksPort, { host: 'plain.test', port: 80, path: '/nope', timeout: 2000, expect: '204' });
+    assert.deepEqual([wrong.ok, wrong.reason, wrong.status], [false, 'wrong-answer', 404], 'a 404 is not a working tunnel');
+    const loose = await tunnelGet(rig.socksPort, { host: 'plain.test', port: 80, path: '/nope', timeout: 2000, expect: '' });
+    assert.equal(loose.reason, 'wrong-answer', 'not even the loose 200–399');
+    const refused = await tunnelGet(rig.socksPort, { host: 'nowhere.test', port: 80, path: '/', timeout: 1000 });
+    assert.equal(refused.reason, 'proxy-refused');
+    const closed = await tunnelGet(rig.socksPort, { host: 'dead.test', port: 80, path: '/', timeout: 1000 });
+    assert.ok(['proxy-refused', 'proxy-closed'].includes(closed.reason), closed.reason);
+    const hang = await tunnelGet(rig.socksPort, { host: 'plain.test', port: 80, path: '/hang', timeout: 400 });
+    assert.equal(hang.reason, 'timeout');
+  });
+  assert.equal((await tunnelGet(await freePort(), { host: 'x.test', port: 80, path: '/', timeout: 1000 })).reason, 'core', 'nothing on the SOCKS port: the core is not there');
+  assert.ok(REASONS.includes('unstable') && REASONS.includes('no-tcp'));
+});
+
+test('delaySeries: a timeout is tried again, a series that can no longer pass stops, and the expectation reaches every request', async () => {
+  const fake = (script) => { let i = 0; const calls = []; return { calls, get: async (port, o) => { calls.push(o); return script[i++] || { ok: false, reason: 'timeout' }; } }; };
+  const ok = (ms) => ({ ok: true, ms, status: 204, reason: '' });
+  const to = { ok: false, ms: -1, reason: 'timeout' };
+  let f = fake([to, ok(50), ok(70)]);
+  let s = await delaySeries(1, { n: 3, get: f.get });
+  assert.deepEqual(s.samples, [-1, 50, 70], 'a timeout, then two answers');
+  assert.equal(s.reason, 'timeout');
+  assert.equal(f.calls.length, 3);
+  f = fake([to, to, ok(1)]);
+  s = await delaySeries(1, { n: 3, get: f.get });
+  assert.equal(f.calls.length, 2, 'two of three can no longer be reached: the third is not asked');
+  assert.deepEqual(s.samples, [-1, -1, -1]);
+  f = fake([{ ok: false, reason: 'proxy-closed' }, ok(1), ok(1)]);
+  s = await delaySeries(1, { n: 3, get: f.get });
+  assert.equal(f.calls.length, 1, 'a closed tunnel first is an answer, not a hiccup');
+  assert.equal(s.reason, 'proxy-closed');
+  f = fake([ok(40), { ok: false, reason: 'proxy-closed' }, ok(60)]);
+  s = await delaySeries(1, { n: 3, get: f.get });
+  assert.deepEqual(s.samples, [40, -1, 60], 'after a success a closed tunnel is one lost sample');
+  f = fake([ok(40), to, ok(60)]);
+  await delaySeries(1, { n: 3, get: f.get, passRatio: 1 });
+  assert.equal(f.calls.length, 2, 'passRatio 1: the first loss ends it');
+  f = fake([ok(1)]);
+  await delaySeries(1, { n: 1, get: f.get, expect: '200-299', host: 'h', port: 8080, path: '/p', timeout: 99 });
+  assert.deepEqual(f.calls[0], { host: 'h', port: 8080, path: '/p', timeout: 99, expect: '200-299' });
+  assert.deepEqual([needOf(3, 0.66), needOf(2, 0.66), needOf(4, 0.66), needOf(5, 0.66), needOf(1, 0.66), needOf(3, 1), needOf(3, 0)], [2, 2, 3, 4, 1, 3, 2]);
+});
+
+test('tlsPing: a finished handshake under the SNI is a pass; a plain server is `tls`, nothing listening `no-tcp`', async () => {
+  await withRig(async (rig) => {
+    const ok = await tlsPing('127.0.0.1', rig.tlsPort, { servername: 'tls.test', timeout: 2000 });
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    assert.ok(rig.sni.includes('tls.test'));
+    const plain = await tlsPing('127.0.0.1', rig.plainPort, { servername: 'tls.test', timeout: 1500 });
+    assert.deepEqual([plain.ok, plain.reason], [false, 'tls']);
+  });
+  const none = await tlsPing('127.0.0.1', await freePort(), { servername: 'x.test', timeout: 1000 });
+  assert.deepEqual([none.ok, none.reason], [false, 'no-tcp']);
 });
 
 /* ----------------------------- TLS ----------------------------- */
