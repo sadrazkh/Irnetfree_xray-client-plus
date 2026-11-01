@@ -628,12 +628,19 @@
     return out;
   }
 
-  /** The pieces into the line, each isolated; the joints between them as plain text. */
+  /**
+   * The pieces into the line, each isolated in the page's own direction (not
+   * `auto`: a piece that starts with a number was measured laid out left to
+   * right in the Persian page); the joints between them as plain text.
+   */
   function setSummaryText(el, parts) {
     el.textContent = '';
+    const dir = document.documentElement.dir === 'rtl' ? 'rtl' : 'ltr';
+    el.dir = dir;
     parts.forEach((s, i) => {
       if (i % 2) { el.appendChild(document.createTextNode(s)); return; }
       const b = document.createElement('bdi');
+      b.dir = dir;
       b.textContent = s;
       el.appendChild(b);
     });
@@ -1067,7 +1074,7 @@
     for (const s of variantSkipped) {
       const tr = document.createElement('tr');
       tr.className = 'scan-row scan-row-dead';
-      tr.innerHTML = '<td class="scan-c-var" dir="ltr"></td><td class="scan-n" colspan="5"></td>';
+      tr.innerHTML = '<td class="scan-c-var" dir="ltr"></td><td class="scan-vskip" colspan="5"></td>';
       tr.cells[0].textContent = s.label;
       tr.cells[1].textContent = fill(t('scan.vskipped'), { r: s.reason });
       host.appendChild(tr);
