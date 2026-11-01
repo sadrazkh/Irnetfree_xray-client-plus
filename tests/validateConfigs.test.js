@@ -24,9 +24,18 @@ test('the dry run builds every server and scan shape — MASQUE, WARP and ECH am
     assert.match(r.stdout, /configs built for xray \d+\.\d+\.\d+ \((\d+) server shapes, (\d+) scan shapes\)/);
     const [, srv, scan] = /\((\d+) server shapes, (\d+) scan shapes\)/.exec(r.stdout).map(Number);
     assert.ok(srv >= 40, 'server shapes: ' + srv);
-    assert.equal(scan, 17);
-    for (const name of ['scan-masque-h3', 'scan-masque-h2', 'scan-warp-h3', 'scan-warp-h2-cover', 'scan-vless-ws-tls-ech', 'scan-hy2-salamander-hop', 'scan-wireguard', 'scan-json-fragment']) {
+    assert.equal(scan, 21);
+    for (const name of ['scan-masque-h3', 'scan-masque-h2', 'scan-warp-h3', 'scan-warp-h2-cover', 'scan-vless-ws-tls-ech', 'scan-hy2-salamander-hop', 'scan-wireguard', 'scan-json-fragment',
+      'scan-vless-ws-tls-dialmode', 'scan-pattn-vless-ws-tls-merge', 'scan-pattn-trojan-tcp-tls-merge-dialmode', 'scan-pattn-vless-ws-tls-tlshello-0-len']) {
       assert.ok(built.includes(name + '.json'), name);
+    }
+    // Xray-PattN's dial tricks survive applyTarget and adaptForCore on every variant (upstream v1.41)
+    const oob = JSON.parse(fs.readFileSync(path.join(out, 'scan-vless-ws-tls-dialmode.json'), 'utf8'));
+    assert.deepEqual(oob.outbounds.filter(o => o.protocol === 'vless').map(o => o.streamSettings.sockopt.dialMode), ['oob.0', 'oob.0', 'oob.0', 'oob.0']);
+    const merge = JSON.parse(fs.readFileSync(path.join(out, 'scan-pattn-trojan-tcp-tls-merge-dialmode.json'), 'utf8'));
+    for (const o of merge.outbounds.filter(o => o.protocol === 'trojan')) {
+      assert.equal(o.streamSettings.sockopt.dialMode, 'oob.0');
+      assert.equal(o.streamSettings.finalmask.tcp[0].type, 'merge');
     }
     // the scan core of an SNI-able config carries the four variants; REALITY's three (no SNI)
     const ws = JSON.parse(fs.readFileSync(path.join(out, 'scan-vless-ws-tls.json'), 'utf8'));
