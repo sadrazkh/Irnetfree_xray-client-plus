@@ -298,10 +298,18 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  padding-block: 14px;
+  gap: calc(8px * var(--navz, 1));
+  padding-block: calc(14px * var(--navz, 1));
   overflow: visible;
 }
+/* every item shrinks together when they would not fit the rail's height
+   (app.js fitNav sets --navz below 1; unset, they are their own size); a
+   labelled skin's labels go first where they would be too small to read, and
+   past the smallest zoom the rail scrolls. Never squeezed by the flex column
+   itself: that pressed a button down to its icon, and a label ran off the end */
+.sidebar > :not(.sidebar-spacer) { zoom: var(--navz, 1); flex-shrink: 0; }
+.sidebar[data-nav-compact] .nav-item > span:not(.nav-ico) { display: none; }
+.sidebar[data-nav-scroll] { overflow-y: auto; scrollbar-width: none; }
 .nav-item {
   width: 40px; height: 40px;
   display: grid;
@@ -629,6 +637,8 @@ button { cursor: pointer; background: none; border: 0; color: inherit; }
 .proto-wireguard { color: var(--ok); border-color: var(--okSoft); background: var(--okSoft); }
 .proto-hysteria2 { color: var(--info); border-color: var(--infoSoft); background: var(--infoSoft); }
 .proto-masque { color: var(--accentInk); border-color: var(--accentLine); background: var(--accentSoft); }
+.proto-tuic { color: var(--info); border-color: var(--infoSoft); background: var(--infoSoft); }   /* QUIC, as Hysteria2 */
+.proto-anytls { color: var(--warn); }   /* password + TLS, as Trojan */
 .proto-chain, .proto-pool, .proto-advanced { color: var(--info); }
 .proto-auto { color: var(--ok); }   /* the picker's "fastest server" action */
 
@@ -729,6 +739,14 @@ button.ins-row:hover .ins-label { color: var(--accentInk); }
 }
 .qr-image svg { display: block; width: 100%; height: auto; }
 .qr-image img { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+/* paper is white whatever the skin: the Users page's wall sheet (settings.css .lu-printsheet) */
+@media print {
+  html.lu-printing, html.lu-printing body, html.lu-printing .lu-printsheet { color-scheme: light; color: #000; background: #fff !important; }
+  html.lu-printing body::before, html.lu-printing body::after { display: none !important; }   /* a skin's own strip (skins.css console) */
+  /* a sign-in card (settings.css .lu-pc): its cut line black, the lines between its rows a light grey */
+  html.lu-printing .lu-pc { border-color: #000; }
+  html.lu-printing .lu-pc-row { border-block-end-color: #bbb; }
+}
 .modal-foot {
   display: flex;
   justify-content: flex-end;
@@ -862,6 +880,26 @@ button.ins-row:hover .ins-label { color: var(--accentInk); }
    get connected — that is the rule the mode has to keep. */
 body[data-ui-mode="simple"] .pro-only { display: none !important; }
 body[data-ui-mode="simple"] .inspector { display: none; }
+
+/* ----------------------------- extensions ----------------------------- */
+
+/* An extension that is not installed (modules.js) draws nothing: the markup
+   names what is its own with data-module, app.js applyModules() says on the
+   body which are off (data-mod-<id>="off"; "on" where installed, or where it
+   is no extension at all). Hidden, never removed — the data stays. "chains
+   groups" is the page that holds both: it goes when both do. */
+body[data-mod-chains="off"] [data-module="chains"],
+body[data-mod-groups="off"] [data-module="groups"],
+body[data-mod-chains="off"][data-mod-groups="off"] [data-module="chains groups"],
+body[data-mod-warp="off"] [data-module="warp"],
+body[data-mod-pool="off"] [data-module="pool"],
+body[data-mod-advanced-routing="off"] [data-module="advancedRouting"],
+body[data-mod-ech-outbound="off"] [data-module="echOutbound"],
+body[data-mod-anti-dpi="off"] [data-module="antiDpi"],
+body[data-mod-lan-share="off"] [data-module="lanShare"],
+body[data-mod-multi-wan="off"] [data-module="multiWan"],
+body[data-mod-remote-relay="off"] [data-module="remoteRelay"],
+body[data-mod-lan-users="off"] [data-module="lanUsers"] { display: none !important; }
 
 .logo-dot { display: none; }
 .open { display: block; }

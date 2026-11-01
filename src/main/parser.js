@@ -93,14 +93,22 @@ function mldsaKey(v) {
  *  - `pcs` (pinnedPeerCertSha256): the certificate to accept — what replaced
  *    allowInsecure in the core; see pinList.
  *  - `vcn` (verifyPeerCertByName): the name(s) to verify the certificate
- *    against instead of the SNI (a fronted server's own name).
+ *    against instead of the SNI (a fronted server's own name). `pcn` is the
+ *    same thing under another panel's name — Fastly-fronted links carry
+ *    `sni=firefox.com&pcn=default.ssl.fastly.net`; dropped, the certificate was
+ *    checked against the SNI and the server never connected. Shared as `vcn`.
+ *  - `echOutbound` (PattN's, not a core key): the outbound the ECH query is
+ *    dialled through — kept in tlsSettings as an object, taken out and wired
+ *    up as `echSockopt.dialerProxy` by configBuilder.applyEchOutbounds.
  */
 function tlsExtras(tls, q) {
   const ech = String(q.ech || q.echConfigList || '').trim();
   if (ech) tls.echConfigList = ech;
+  const eo = echOutboundOf(q.echOutbound);
+  if (eo) tls.echOutbound = eo;
   const pcs = pinList(q.pcs || q.pinnedPeerCertSha256 || q.pinSHA256 || '');
   if (pcs) tls.pinnedPeerCertSha256 = pcs;
-  const vcn = String(q.vcn || q.verifyPeerCertByName || '').split(',').map(x => x.trim()).filter(Boolean).join(',');
+  const vcn = String(q.vcn || q.verifyPeerCertByName || q.pcn || '').split(',').map(x => x.trim()).filter(Boolean).join(',');
   if (vcn) tls.verifyPeerCertByName = vcn;
   return tls;
 }
@@ -189,12 +197,13 @@ function buildStreamSettings(q) {
 
   // --- security specific ---
   if (security === 'tls') {
+    // `serverName` / `fingerprint`: the core's own key names, which some generators put in the link instead of sni / fp
     stream.tlsSettings = {
-      serverName: q.sni || q.host || '',
+      serverName: q.sni || q.serverName || q.host || '',
       // `insecure` / `allow_insecure`: the spelling of hysteria2, anytls and tuic
       // links, which some panels put on every link they make
       allowInsecure: isTrue(q.allowInsecure) || isTrue(q.insecure) || isTrue(q.allow_insecure),
-      fingerprint: q.fp || 'chrome'
+      fingerprint: q.fp || q.fingerprint || 'chrome'
     };
     if (q.alpn) stream.tlsSettings.alpn = q.alpn.split(',');
     // patterniha-style custom TLS: `unsafe` fingerprint lets you pin cipherSuites.
@@ -203,8 +212,8 @@ function buildStreamSettings(q) {
     tlsExtras(stream.tlsSettings, q);
   } else if (security === 'reality') {
     stream.realitySettings = {
-      serverName: q.sni || '',
-      fingerprint: q.fp || 'chrome',
+      serverName: q.sni || q.serverName || '',
+      fingerprint: q.fp || q.fingerprint || 'chrome',
       publicKey: q.pbk || '',
       shortId: q.sid || '',
       spiderX: q.spx || ''
@@ -227,6 +236,55 @@ function buildStreamSettings(q) {
   }
 
   return stream;
+}
+
+/**
+ * An ECH outbound (PattN's `echOutbound`): an Xray outbound object, from the
+ * link's one-line JSON or the editor's text — PattN writes it with comments
+ * and trailing commas allowed, so those are read too. null for anything that
+ * is not an object naming a protocol. Its `tag` is the builder's to give.
+ */
+function echOutboundOf(raw) {
+  if (raw == null || raw === '') return null;
+  let o = raw;
+  if (typeof raw !== 'object') {
+    const s = String(raw).trim();
+    if (!s) return null;
+    try { o = JSON.parse(s); } catch {
+      try { o = JSON.parse(looseJson(s)); } catch { return null; }
+    }
+  }
+  if (!o || typeof o !== 'object' || Array.isArray(o) || typeof o.protocol !== 'string' || !o.protocol.trim()) return null;
+  return JSON.parse(JSON.stringify(o));
+}
+
+/** JSON with // and /* *\/ comments and trailing commas, as plain JSON (strings left alone). */
+function looseJson(s) {
+  let out = '', i = 0, inStr = false;
+  while (i < s.length) {
+    const c = s[i];
+    if (inStr) {
+      out += c;
+      if (c === '\\') { out += s[i + 1] || ''; i += 2; continue; }
+      if (c === '"') inStr = false;
+      i++; continue;
+    }
+    if (c === '"') { inStr = true; out += c; i++; continue; }
+    if (c === '/' && s[i + 1] === '/') { while (i < s.length && s[i] !== '\n') i++; continue; }
+    if (c === '/' && s[i + 1] === '*') { const end = s.indexOf('*/', i + 2); i = end === -1 ? s.length : end + 2; continue; }
+    out += c; i++;
+  }
+  return out.replace(/,(\s*[}\]])/g, '$1');
+}
+
+/** An ECH outbound as a share link carries it: one line, with a tag — PattN refuses one without. */
+function echOutboundShare(o) {
+  return JSON.stringify(Object.assign({ tag: 'ech-out' }, o));
+}
+
+/** An ECH outbound as the edit form shows it: indented JSON, '' for none. */
+function echOutboundText(o) {
+  return o && typeof o === 'object' ? JSON.stringify(o, null, 2) : '';
 }
 
 /** Parse a finalMask value (JSON string or object). Returns null when unusable. */
@@ -320,7 +378,8 @@ function parseVmess(link) {
     allowInsecure: v.allowInsecure || v.insecure || '',
     ech: v.ech || '',
     pcs: v.pcs || '',
-    vcn: v.vcn || '',
+    vcn: v.vcn || v.pcn || '',
+    echOutbound: v.echOutbound || '',
     cipherSuites: v.cs || v.cipherSuites || '',
     finalMask: v.fm || v.finalMask || v.finalmask || ''
   };
@@ -594,6 +653,196 @@ function buildHysteria2Outbound(f) {
     settings: { version: 2, address, port: parseInt(f.port, 10) || 443 },
     streamSettings: stream
   };
+}
+
+/* --------------------------- TUIC and AnyTLS --------------------------- */
+/**
+ * tuic://<uuid>:<password>@host:port?sni=…&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1&reduce_rtt=1#name
+ * anytls://<password>@host:port?sni=…&fp=chrome&alpn=…&insecure=1#name
+ * (v2rayN's, NekoBox's and mihomo's spellings.) Only sing-box speaks either —
+ * neither Xray core has them — so such a server always runs there, on its own
+ * (engineChoice.isSingboxOnly). The record keeps an outbound in Xray's SHAPE
+ * all the same, so the editor, the share link, the names and the list treat
+ * it like any other server (Android's parser writes exactly this shape):
+ *
+ *   { protocol: 'tuic' | 'anytls',
+ *     settings: { servers: [{ address, port,
+ *       tuic:   uuid, password, congestionControl ('bbr' | 'cubic' | 'new_reno' | '' = sing-box's default, cubic),
+ *               udpRelayMode ('native' | 'quic' | ''), zeroRtt (bool), heartbeat ('' or a duration, '10s')
+ *       anytls: password }] },
+ *     streamSettings: { network: 'udp' (TUIC is QUIC) | 'tcp' (AnyTLS is TLS over TCP), security: 'tls',
+ *       tlsSettings: { serverName, allowInsecure, alpn?, fingerprint? (AnyTLS: uTLS, chrome by default),
+ *                      disableSni? (TUIC, when the link says so), + tlsExtras' ech / pcs / vcn } } }
+ *
+ * TUIC's userinfo is uuid:password, split at the FIRST `:`; AnyTLS's is the
+ * password whole. A `pcs` / `vcn` is kept as the link says it — but sing-box
+ * cannot keep a certificate pin (singboxBuilder.pinnedTls), and there is no
+ * Xray to fall back to: such a server is refused at connect, by name.
+ * `allowInsecure` is sing-box's `insecure`, on purpose — no pin is learnt on
+ * first use for these two (certPin.wantsPin).
+ */
+const SINGBOX_ONLY_PROTOCOLS = ['tuic', 'anytls'];
+const TUIC_CONGESTION = ['bbr', 'cubic', 'new_reno'];
+const TUIC_UDP_MODES = ['native', 'quic'];
+
+/** A TUIC congestion control as sing-box names it; '' (its default, cubic) for anything else. */
+function tuicCongestion(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase().replace(/-/g, '_');
+  const name = s === 'newreno' || s === 'reno' ? 'new_reno' : s;
+  return TUIC_CONGESTION.includes(name) ? name : '';
+}
+
+/** TUIC's UDP relay mode: native or quic; '' (sing-box's default, native) for anything else. */
+function tuicUdpMode(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return TUIC_UDP_MODES.includes(s) ? s : '';
+}
+
+/**
+ * A heartbeat as sing-box reads a duration ("10s", "500ms", "1m"); a bare
+ * number is seconds. null for what is no duration — sing-box would refuse the
+ * whole config over it — and '' for none.
+ */
+function tuicHeartbeat(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return '';
+  if (/^\d+$/.test(s)) return Number(s) > 0 ? s + 's' : '';
+  return /^\d+(\.\d+)?(ms|s|m|h)$/.test(s) ? s : null;
+}
+
+/** A UUID as sing-box parses one (dashed, or 32 hex digits); anything else it refuses at start. */
+function isUuid(v) {
+  return /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$/i.test(String(v == null ? '' : v).trim());
+}
+
+/** TLS for both, from a link's (or the edit form's) values — tlsExtras as for every other kind. */
+function singboxOnlyTls(f, proto) {
+  const address = String(f.address || '').trim();
+  const tls = {
+    serverName: String(f.sni || f.serverName || '').trim() || (isIP(address) ? '' : address),
+    allowInsecure: isTrue(f.insecure) || isTrue(f.allowInsecure) || isTrue(f.allow_insecure)
+  };
+  const alpn = Array.isArray(f.alpn) ? f.alpn : String(f.alpn || '').split(',');
+  const list = alpn.map(x => String(x).trim()).filter(Boolean);
+  if (list.length) tls.alpn = list;
+  // uTLS: AnyTLS is TLS over TCP; TUIC is QUIC, Go's own TLS — no fingerprint
+  if (proto === 'anytls') tls.fingerprint = String(f.fp || f.fingerprint || '').trim() || 'chrome';
+  if (proto === 'tuic' && isTrue(f.disable_sni)) tls.disableSni = true;
+  tlsExtras(tls, f);
+  // PattN's ECH outbound is an Xray outbound: nothing sing-box can dial through
+  delete tls.echOutbound;
+  return tls;
+}
+
+/** The TUIC record's outbound from a link's (or the edit form's) values. */
+function buildTuicOutbound(f) {
+  const address = String(f.address || '').trim();
+  const hb = tuicHeartbeat(f.heartbeat);
+  return {
+    protocol: 'tuic',
+    settings: { servers: [{
+      address, port: parseInt(f.port, 10) || 443,
+      uuid: String(f.uuid == null ? '' : f.uuid).trim(), password: String(f.password == null ? '' : f.password),
+      congestionControl: tuicCongestion(f.congestion_control),
+      udpRelayMode: tuicUdpMode(f.udp_relay_mode),
+      zeroRtt: isTrue(f.zero_rtt_handshake) || isTrue(f.reduce_rtt) || f.zeroRtt === true,
+      heartbeat: hb || ''
+    }] },
+    streamSettings: { network: 'udp', security: 'tls', tlsSettings: singboxOnlyTls(f, 'tuic') }
+  };
+}
+
+/** The AnyTLS record's outbound from a link's (or the edit form's) values. */
+function buildAnytlsOutbound(f) {
+  return {
+    protocol: 'anytls',
+    settings: { servers: [{ address: String(f.address || '').trim(), port: parseInt(f.port, 10) || 443, password: String(f.password == null ? '' : f.password) }] },
+    streamSettings: { network: 'tcp', security: 'tls', tlsSettings: singboxOnlyTls(f, 'anytls') }
+  };
+}
+
+/** A link's parts: { name, userinfo (raw), address, port, q }. */
+function splitProxyLink(link, scheme) {
+  const body = link.slice(scheme.length);
+  const hashIdx = body.indexOf('#');
+  const name = hashIdx === -1 ? '' : safeDecodeURIComponent(body.slice(hashIdx + 1));
+  const main = hashIdx === -1 ? body : body.slice(0, hashIdx);
+  const qIdx = main.indexOf('?');
+  const beforeQ = (qIdx === -1 ? main : main.slice(0, qIdx)).replace(/\/+$/, '');
+  const q = parseQuery(qIdx === -1 ? '' : main.slice(qIdx + 1));
+  const atIdx = beforeQ.lastIndexOf('@');
+  const [address, portStr] = splitHostPort(atIdx === -1 ? beforeQ : beforeQ.slice(atIdx + 1));
+  if (!address) throw new Error(`${scheme.replace('://', '')}: no server address in the link`);
+  return { name, userinfo: atIdx === -1 ? '' : beforeQ.slice(0, atIdx), address, port: parseInt(portStr, 10) || 443, q };
+}
+
+function parseTuic(link) {
+  const { name, userinfo, address, port, q } = splitProxyLink(link, 'tuic://');
+  // uuid:password at the FIRST colon, each part decoded; a userinfo encoded
+  // whole (uuid%3Apassword) is decoded once, then split
+  const whole = !userinfo.includes(':');
+  const raw = whole ? safeDecodeURIComponent(userinfo) : userinfo;
+  const dec = whole ? (s) => s : safeDecodeURIComponent;
+  const ci = raw.indexOf(':');
+  const uuid = dec(ci === -1 ? raw : raw.slice(0, ci)).trim();
+  const password = ci === -1 ? '' : dec(raw.slice(ci + 1));
+  if (!uuid) throw new Error('TUIC: no uuid in the link');
+  if (!isUuid(uuid)) throw new Error('TUIC: the uuid in the link is not a UUID');
+  return mkServer(name || address, 'tuic', address, port, link,
+    buildTuicOutbound(Object.assign({}, q, { address, port, uuid, password })));
+}
+
+function parseAnytls(link) {
+  const { name, userinfo, address, port, q } = splitProxyLink(link, 'anytls://');
+  return mkServer(name || address, 'anytls', address, port, link,
+    buildAnytlsOutbound(Object.assign({}, q, { address, port, password: safeDecodeURIComponent(userinfo) })));
+}
+
+/**
+ * A TUIC / AnyTLS outbound's values in the builders' terms (the link's names)
+ * — so an edit rebuilds it from everything it had, only what the form changed changed.
+ */
+function singboxOnlyValues(ob) {
+  const st = (ob && ob.streamSettings) || {};
+  const tls = st.tlsSettings || {};
+  const srv = (ob && ob.settings && Array.isArray(ob.settings.servers) && ob.settings.servers[0]) || {};
+  return {
+    address: srv.address || '', port: srv.port, uuid: srv.uuid || '', password: srv.password == null ? '' : String(srv.password),
+    congestion_control: srv.congestionControl || '', udp_relay_mode: srv.udpRelayMode || '', zeroRtt: srv.zeroRtt === true,
+    heartbeat: srv.heartbeat || '',
+    sni: tls.serverName || '', insecure: tls.allowInsecure ? '1' : '', disable_sni: tls.disableSni ? '1' : '',
+    alpn: Array.isArray(tls.alpn) ? tls.alpn.join(',') : (tls.alpn || ''), fp: tls.fingerprint || '',
+    ech: tls.echConfigList || '', pcs: tls.pinnedPeerCertSha256 || '', vcn: tls.verifyPeerCertByName || ''
+  };
+}
+
+/**
+ * Bring a TUIC / AnyTLS record to the shape sing-box takes, or throw saying
+ * which field it refuses — what sing-box would refuse the whole config for,
+ * said at the save instead of at a connect. Never an engine of its own (it
+ * runs on sing-box whatever a record says), never Mux, never Xray's noise
+ * dialer (sing-box has none) — and TUIC no fragment either: QUIC has no TCP
+ * ClientHello to split (AnyTLS's is sing-box's own `tls.fragment`). TUIC's
+ * servers entry carries every key, its switch's "off" as false.
+ */
+function checkSingboxOnly(server) {
+  const ob = server.outbound;
+  delete server.engine;
+  delete server.mux; delete server.muxConcurrency; delete server.xudpConcurrency;
+  delete ob._noise;
+  if (ob.protocol === 'tuic') delete ob._fragment;
+  const srv = ob.settings && Array.isArray(ob.settings.servers) && ob.settings.servers[0];
+  if (!srv) throw new Error('the server has no address');
+  if (ob.protocol === 'tuic') {
+    if (!isUuid(srv.uuid)) throw new Error('uuid: not a UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)');
+    srv.congestionControl = tuicCongestion(srv.congestionControl);
+    srv.udpRelayMode = tuicUdpMode(srv.udpRelayMode);
+    srv.zeroRtt = srv.zeroRtt === true;
+    const hb = tuicHeartbeat(srv.heartbeat);
+    if (hb === null) throw new Error('tuicHeartbeat: a duration, like 10s');
+    srv.heartbeat = hb;
+  }
+  return server;
 }
 
 /* --------------------------- SOCKS / HTTP proxy --------------------------- */
@@ -1044,7 +1293,7 @@ function masqueServer(outbound, name) {
  * and a port). MASQUE: nothing — its user and password are optional, and a
  * WARP account's three fields are all-or-none (checkMasque).
  */
-const CREATE_NEEDS = { vless: ['uuid'], vmess: ['uuid'], trojan: ['password'], shadowsocks: ['password'], hysteria2: ['password'], wireguard: ['privateKey', 'publicKey'], masque: [] };
+const CREATE_NEEDS = { vless: ['uuid'], vmess: ['uuid'], trojan: ['password'], shadowsocks: ['password'], hysteria2: ['password'], tuic: ['uuid', 'password'], anytls: ['password'], wireguard: ['privateKey', 'publicKey'], masque: [] };
 
 /**
  * A server made from the editor's fields alone (its "new server" form): the
@@ -1071,6 +1320,9 @@ function createServer(fields) {
     server = makeProxyServer({ type: proto, name: f.name, address, port, username: f.username, password: f.password });
   } else if (proto === 'hysteria2') {
     server = mkServer(f.name, 'hysteria2', address, port, '', buildHysteria2Outbound({ address, port, auth: f.password, sni: f.sni }));
+  } else if (proto === 'tuic' || proto === 'anytls') {
+    // the bare outbound; applyServerEdits below writes every field into it and checks it (checkSingboxOnly)
+    server = mkServer(f.name, proto, address, port, '', (proto === 'tuic' ? buildTuicOutbound : buildAnytlsOutbound)({ address, port }));
   } else if (proto === 'masque') {
     // the bare outbound; applyServerEdits below writes every field into it and checks it (checkMasque)
     server = mkServer(f.name, 'masque', address, port, '', {
@@ -1185,6 +1437,25 @@ function applyServerEdits(server, f) {
     ob.settings = rebuilt.settings;
     ob.streamSettings = Object.assign({}, ob.streamSettings, rebuilt.streamSettings);
     if (!rebuilt.streamSettings.finalmask) delete ob.streamSettings.finalmask;
+  } else if (proto === 'tuic' || proto === 'anytls') {
+    // Rebuilt from everything it had, the form's values over them (as
+    // Hysteria2): an empty password keeps the one it had (as Trojan's), an
+    // empty SNI, ALPN, ECH or pin clears it. TUIC's congestion control, UDP
+    // relay mode, 0-RTT, heartbeat and "no SNI" are the table's path fields,
+    // written after this (serverFields.applyPathFields).
+    const v = singboxOnlyValues(ob);
+    const pick = (k, cur) => (f[k] != null ? String(f[k]).trim() : cur);
+    const rebuilt = (proto === 'tuic' ? buildTuicOutbound : buildAnytlsOutbound)(Object.assign({}, v, {
+      address: addr, port,
+      uuid: f.uuid ? String(f.uuid).trim() : v.uuid,
+      password: f.password ? String(f.password) : v.password,
+      sni: pick('sni', v.sni),
+      insecure: f.allowInsecure != null ? (f.allowInsecure ? '1' : '') : v.insecure,
+      alpn: pick('alpn', v.alpn), fp: pick('fp', v.fp),
+      ech: pick('ech', v.ech), pcs: pick('pcs', v.pcs), vcn: pick('vcn', v.vcn)
+    }));
+    ob.settings = rebuilt.settings;
+    ob.streamSettings = rebuilt.streamSettings;
   } else if (proto === 'masque') {
     // The core's flat settings and its own stream, always MASQUE over TLS
     // (`method` is the core's other spelling of the network, and wins over
@@ -1203,6 +1474,10 @@ function applyServerEdits(server, f) {
     put('echConfigList', text('ech'));
     put('pinnedPeerCertSha256', f.pcs == null ? null : pinList(f.pcs));
     put('verifyPeerCertByName', f.vcn == null ? null : String(f.vcn).split(',').map(x => x.trim()).filter(Boolean).join(','));
+    if (f.echOutbound != null) {
+      const eo = echOutboundOf(f.echOutbound);
+      if (eo) tls.echOutbound = eo; else delete tls.echOutbound;
+    }
     // HTTP/2 is ALPN h2; HTTP/3 is the core's default, no ALPN at all — an
     // ALPN that already says the version asked for is left as it is
     const http = (text('masqueHttp') || '').toLowerCase();
@@ -1284,6 +1559,8 @@ function applyServerEdits(server, f) {
   // what the core would refuse a MASQUE server for, said now — or put right
   // (a WARP key's PEM made one line, anti-DPI for the HTTP version it has)
   if (proto === 'masque') checkMasque(out);
+  // and what sing-box would refuse a TUIC / AnyTLS one for (a uuid, a heartbeat)
+  if (SINGBOX_ONLY_PROTOCOLS.includes(proto)) checkSingboxOnly(out);
 
   // Which fields the user edited, kept on the record (a union over every
   // edit). The form re-sends every field on every save, so a field counts
@@ -1322,7 +1599,7 @@ function applyServerEdits(server, f) {
 
 /** What a Shadowsocks stream is rebuilt from, when one of them changed (applyServerEdits). */
 const SS_STREAM_KEYS = ['network', 'security', 'sni', 'host', 'path', 'fp', 'pbk', 'sid', 'alpn', 'allowInsecure',
-  'ech', 'pcs', 'vcn', 'pqv', 'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx', 'cipherSuites', 'finalMask'];
+  'ech', 'echOutbound', 'pcs', 'vcn', 'pqv', 'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx', 'cipherSuites', 'finalMask'];
 
 /** Fields of the view that follow another one (serviceName is the path) or have no input (alpn). */
 const DERIVED_FIELDS = ['serviceName', 'alpn'];
@@ -1387,12 +1664,20 @@ function editFields(s) {
       alpn: h.alpn, obfsPassword: h['obfs-password'], mport: h.mport
     });
   }
+  if (SINGBOX_ONLY_PROTOCOLS.includes(proto)) {
+    // TUIC's congestion control, relay mode, 0-RTT, heartbeat and "no SNI" are path fields (below)
+    const sv = singboxOnlyValues(ob);
+    Object.assign(v, { password: sv.password, sni: sv.sni, allowInsecure: isTrue(sv.insecure), alpn: sv.alpn, ech: sv.ech, pcs: sv.pcs, vcn: sv.vcn });
+    if (proto === 'tuic') v.uuid = sv.uuid;
+    if (proto === 'anytls') v.fp = sv.fp;
+  }
   if (proto === 'masque') {
     // its HTTP version (masqueHttp) is read below with the other special fields
     const ts = st.tlsSettings || {};
     Object.assign(v, {
       sni: ts.serverName || '', fp: ts.fingerprint || '', ech: ts.echConfigList || '', pcs: ts.pinnedPeerCertSha256 || '',
-      vcn: ts.verifyPeerCertByName || '', finalMask: st.finalmask ? JSON.stringify(st.finalmask) : ''
+      vcn: ts.verifyPeerCertByName || '', finalMask: st.finalmask ? JSON.stringify(st.finalmask) : '',
+      echOutbound: echOutboundText(ts.echOutbound)
     });
   }
   if (proto === 'vless' || proto === 'vmess' || proto === 'trojan' || proto === 'shadowsocks') {
@@ -1419,6 +1704,7 @@ function editFields(s) {
       cipherSuites: (st.tlsSettings && st.tlsSettings.cipherSuites) || '',
       finalMask: st.finalmask ? JSON.stringify(st.finalmask) : '',
       ech: ts.echConfigList || '', pcs: ts.pinnedPeerCertSha256 || '', vcn: ts.verifyPeerCertByName || '',
+      echOutbound: echOutboundText(ts.echOutbound),
       pqv: rs.mldsa65Verify || ''
     });
   }
@@ -1452,6 +1738,7 @@ function hy2Values(ob) {
     sni: tls.serverName || '', insecure: tls.allowInsecure ? '1' : '',
     alpn: Array.isArray(tls.alpn) ? tls.alpn.join(',') : (tls.alpn || ''),
     ech: tls.echConfigList || '', pcs: tls.pinnedPeerCertSha256 || '', vcn: tls.verifyPeerCertByName || '',
+    echOutbound: echOutboundText(tls.echOutbound),
     obfs: sal ? 'salamander' : '', 'obfs-password': (sal && sal.settings && sal.settings.password) || '',
     mport: hop && hop.settings ? String(hop.settings.remotePorts || '') : '',
     hopInterval: hop && hop.settings && hop.settings.interval != null ? String(hop.settings.interval) : '',
@@ -1465,7 +1752,7 @@ function rebuildStream(ob, f) {
   const cur = ob.streamSettings;
   // Only rebuild if the user touched transport/security fields.
   const touched = ['network', 'security', 'sni', 'path', 'host', 'allowInsecure', 'fp', 'pbk', 'sid', 'serviceName', 'alpn', 'cipherSuites', 'finalMask',
-    'ech', 'pcs', 'vcn', 'pqv', 'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx']
+    'ech', 'echOutbound', 'pcs', 'vcn', 'pqv', 'headerType', 'grpcMode', 'xhttpMode', 'kcpHeader', 'kcpSeed', 'spx']
     .some(k => f[k] != null && f[k] !== '');
   if (!touched) return;
 
@@ -1522,6 +1809,7 @@ function rebuildStream(ob, f) {
     finalMask: f.finalMask != null ? f.finalMask : (cur.finalmask ? JSON.stringify(cur.finalmask) : ''),
     // newer TLS / REALITY knobs: the form's value, else what the record had
     ech: f.ech != null ? f.ech : (ts.echConfigList || ''),
+    echOutbound: f.echOutbound != null ? f.echOutbound : echOutboundText(ts.echOutbound),
     pcs: f.pcs != null ? f.pcs : (ts.pinnedPeerCertSha256 || ''),
     vcn: f.vcn != null ? f.vcn : (ts.verifyPeerCertByName || ''),
     pqv: f.pqv != null ? f.pqv : (rs.mldsa65Verify || ''),
@@ -1595,7 +1883,7 @@ function mkServer(name, protocol, address, port, raw, outbound) {
 /** A URI scheme at the start of a line, and the ones we can import. */
 const SCHEME = /^([a-z][a-z0-9+.-]*):\/\//i;
 const SCHEME_LINE = /^[a-z][a-z0-9+.-]*:\/\//im;
-const SUPPORTED = /^(vless|vmess|trojan|ss|socks|socks5|wireguard|wg|hysteria2|hy2):\/\//i;
+const SUPPORTED = /^(vless|vmess|trojan|ss|socks|socks5|wireguard|wg|hysteria2|hy2|tuic|anytls):\/\//i;
 
 /**
  * Parse a single share link into a server object. Throws on failure.
@@ -1613,10 +1901,65 @@ function parseLink(link) {
   if (l.startsWith('socks://') || l.startsWith('socks5://')) return parseSocks(l);
   if (l.startsWith('wireguard://') || l.startsWith('wg://')) return parseWireguard(l);
   if (l.startsWith('hysteria2://') || l.startsWith('hy2://')) return parseHysteria2(l);
+  if (l.startsWith('tuic://')) return parseTuic(l);
+  if (l.startsWith('anytls://')) return parseAnytls(l);
   // case-insensitive to match HTTP_PROXY_LINK's /i (and parseMany's line filter),
   // so an uppercase scheme imports instead of being reported as an error
   if (/^http:\/\//i.test(l) && isHttpProxyLink(l)) return parseHttpProxy(l);
   throw new Error('Unsupported or invalid link: ' + l.slice(0, 12) + '...');
+}
+
+/* ------------------ what a link carries that is not read ------------------ */
+
+/**
+ * The query keys each kind of link is read for — every key the parsers above
+ * look at. Anything else in a link was dropped without a word: `pcn`, one
+ * panel's name for vcn, sat in Fastly-fronted links until v1.35.2 while their
+ * certificate was checked against the SNI, and the servers never connected.
+ * unreadLinkKeys names such keys so the import says so (main.js, service.js,
+ * a subscription's refresh) and the next one is found by its log line. VLESS,
+ * Trojan, Hysteria2, TUIC and AnyTLS — the kinds whose settings travel as
+ * query keys; a vmess link is JSON, Shadowsocks, WireGuard and the proxies
+ * carry little. (TUIC's and AnyTLS's `fp`: AnyTLS reads it; TUIC is QUIC,
+ * where a fingerprint means nothing — read and left, as for Hysteria2.)
+ */
+const TLS_LINK_KEYS = ['sni', 'serverName', 'fp', 'fingerprint', 'alpn', 'allowInsecure', 'insecure', 'allow_insecure',
+  'ech', 'echConfigList', 'echOutbound', 'pcs', 'pinnedPeerCertSha256', 'pinSHA256', 'vcn', 'verifyPeerCertByName', 'pcn'];
+const STREAM_LINK_KEYS = [...TLS_LINK_KEYS, 'type', 'network', 'security', 'path', 'host', 'serviceName', 'mode', 'authority',
+  'headerType', 'seed', 'mtu', 'extra', 'cs', 'cipherSuites', 'pbk', 'sid', 'spx', 'pqv', 'mldsa65Verify', 'fm', 'finalMask',
+  'fragment', 'noise', 'engine'];
+const LINK_KEYS = {
+  vless: new Set([...STREAM_LINK_KEYS, 'encryption', 'flow']),
+  trojan: new Set(STREAM_LINK_KEYS),
+  hysteria2: new Set([...TLS_LINK_KEYS, 'auth', 'peer', 'obfs', 'obfs-password', 'obfsPassword', 'mport', 'ports',
+    'hopInterval', 'hop_interval', 'up', 'down', 'upmbps', 'downmbps', 'engine']),
+  // `engine`: always sing-box for these two (engineChoice), whatever a link says
+  tuic: new Set([...TLS_LINK_KEYS, 'congestion_control', 'udp_relay_mode', 'reduce_rtt', 'zero_rtt_handshake', 'heartbeat',
+    'disable_sni', 'engine']),
+  anytls: new Set([...TLS_LINK_KEYS, 'engine'])
+};
+/** Written by other clients, needed by none: VLESS's UDP is xudp anyway; a remark is the name after `#`. */
+const HARMLESS_LINK_KEYS = new Set(['packetEncoding', 'remarks', 'remark']);
+
+/** A link's query keys this app does not read — [] for a kind it does not list, or a link with none. */
+function unreadLinkKeys(link) {
+  const l = String(link || '').trim();
+  const m = SCHEME.exec(l);
+  if (!m) return [];
+  const scheme = m[1].toLowerCase() === 'hy2' ? 'hysteria2' : m[1].toLowerCase();
+  const known = LINK_KEYS[scheme];
+  if (!known) return [];
+  const body = l.slice(m[0].length);
+  const hash = body.indexOf('#');
+  const main = hash === -1 ? body : body.slice(0, hash);
+  const qi = main.indexOf('?');
+  if (qi === -1) return [];
+  return Object.keys(parseQuery(main.slice(qi + 1))).filter((k) => k && !known.has(k) && !HARMLESS_LINK_KEYS.has(k));
+}
+
+/** `{ key: how many links }` as one line for a log: «pcn ×12, foo ×1». */
+function unreadText(unread) {
+  return Object.entries(unread || {}).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, n]) => `${k} ×${n}`).join(', ');
 }
 
 /**
@@ -1652,23 +1995,25 @@ function parseMany(text) {
   const lines = body.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const servers = [];
   const errors = [];
+  const unread = {};   // a key this app does not read → in how many of the links (unreadLinkKeys)
   for (const line of lines) {
     if (SUPPORTED.test(line) || isHttpProxyLink(line)) {
       try {
         servers.push(parseLink(line));
+        for (const k of unreadLinkKeys(line)) unread[k] = (unread[k] || 0) + 1;
       } catch (e) {
         errors.push({ line, error: e.message });
       }
       continue;
     }
-    // hysteria2 / tuic / anytls / … are proxy links we cannot import: say so,
+    // juicity / naive / ssr / … are proxy links we cannot import: say so,
     // rather than a subscription that seems to have fewer servers. http(s)
     // lines are not links (a channel URL, a subscription URL) and comments
     // have no scheme; both stay skipped.
     const m = line.match(SCHEME);
     if (m && !/^https?$/i.test(m[1])) errors.push({ line, error: 'unsupported protocol: ' + m[1].toLowerCase() });
   }
-  return { servers, errors };
+  return { servers, errors, unread };
 }
 
 /* ===================== build share link (export) ===================== */
@@ -1712,6 +2057,7 @@ function streamToQuery(st) {
     if (tls.alpn) q.alpn = Array.isArray(tls.alpn) ? tls.alpn.join(',') : tls.alpn;
     if (tls.cipherSuites) q.cs = tls.cipherSuites;
     if (tls.echConfigList) q.ech = tls.echConfigList;
+    if (tls.echOutbound) q.echOutbound = echOutboundShare(tls.echOutbound);
     if (tls.pinnedPeerCertSha256) q.pcs = tls.pinnedPeerCertSha256;
     if (tls.verifyPeerCertByName) q.vcn = tls.verifyPeerCertByName;
   }
@@ -1763,6 +2109,7 @@ function buildShareLink(server) {
     if (p.type === 'xhttp' && p.extra) v.extra = p.extra;
     if (p.allowInsecure) v.insecure = '1';
     if (p.ech) v.ech = p.ech;
+    if (p.echOutbound) v.echOutbound = p.echOutbound;
     if (p.pcs) v.pcs = p.pcs;
     if (p.vcn) v.vcn = p.vcn;
     if (p.cs) v.cs = p.cs;
@@ -1791,6 +2138,7 @@ function buildShareLink(server) {
       alpn: Array.isArray(tls.alpn) ? tls.alpn.join(',') : (tls.alpn || ''),
       pinSHA256: tls.pinnedPeerCertSha256 || '',
       ech: tls.echConfigList || '',
+      echOutbound: tls.echOutbound ? echOutboundShare(tls.echOutbound) : '',
       vcn: tls.verifyPeerCertByName || '',
       obfs: salamander ? 'salamander' : '',
       'obfs-password': salamander && salamander.settings ? salamander.settings.password || '' : '',
@@ -1802,6 +2150,22 @@ function buildShareLink(server) {
     };
     const auth = (st.hysteriaSettings && st.hysteriaSettings.auth) || '';
     return `hysteria2://${enc(auth)}@${joinHostPort(server.address, server.port)}/?${qs(q)}${name}`;
+  }
+  if (proto === 'tuic' || proto === 'anytls') {
+    // the spellings parseTuic / parseAnytls read first (NekoBox's for TUIC's own
+    // keys); no engine — these run on sing-box whatever a link says
+    const v = singboxOnlyValues(ob);
+    const tlsQ = { sni: v.sni, alpn: v.alpn, ech: v.ech, pcs: v.pcs, vcn: v.vcn };
+    const hp = joinHostPort(server.address, server.port);
+    if (proto === 'tuic') {
+      const q = Object.assign({ sni: v.sni, alpn: v.alpn, congestion_control: v.congestion_control, udp_relay_mode: v.udp_relay_mode,
+        reduce_rtt: v.zeroRtt ? '1' : '', heartbeat: v.heartbeat, allow_insecure: v.insecure, disable_sni: v.disable_sni }, tlsQ);
+      const query = qs(q);
+      const user = enc(v.uuid) + (v.password !== '' ? ':' + enc(v.password) : '');
+      return `tuic://${user}@${hp}${query ? '?' + query : ''}${name}`;
+    }
+    const query = qs(Object.assign({ sni: v.sni, fp: v.fp, alpn: v.alpn, insecure: v.insecure }, tlsQ));
+    return `anytls://${enc(v.password)}@${hp}${query ? '?' + query : ''}${name}`;
   }
   if (proto === 'socks' || proto === 'http') {
     const srv = ob.settings.servers[0]; const c = srv.users && srv.users[0];
@@ -2001,7 +2365,7 @@ function migrateStoredServer(server) {
 }
 
 module.exports = {
-  parseLink, parseMany, b64decode, isHttpProxyLink,
+  parseLink, parseMany, unreadLinkKeys, unreadText, b64decode, isHttpProxyLink,
   buildStreamSettings, buildWireguardOutbound, makeWireguardServer, makeProxyServer, applyServerEdits, editFields, createServer,
   parseWireguardConf, isWireguardConf, splitDnsField, masqueServer,
   buildShareLink, migrateStoredServer, ssPluginOf

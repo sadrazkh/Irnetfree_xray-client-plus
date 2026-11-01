@@ -28,15 +28,26 @@ needs a file that is not on the list, it prints the file and the code that needs
 Then read what changed (`git diff --stat`), run the gates above, and commit the sync on its own:
 `Sync upstream vX.Y.Z — <what moved>`.
 
-## What is synced (v1.25.0)
+## What is synced (v1.41.0)
 
 | Area | Files |
 |---|---|
 | Protocols and configs | `src/main/parser.js`, `jsonImport.js`, `configBuilder.js`, `dnsBuilder.js`, `routingProfiles.js`, `mux.js`, `certPin.js`, `coreCompat.js`, `engineChoice.js`, `engines.js`, `src/renderer/serverFields.js` |
+| What `configBuilder.js` needs since v1.27–v1.38 (groups, per-target outbounds, multi-internet, per-app configs; Plus calls none of it directly) | `src/main/groups.js`, `addressSwap.js`, `targetOutbounds.js`, `tunAppTargets.js`, `tunApps.js`, `multiWan.js`, `capPeriods.js`, `jalali.js`, `src/modules/lanUsers/model.js`, `src/modules/lanUsers/xray.js`, `src/renderer/modules.js` |
 | Cores | `src/main/xrayManager.js`, `downloader.js`, `coreVersions.js`, `assets.js`, `assetUpdater.js`, `netutils.js`, `store.js` |
 | Page | `src/renderer/i18n.js`, `corePicker.js`, `theme-boot.js`, `styles.css`, `skins.css`, `settings.css`, `lists.css`, `home.css`, `vendor/qrcode.js` |
 | Headless | `src/server/guard.js` |
 | Scripts | `scripts/download-xray.js`, `scripts/gen-icons.js` |
+
+The second row is upstream's dependency tree, not Plus's API: `configBuilder.js` requires it (groups expand inside
+`buildTestConfig` / `buildMultiTestConfig`, the users module hooks into `buildConfig`), so the sync's require check
+asks for it. All of it is plain Node (`net`, `crypto`, `url`), nothing Electron- or router-only; `src/renderer/modules.js`
+is a dual module (browser global + `module.exports`) and is only required, never loaded by the page.
+
+`npm run validate` runs Xray-PattN's own scan shapes (`scan-pattn-*`: the merge mask, PattNG's ClientHello splits) only
+when the core is the fork — `IRNF_XRAY_FORK=pattn`, or a core file named `xray-pattn` — and at least
+`PATTN_OOB_SINCE` (26.10.27); the CI's cores job sets it on the PattN step. A `sockopt.dialMode` server runs on every
+core (the official core ignores the key, as upstream's validate proves too).
 
 ## What is Plus's own
 
