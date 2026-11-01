@@ -71,6 +71,12 @@
         <div class="view-head"><h2 data-i18n="scan.title">اسکن</h2></div>
         <p class="hint" data-i18n="scan.intro"></p>
 
+        <!-- what the run will be, live, always in sight: addresses × ports × SNIs × each parameter = tests (scan:plan) -->
+        <div class="scan-summary" id="scanSummary">
+          <span class="scan-summary-text" id="scanSummaryText"></span>
+          <span class="scan-summary-note" id="scanSummaryNote"></span>
+        </div>
+
         <div class="scan-forms">
           <!-- 1. the config: a stored one, or a link / JSON pasted here -->
           <div class="card scan-card">
@@ -91,44 +97,102 @@
             <ul class="scan-facts" id="scanFacts"></ul>
           </div>
 
-          <!-- 2. what to test: addresses × ports × SNIs -->
-          <div class="card scan-card">
+          <!--
+            2. what to test: every input a row. A row's switch puts its values into the product
+            (addresses × ports × SNIs × each parameter); off, the config's own value is used as it is.
+          -->
+          <div class="card scan-card scan-card-wide">
             <div class="sec"><span class="sec-label" data-i18n="scan.targets">چه چیزی تست شود</span></div>
-            <label class="field-label" for="scanIps" data-i18n="scan.addrs">آدرس‌ها</label>
-            <div class="row-gap scan-presets" id="scanAddrPresets">
-              <button type="button" class="btn ghost small" data-preset="suggest" id="btnScanSuggest" data-i18n="scan.p.suggest">پیشنهادی</button>
-              <button type="button" class="btn ghost small" data-preset="cf" data-i18n="scan.p.cf">کلودفلر</button>
-              <button type="button" class="btn ghost small" data-preset="warp-masque" data-i18n="scan.p.warpMasque">WARP MASQUE</button>
-              <button type="button" class="btn ghost small" data-preset="warp-wg" data-i18n="scan.p.warpWg">WARP وایرگارد</button>
-              <button type="button" class="btn ghost small" id="btnScanFile" data-i18n="scan.file">از فایل</button>
-              <input type="file" id="scanFile" accept=".txt,.csv,.log,text/plain" class="vis-hidden" tabindex="-1" aria-hidden="true" />
-            </div>
-            <textarea id="scanIps" class="textarea scan-ips" rows="6" dir="ltr" spellcheck="false" data-i18n-ph="scan.ipsPh"></textarea>
-            <div class="row-gap scan-ip-actions">
-              <div class="seg scan-pick" id="scanPickSeg">
-                <button type="button" class="seg-btn active" data-pick="all" data-i18n="scan.pick.all">همهٔ آدرس‌ها</button>
-                <button type="button" class="seg-btn" data-pick="random" data-i18n="scan.pick.random">تصادفی از هر رنج</button>
+
+            <div class="scan-inrow" id="scanRowAddrs">
+              <div class="scan-inrow-head">
+                <label class="switch"><input type="checkbox" id="scanUseAddrs" checked /><span class="slider"></span></label>
+                <div class="scan-inrow-title">
+                  <label class="scan-inrow-name" for="scanIps" data-i18n="scan.addrs">آدرس‌ها</label>
+                  <span class="scan-inrow-hint" data-i18n="scan.row.addrsHint"></span>
+                </div>
+                <span class="scan-inrow-own" id="scanOwnAddrs"></span>
               </div>
-              <span class="scan-count" id="scanCount"></span>
-            </div>
-            <div class="row-gap scan-pick-opts" id="scanPickOpts" hidden>
-              <label class="field-label scan-inline-label" for="scanPerRange" data-i18n="scan.perRange">از هر رنج</label>
-              <input type="number" id="scanPerRange" class="input scan-num" dir="ltr" min="1" max="5000" value="20" data-i18n-title="scan.perRangeHint" />
-              <label class="scan-check"><input type="checkbox" id="scanFresh" checked /><span class="scan-check-label" data-i18n="scan.fresh">فقط آدرس‌های تست‌نشده</span></label>
-              <button type="button" class="btn ghost small" id="btnScanForget" data-i18n="scan.forget">فراموش کردن تاریخچه</button>
-              <span class="scan-count" id="scanTested" hidden></span>
+              <div class="scan-inrow-body" id="scanAddrsBody">
+                <div class="row-gap scan-presets" id="scanAddrPresets">
+                  <button type="button" class="btn ghost small" data-preset="suggest" id="btnScanSuggest" data-i18n="scan.p.suggest">پیشنهادی</button>
+                  <button type="button" class="btn ghost small" data-preset="cf" data-i18n="scan.p.cf">کلودفلر</button>
+                  <button type="button" class="btn ghost small" data-preset="warp-masque" data-i18n="scan.p.warpMasque">WARP MASQUE</button>
+                  <button type="button" class="btn ghost small" data-preset="warp-wg" data-i18n="scan.p.warpWg">WARP وایرگارد</button>
+                  <button type="button" class="btn ghost small" id="btnScanFile" data-i18n="scan.file">از فایل</button>
+                  <input type="file" id="scanFile" accept=".txt,.csv,.log,text/plain" class="vis-hidden" tabindex="-1" aria-hidden="true" />
+                </div>
+                <textarea id="scanIps" class="textarea scan-ips" rows="5" dir="ltr" spellcheck="false" data-i18n-ph="scan.ipsPh"></textarea>
+                <div class="row-gap scan-ip-actions">
+                  <div class="seg scan-pick" id="scanPickSeg">
+                    <button type="button" class="seg-btn active" data-pick="all" data-i18n="scan.pick.all">همهٔ آدرس‌ها</button>
+                    <button type="button" class="seg-btn" data-pick="sample" data-i18n="scan.pick.sample">N تصادفی از همه</button>
+                    <button type="button" class="seg-btn" data-pick="random" data-i18n="scan.pick.random">N از هر رنج</button>
+                  </div>
+                  <span class="scan-count" id="scanCount"></span>
+                </div>
+                <div class="row-gap scan-pick-opts" id="scanPickOpts" hidden>
+                  <label class="field-label scan-inline-label" for="scanPickN" id="scanPickNLabel" data-i18n="scan.pickN">تعداد</label>
+                  <input type="number" id="scanPickN" class="input scan-num" dir="ltr" min="1" max="1000000" value="1000" data-i18n-title="scan.pickNHint" />
+                  <input type="number" id="scanPerRange" class="input scan-num" dir="ltr" min="1" max="1000000" value="20" data-i18n-title="scan.perRangeHint" />
+                  <label class="scan-check"><input type="checkbox" id="scanFresh" checked /><span class="scan-check-label" data-i18n="scan.fresh">فقط آدرس‌های تست‌نشده</span></label>
+                  <button type="button" class="btn ghost small" id="btnScanForget" data-i18n="scan.forget">فراموش کردن تاریخچه</button>
+                  <span class="scan-count" id="scanTested" hidden></span>
+                </div>
+              </div>
             </div>
 
-            <label class="field-label scan-sub-label" for="scanPorts" data-i18n="scan.ports">پورت‌ها</label>
-            <div class="row-gap scan-presets">
-              <input type="text" id="scanPorts" class="input scan-ports" dir="ltr" spellcheck="false" data-i18n-ph="scan.portsPh" />
-              <button type="button" class="btn ghost small" data-ports="cf-tls-ports" data-i18n="scan.p.cfTls">پورت‌های TLS کلودفلر</button>
-              <button type="button" class="btn ghost small" data-ports="warp-wg" data-i18n="scan.p.warpPorts">پورت‌های WARP</button>
+            <div class="scan-inrow" id="scanRowPorts">
+              <div class="scan-inrow-head">
+                <label class="switch"><input type="checkbox" id="scanUsePorts" /><span class="slider"></span></label>
+                <div class="scan-inrow-title">
+                  <label class="scan-inrow-name" for="scanPorts" data-i18n="scan.ports">پورت‌ها</label>
+                  <span class="scan-inrow-hint" data-i18n="scan.row.portsHint"></span>
+                </div>
+                <span class="scan-inrow-own" id="scanOwnPorts"></span>
+              </div>
+              <div class="scan-inrow-body" id="scanPortsBody" hidden>
+                <div class="row-gap scan-presets">
+                  <input type="text" id="scanPorts" class="input scan-ports" dir="ltr" spellcheck="false" data-i18n-ph="scan.portsPh" />
+                  <button type="button" class="btn ghost small" data-ports="cf-tls-ports" data-i18n="scan.p.cfTls">پورت‌های TLS کلودفلر</button>
+                  <button type="button" class="btn ghost small" data-ports="warp-wg" data-i18n="scan.p.warpPorts">پورت‌های WARP</button>
+                </div>
+              </div>
             </div>
 
-            <label class="field-label scan-sub-label" for="scanSnis" data-i18n="scan.snis">SNIها</label>
-            <textarea id="scanSnis" class="textarea scan-snis" rows="3" dir="ltr" spellcheck="false" data-i18n-ph="scan.snisPh"></textarea>
-            <p class="hint" id="scanSniHint" data-i18n="scan.snisHint"></p>
+            <div class="scan-inrow" id="scanRowSnis">
+              <div class="scan-inrow-head">
+                <label class="switch"><input type="checkbox" id="scanUseSnis" /><span class="slider"></span></label>
+                <div class="scan-inrow-title">
+                  <label class="scan-inrow-name" for="scanSnis" data-i18n="scan.snis">SNIها</label>
+                  <span class="scan-inrow-hint" data-i18n="scan.snisHint"></span>
+                </div>
+                <span class="scan-inrow-own" id="scanOwnSnis"></span>
+              </div>
+              <div class="scan-inrow-body" id="scanSnisBody" hidden>
+                <textarea id="scanSnis" class="textarea scan-snis" rows="3" dir="ltr" spellcheck="false" data-i18n-ph="scan.snisPh"></textarea>
+              </div>
+            </div>
+
+            <!-- the parameter matrix (src/main/scan/variants.js): one row per dimension, built by scan.js from scan:presets' catalog -->
+            <details class="scan-params" id="scanParams">
+              <summary><span data-i18n="scan.params">پارامترها</span><span class="scan-params-count" id="scanParamsCount"></span></summary>
+              <p class="hint scan-params-intro" data-i18n="scan.paramsIntro"></p>
+              <div class="scan-dims" id="scanDims"></div>
+              <div class="row-gap scan-limit-row">
+                <label class="field-label scan-inline-label" for="scanLimit" data-i18n="scan.limit">حداکثر تست</label>
+                <input type="number" id="scanLimit" class="input scan-num" dir="ltr" min="1" max="1000000" value="300" />
+                <span class="scan-limit-hint" data-i18n="scan.limitHint"></span>
+              </div>
+              <div class="row-gap scan-sets">
+                <label class="field-label scan-inline-label" for="scanSetPick" data-i18n="scan.sets">مجموعه‌ها</label>
+                <select id="scanSetPick" class="select scan-set-pick"></select>
+                <button type="button" class="btn ghost small" id="btnScanSetLoad" data-i18n="scan.setLoad">بارگذاری</button>
+                <button type="button" class="btn ghost small" id="btnScanSetDelete" data-i18n="scan.setDelete">حذف</button>
+                <input type="text" id="scanSetName" class="input scan-set-name" maxlength="60" data-i18n-ph="scan.setNamePh" />
+                <button type="button" class="btn ghost small" id="btnScanSetSave" data-i18n="scan.setSave">ذخیره</button>
+              </div>
+            </details>
           </div>
 
           <!-- 3. how: one preset, how many at once, which cores, what to measure; the rest under Advanced -->
@@ -159,6 +223,21 @@
                 <div>
                   <label class="field-label" for="scanSamples" data-i18n="scan.samples">نمونه‌های تأخیر</label>
                   <input type="number" id="scanSamples" class="input" dir="ltr" min="1" max="10" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanPassRatio" data-i18n="scan.passRatio">حداقل پاسخ موفق (٪)</label>
+                  <input type="number" id="scanPassRatio" class="input" dir="ltr" min="30" max="100" step="1" data-i18n-title="scan.passRatioHint" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanDelayExpect" data-i18n="scan.delayExpect">پاسخ درست صفحهٔ تأخیر</label>
+                  <input type="text" id="scanDelayExpect" class="input" dir="ltr" spellcheck="false" data-i18n-ph="scan.delayExpectPh" data-i18n-title="scan.delayExpectHint" />
+                </div>
+                <div>
+                  <label class="field-label" for="scanPreConc" data-i18n="scan.preConc">پیش‌بررسی هم‌زمان</label>
+                  <input type="number" id="scanPreConc" class="input" dir="ltr" min="1" max="1024" data-i18n-title="scan.preConcHint" />
+                </div>
+                <div class="scan-limits-check">
+                  <label class="scan-check"><input type="checkbox" id="scanPreTls" /><span class="scan-check-label" data-i18n="scan.preTls">پیش‌بررسی با دست‌دادن TLS</span></label>
                 </div>
                 <div>
                   <label class="field-label" for="scanTcpTimeout" data-i18n="scan.tcpTimeout">سقف انتظار TCP (ms)</label>
@@ -250,6 +329,30 @@
               <button class="btn ghost small" id="btnScanClear" type="button" data-i18n="scan.clear">پاک کردن</button>
             </div>
           </div>
+          <!-- per variant, across every address: how often it passed, how fast, where best (built from the rows; scan.js) -->
+          <div class="scan-vsum" id="scanVarSum" hidden>
+            <div class="scan-vsum-head">
+              <span class="sec-label" data-i18n="scan.vsum">هر ترکیب پارامترها</span>
+              <span class="scan-vsum-hint" data-i18n="scan.vsumHint"></span>
+            </div>
+            <div class="scan-table-wrap">
+              <table class="scan-table scan-vsum-table" id="scanVarTable">
+                <thead>
+                  <tr>
+                    <th class="scan-th" data-i18n="scan.vcol.variant">ترکیب</th>
+                    <th class="scan-th" data-i18n="scan.vcol.ok">موفق</th>
+                    <th class="scan-th" data-i18n="scan.vcol.rate">نرخ</th>
+                    <th class="scan-th" data-i18n="scan.vcol.median">میانهٔ تأخیر</th>
+                    <th class="scan-th" data-i18n="scan.vcol.best">بهترین آدرس</th>
+                    <th class="scan-th scan-th-acts" data-i18n="scan.col.actions">کارها</th>
+                  </tr>
+                </thead>
+                <tbody id="scanVarTbody"></tbody>
+              </table>
+            </div>
+          </div>
+          <!-- the failures by reason: a run too big to list sends only the rows that passed -->
+          <p class="hint scan-fails" id="scanFails" hidden></p>
           <!-- many columns never fit 900px: the table scrolls inside this wrapper -->
           <div class="scan-table-wrap">
             <table class="scan-table" id="scanTable">
@@ -257,6 +360,7 @@
                 <tr>
                   <th class="scan-th" data-sort="addr"><span data-i18n="scan.col.addr">آدرس</span><span class="scan-sort"></span></th>
                   <th class="scan-th scan-c-sni" id="scanThSni" data-sort="sni"><span data-i18n="scan.col.sni">SNI</span><span class="scan-sort"></span></th>
+                  <th class="scan-th scan-c-var" id="scanThVar" data-sort="variant"><span data-i18n="scan.col.variant">پارامترها</span><span class="scan-sort"></span></th>
                   <th class="scan-th" data-sort="engine"><span data-i18n="scan.col.engine">هسته</span><span class="scan-sort"></span></th>
                   <th class="scan-th" data-sort="tcp"><span data-i18n="scan.col.tcp">TCP</span><span class="scan-sort"></span></th>
                   <th class="scan-th" data-sort="median" data-i18n-title="scan.col.medianHint"><span data-i18n="scan.col.median">تأخیر</span><span class="scan-sort"></span></th>
@@ -266,7 +370,7 @@
                   <th class="scan-th" data-sort="loss"><span data-i18n="scan.col.loss">اتلاف</span><span class="scan-sort"></span></th>
                   <th class="scan-th" data-sort="down"><span data-i18n="scan.col.down">دانلود</span><span class="scan-sort"></span></th>
                   <th class="scan-th" data-sort="up"><span data-i18n="scan.col.up">آپلود</span><span class="scan-sort"></span></th>
-                  <th class="scan-th" data-sort="score"><span data-i18n="scan.col.score">امتیاز</span><span class="scan-sort"></span></th>
+                  <th class="scan-th" data-sort="score" data-i18n-title="scan.col.scoreHint"><span data-i18n="scan.col.score">امتیاز</span><span class="scan-sort"></span></th>
                   <th class="scan-th scan-th-acts"><span data-i18n="scan.col.actions">کارها</span></th>
                 </tr>
               </thead>
