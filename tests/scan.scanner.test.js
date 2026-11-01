@@ -306,19 +306,26 @@ test('a failed TCP connect ends the row; a tunnel that never answers is alive to
   assert.equal(progress.at(-1).alive, 3);
 });
 
-test('results are sorted by score desc, then median delay asc', async () => {
-  const mbps = { '1.1.1.1': 1, '1.1.1.2': 9, '1.1.1.3': 9, '1.1.1.4': 3, '1.1.1.5': 0.5 };
-  const rig = fakeRig({
-    mbps: (ip) => mbps[ip],
-    delay: (ip) => (ip === '1.1.1.3' ? delayStats([20, 20, 20]) : delayStats([80, 80, 80]))
-  });
+test('results rank by success first, then the median delay, then the jitter — the download does not reorder them', async () => {
+  const mbps = { '1.1.1.1': 50, '1.1.1.2': 1, '1.1.1.3': 9, '1.1.1.4': 3, '1.1.1.5': 99 };
+  const series = {
+    '1.1.1.1': [20, 20, -1],        // fast, but a third lost
+    '1.1.1.2': [80, 80, 80],
+    '1.1.1.3': [100, 100, 100],
+    '1.1.1.4': [40, 80, 120],       // the same median as .2, more jitter
+    '1.1.1.5': [10, -1, -1]         // one lucky answer: not a pass
+  };
+  const rig = fakeRig({ mbps: (ip) => mbps[ip], delay: (ip) => delayStats(series[ip]) });
   const { promise } = run(rig, { opts: { batch: 20, speedTop: 5 } });
   const { results } = await promise;
-  assert.deepEqual(results.map(r => r.ip), ['1.1.1.3', '1.1.1.2', '1.1.1.4', '1.1.1.1', '1.1.1.5']);
-  for (let i = 1; i < results.length; i++) assert.ok(results[i - 1].score >= results[i].score);
-  const a = { score: 5, delay: { loss: 0, median: 30 } }, b = { score: 5, delay: { loss: 0, median: 20 } };
-  assert.ok(byRank(a, b) > 0, 'equal score: the lower median first');
-  assert.ok(byRank({ score: 5, delay: null }, b) > 0, 'no delay sorts after one');
+  assert.deepEqual(results.map(r => r.ip), ['1.1.1.2', '1.1.1.4', '1.1.1.3', '1.1.1.1', '1.1.1.5']);
+  assert.equal(results.find(r => r.ip === '1.1.1.5').score, 0);
+  assert.equal(results.find(r => r.ip === '1.1.1.5').phase, 1, 'a row that did not pass gets no speed test');
+  const a = { score: 10050, delay: { loss: 0, median: 30, jitter: 0 } }, b = { score: 10050, delay: { loss: 0, median: 20, jitter: 9 } };
+  assert.ok(byRank(a, b) > 0, 'the same step: the lower median first');
+  assert.ok(byRank({ score: 10050, delay: { loss: 0, median: 20, jitter: 1 } }, b) < 0, 'the same median: the lower jitter first');
+  assert.ok(byRank({ score: 10099, delay: null }, b) > 0, 'no delay sorts after one');
+  assert.ok(byRank({ score: 6799, delay: { loss: 1 / 3, median: 1, jitter: 0 } }, a) > 0, 'a lower success step loses whatever its latency');
 });
 
 /* ----------------------------- progress ----------------------------- */
@@ -475,7 +482,7 @@ test('runSpeed: phase 2 alone on the rows given, in the speed stage from the sta
   assert.equal(a.down.mbps, 5);
   const b = results.find(r => r.ip === '1.1.1.2');
   assert.deepEqual([b.tcp, b.delay, b.down.mbps], [null, null, 5]);
-  assert.equal(b.score, 500, 'download alone is the base when no delay came along');
+  assert.equal(b.score, 10094, 'no delay came along: a full success ranked by the download’s first byte (10 ms)');
   assert.ok(a.score < b.score && a.score > 0);
   assert.deepEqual(progress[0], { stage: 'speed', done: 2, total: 2, alive: 2, speedDone: 0, speedTotal: 2, etaMs: null });
   assert.deepEqual(progress.at(-1), { stage: 'done', done: 2, total: 2, alive: 2, speedDone: 2, speedTotal: 2, etaMs: 0 });
