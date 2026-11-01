@@ -20,7 +20,7 @@ const path = require('path');
 const http = require('http');
 const { spawn: nodeSpawn } = require('child_process');
 const { engineRunArgs } = require('../engines');
-const { getFreePort: nodeGetFreePort } = require('../xrayManager');
+const { getFreePort: nodeGetFreePort, PLAINTEXT_REJECT } = require('../xrayManager');
 const { normalizeModel, validateModel, buildServerConfig } = require('./config');
 
 const POLL_MS = 300;            // how often the metrics port is asked while starting
@@ -267,11 +267,28 @@ class ServerCore {
     try { apiPort = await this.getFreePort(); } catch (e) { return this._fail('no free port for the metrics listener: ' + e.message); }
     if (gen !== this.gen) return bailed();
     const config = buildServerConfig(model, { apiPort, servers: this.getServers(), geoAvailable: this._geo() });
-    const t = await this.xray.validate(config, model.engine);
+    let engine = model.engine;
+    let t = await this.xray.validate(config, engine);
     if (gen !== this.gen) return bailed();
+    // The official core refuses VLESS/Trojan without TLS to a public address (measured on 26.10.31: a
+    // bridge whose link to its portal is plaintext). Xray-PattN allows it, and the client already moves
+    // such a config there (xrayManager's validateWithFallback) — the server tab does the same, and says so.
+    if (t && !t.ok && PLAINTEXT_REJECT.test(t.error || '') && this.xray.resolveEngine(engine, { quiet: true }).id !== 'xray-pattn') {
+      if (this.xray.resolveEngine('xray-pattn', { quiet: true }).bin) {
+        const again = await this.xray.validate(config, 'xray-pattn');
+        if (gen !== this.gen) return bailed();
+        if (again && again.ok) {
+          this.log('Server core: the official core refuses this link without TLS to a public address — running it on Xray-PattN', 'warn');
+          engine = 'xray-pattn';
+          t = again;
+        }
+      } else if (t.error) {
+        t = Object.assign({}, t, { error: `${t.error} — install Xray-PattN (Settings → Cores), which allows it, or give the link TLS or REALITY` });
+      }
+    }
     if (!t || !t.ok) return this._fail((t && t.error) || 'the core refused the config');
 
-    const { id, bin } = this.xray.resolveEngine(model.engine, { quiet: true });
+    const { id, bin } = this.xray.resolveEngine(engine, { quiet: true });
     if (!bin) return this._fail('core binary not found');
     this.engine = id;
 
