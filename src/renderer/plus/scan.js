@@ -1309,7 +1309,7 @@
     if (!src.serverId && !src.link) { setError('no server'); return; }
     setError('');
     let res;
-    try { res = await window.api.scanRetest(Object.assign({ rows: rowsOut, tests: { down: true, up: testOn('up') }, opts: buildOpts() }, src)); }
+    try { res = await window.api.scanRetest(Object.assign({ rows: rowsOut, tests: { down: true, up: testOn('up') }, opts: buildOpts(), upstream: proxyReq() }, src)); }
     catch (e) { setError((e && e.message) || String(e)); return; }
     if (!res || res.error) { setError((res && res.error) || 'no rows'); return; }
     const n = res.total || rowsOut.length;

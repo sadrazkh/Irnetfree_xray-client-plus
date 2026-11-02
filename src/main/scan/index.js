@@ -224,6 +224,7 @@ function createScan(ctx, deps = {}) {
   const runSpeed = deps.runSpeed || defaultRunSpeed;
   const fetchEch = deps.fetchEchConfig || defaultFetchEch;
   const checkPath = deps.checkPath || U.checkPath;
+  let starting = false;     // a start is on its way to `run`
   let cdnStored = null;     // the store's updated lists, read once
   let cdnUpdating = null;   // the update under way: a second click joins it
   let run = null;                    // { runId, token, promise } while a scan is in flight
@@ -571,7 +572,14 @@ function createScan(ctx, deps = {}) {
     };
   }
 
+  /** One start at a time: it awaits DNS and the path check before `run` is set, and two that got past would both launch. */
   async function start(raw) {
+    if (starting) return { error: 'busy' };
+    starting = true;
+    try { return await startRun(raw); } finally { starting = false; }
+  }
+
+  async function startRun(raw) {
     const req = raw && typeof raw === 'object' ? raw : {};
     if (run) return { error: 'busy' };
 

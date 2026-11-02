@@ -12,6 +12,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const os = require('node:os');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const { createScan, STREAM_ALL } = require('../src/main/scan/index');
 const { delayStats } = require('../src/main/scan/score');
@@ -392,4 +394,22 @@ test('scan:cdnUpdate with an unreadable port refuses before it asks anyone', asy
   const s = setup({ fetchText: async () => { asked++; return ''; } }, []);
   assert.deepEqual(await s.handlers['scan:cdnUpdate']({ upstream: { on: true, addr: 'junk' } }), { error: 'proxy-addr' });
   assert.equal(asked, 0);
+});
+
+test('two starts at once: the second is told busy, whatever the first is still waiting on', async () => {
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const s = setup({ installed: ['xray'], checkPath: async () => { await held; return { via: 'direct', state: 'clean' }; } }, [VLESS()]);
+  const req = { serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 } };
+  const first = s.handlers['scan:start'](req);
+  assert.deepEqual(await s.handlers['scan:start'](req), { error: 'busy' });
+  release();
+  assert.equal((await first).error, undefined);
+  await s.finished();
+  assert.equal(s.cores.length, 1, 'one run');
+});
+
+test('the page sends its way out with a re-test as with a start', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'plus', 'scan.js'), 'utf8');
+  assert.match(src, /scanRetest\([^\n]*upstream: proxyReq\(\)/);
 });
