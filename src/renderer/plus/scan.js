@@ -73,7 +73,9 @@
   const TABLE_MAX = 3000;
   /** How long after the last change the summary asks main again. */
   const PLAN_MS = 300;
-  const PRESET_NAMES = { cf: 'scan.p.cf', 'warp-masque': 'scan.p.warpMasque', 'warp-wg': 'scan.p.warpWg' };
+  const PRESET_NAMES = { cf: 'scan.p.cf', fastly: 'scan.p.fastly', cloudfront: 'scan.p.cloudfront', 'cloudfront-regional': 'scan.p.cloudfrontRegional', gcore: 'scan.p.gcore', 'warp-masque': 'scan.p.warpMasque', 'warp-wg': 'scan.p.warpWg' };
+  /** The presets the update button refreshes, in the order of their buttons. */
+  const CDN_IDS = ['cf', 'fastly', 'cloudfront', 'cloudfront-regional', 'gcore'];
   /** Each dimension's name, hint and plural (for the summary), as dictionary keys. */
   const DIM_KEYS = {
     fingerprint: ['scan.dim.fingerprint', 'scan.dim.fingerprint.hint', 'scan.dim.fingerprint.many'],
@@ -99,7 +101,8 @@
   let sourceSel = null;          // the makeSearchSelect element, when there is one
   let pendingPick = '';          // a config chosen elsewhere (Configs → «اسکن این»), applied at the next rebuild
   let srcMode = 'server';        // 'server' | 'link'
-  let pickMode = 'all';          // 'all' | 'sample' | 'random'
+  let pickMode = 'all';          // 'all' | 'sample' | 'random' | 'block'
+  let cdnFailed = [];            // the last update's failures: [{ name, error }]
   let run = null;                // { runId, startedAt } while a scan is in flight
   let prog = null;               // the newest progress; it outlives the run so the strip keeps its numbers
   let lastReq = null;            // the request the rows came from — links, saving and re-tests reuse its source
@@ -289,19 +292,22 @@
   }
 
   function setPick(mode) {
-    pickMode = mode === 'random' || mode === 'sample' ? mode : 'all';
+    pickMode = mode === 'random' || mode === 'sample' || mode === 'block' ? mode : 'all';
     $$('#scanPickSeg .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.pick === pickMode));
     $('#scanPickOpts').hidden = pickMode === 'all';
     $('#scanPickN').hidden = pickMode !== 'sample';
     $('#scanPerRange').hidden = pickMode !== 'random';
+    $('#scanPerBlock').hidden = pickMode !== 'block';
+    $('#scanBlockWrap').hidden = pickMode !== 'block';
     const label = $('#scanPickNLabel');
-    label.htmlFor = pickMode === 'random' ? 'scanPerRange' : 'scanPickN';
-    if (pickMode === 'random') label.dataset.i18n = 'scan.perRange'; else label.dataset.i18n = 'scan.pickN';
+    label.htmlFor = pickMode === 'random' ? 'scanPerRange' : (pickMode === 'block' ? 'scanPerBlock' : 'scanPickN');
+    label.dataset.i18n = pickMode === 'random' ? 'scan.perRange' : (pickMode === 'block' ? 'scan.perBlock' : 'scan.pickN');
     label.textContent = t(label.dataset.i18n);
     updateCount();
   }
   const perRange = () => Math.round(numOf('#scanPerRange', 20, 1));
   const pickCount = () => Math.round(numOf('#scanPickN', 1000, 1));
+  const perBlock = () => Math.round(numOf('#scanPerBlock', 5, 1));
 
   /** The line under the box: what a run took, or main's count of what the box names. */
   function paintCount() {
@@ -344,10 +350,39 @@
     $('#scanIps').value = p.ranges.join('\n');
     if (Array.isArray(p.ports) && p.ports.length) { $('#scanPorts').value = p.ports.join(', '); $('#scanUsePorts').checked = true; }
     paintRows();
-    // a big list is meant to be sampled, not walked
-    if (p.ranges.length > 1 || /\/(?:[0-9]|1[0-9]|2[0-3])$/.test(p.ranges[0] || '')) setPick('random');
+    // a big list is meant to be sampled, not walked; a sampling pick already chosen stays
+    if (pickMode === 'all' && (p.ranges.length > 1 || /\/(?:[0-9]|1[0-9]|2[0-3])$/.test(p.ranges[0] || ''))) setPick('random');
     updateCount();
     return undefined;
+  }
+
+  /** The line beside the update button: each list's size and date, then what the last update could not reach. */
+  function paintCdnStatus() {
+    const el = $('#scanCdnStatus');
+    const date = (ms) => (ms ? new Date(ms).toLocaleDateString(document.documentElement.lang === 'fa' ? 'fa-IR' : 'en-GB', { year: 'numeric', month: 'short', day: 'numeric' }) : '');
+    const rows = CDN_IDS.map((id) => ({ name: t(PRESET_NAMES[id]), list: (presets.ranges || {})[id] })).filter((r) => r.list && Array.isArray(r.list.ranges));
+    const parts = rows.map((r) => fill(t('scan.cdn.line'), { name: r.name, n: fmtN(r.list.ranges.length), d: date(r.list.updatedAt) }));
+    for (const f of cdnFailed) parts.push(fill(t('scan.cdn.fail'), { name: f.name, e: f.error }));
+    el.textContent = parts.join(' · ');
+  }
+
+  /** Asks every CDN for its list; what comes back replaces the presets, what fails stays and is said. */
+  async function updateCdnLists() {
+    const btn = $('#btnScanCdnUpdate');
+    btn.disabled = true;
+    $('#scanCdnStatus').textContent = t('scan.cdn.updating');
+    try {
+      const r = await window.api.scanCdnUpdate({});
+      Object.assign(presets.ranges, r.ranges);
+      cdnFailed = r.results.filter((x) => !x.ok).map((x) => ({ name: x.name, error: x.error }));
+      if (!cdnFailed.length) toast(t('scan.cdn.doneAll'), 'ok');
+      else toast(fill(t('scan.cdn.someFailed'), { n: cdnFailed.length }), 'warn');
+    } catch (e) {
+      toast((e && e.message) || String(e), 'err');
+    } finally {
+      btn.disabled = false;
+      paintCdnStatus();
+    }
   }
 
   function applyPortsPreset(name) {
@@ -784,6 +819,8 @@
     if (last.pick && typeof last.pick === 'object') {
       if (last.pick.perRange) $('#scanPerRange').value = last.pick.perRange;
       if (last.pick.count) $('#scanPickN').value = last.pick.count;
+      if (last.pick.perBlock) $('#scanPerBlock').value = last.pick.perBlock;
+      if (last.pick.block) $('#scanBlock').value = String(last.pick.block);
       $('#scanFresh').checked = last.pick.fresh !== false;
       setPick(last.pick.mode);
     }
@@ -1171,7 +1208,7 @@
       ipsText: $('#scanUseAddrs').checked ? $('#scanIps').value : '',
       portsText: $('#scanUsePorts').checked ? $('#scanPorts').value : '',
       snisText: $('#scanUseSnis').checked && !$('#scanSnis').disabled ? $('#scanSnis').value : '',
-      pick: { mode: pickMode, perRange: perRange(), count: pickCount(), fresh: $('#scanFresh').checked },
+      pick: { mode: pickMode, perRange: perRange(), count: pickCount(), perBlock: perBlock(), block: Number($('#scanBlock').value), fresh: $('#scanFresh').checked },
       engines: selectedEngines(),
       tests: selectedTests(),
       opts: buildOpts(),
@@ -1368,6 +1405,9 @@
     $('#scanSnis').oninput = updateCount;
     $('#scanPerRange').oninput = updateCount;
     $('#scanPickN').oninput = updateCount;
+    $('#scanPerBlock').oninput = updateCount;
+    $('#scanBlock').onchange = updateCount;
+    $('#btnScanCdnUpdate').onclick = updateCdnLists;
     $('#scanLimit').oninput = schedulePlan;
     $('#scanEngines').addEventListener('change', schedulePlan);
     $('#scanAddrPresets').onclick = (e) => { const b = e.target.closest('button[data-preset]'); if (b) applyAddrPreset(b.dataset.preset); };
@@ -1441,6 +1481,7 @@
   function redrawText() {
     renderEngines(presets.engines || []);
     paintCount();
+    paintCdnStatus();
     paintStrip();
     paintSortMarks();
     paintFacts();
@@ -1483,6 +1524,7 @@
     restore(presets.last);
     paintRows();
     paintTested(presets.tested);
+    paintCdnStatus();
     renderDims();
     refreshSourcePicker();
     wire();

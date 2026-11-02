@@ -152,6 +152,12 @@ test('scan:plan: the live counts — addresses X of Y, targets, variants and tes
   assert.deepEqual([sample.addresses.taken, sample.targets], [500, 1000]);
   const per = await s.handlers['scan:plan']({ serverId: 'sv-vless', ipsText: '10.0.0.0/24\n10.1.0.0/30', pick: { mode: 'random', perRange: 10 } });
   assert.deepEqual([per.addresses.total, per.addresses.taken], [260, 14]);
+  const block = await s.handlers['scan:plan']({ serverId: 'sv-vless', ipsText: '10.0.0.0/22\n10.1.0.1/32', pick: { mode: 'block', perBlock: 100, block: 24 } });
+  assert.deepEqual([block.addresses.total, block.addresses.taken], [1025, 401], 'a /22 is four blocks of 100, not one 100');
+  const t1 = Date.now();
+  const blocks = await s.handlers['scan:plan']({ serverId: 'sv-vless', ipsText: '10.0.0.0/8', portsText: '443, 2053', pick: { mode: 'block', perBlock: 3, block: 24 } });
+  assert.ok(Date.now() - t1 < 1000, 'blocks are counted, not drawn');
+  assert.deepEqual([blocks.addresses.taken, blocks.targets], [196608, 393216]);
   const v = await s.handlers['scan:plan']({
     serverId: 'sv-vless', ipsText: '1.1.1.0/30', snisText: 'a.example.org',
     variants: { dims: { fingerprint: ['chrome', 'firefox', 'ios', 'edge'], finalMask: ['none', 'tlshello'] }, limit: 20 }
@@ -187,7 +193,7 @@ test('the address picks: N random from all the ranges together, N from each rang
   const r = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '10.0.0.0/16\n10.9.9.0/24', tests: FILTER, pick: { mode: 'sample', count: 64 } });
   assert.deepEqual([r.targets, r.addresses], [64, { total: 65792, taken: 64 }]);
   await s.finished();
-  assert.deepEqual(s.data.scan.pick, { mode: 'sample', perRange: 20, count: 64, fresh: true });
+  assert.deepEqual(s.data.scan.pick, { mode: 'sample', perRange: 20, count: 64, perBlock: 5, block: 24, fresh: true });
   assert.ok(s.logs.some((l) => /64 of 65792 address\(es\), a random sample of all the ranges together/.test(l.line)));
 });
 
