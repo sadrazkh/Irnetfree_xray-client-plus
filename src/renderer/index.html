@@ -236,6 +236,13 @@
             <div class="scan-checks" id="scanEngines"></div>
             <label class="field-label scan-sub-label" data-i18n="scan.testsPick">چه چیزی اندازه گرفته شود</label>
             <div class="scan-checks" id="scanTests"></div>
+            <label class="field-label scan-sub-label" data-i18n="scan.path">مسیر اسکن</label>
+            <div class="row-gap scan-path-row">
+              <label class="scan-check"><input type="checkbox" id="scanProxyOn" /><span class="scan-check-label" data-i18n="scan.proxy.on">از یک پورت SOCKS</span></label>
+              <input type="text" id="scanProxyAddr" class="input scan-proxy-addr" dir="ltr" spellcheck="false" placeholder="127.0.0.1:30810" data-i18n-title="scan.proxy.addrHint" />
+              <button type="button" class="btn ghost small" id="btnScanPathCheck" data-i18n="scan.path.check">بررسی مسیر</button>
+            </div>
+            <p class="scan-path-line" id="scanPathLine" role="status"></p>
 
             <details class="scan-more" id="scanAdvanced">
               <summary data-i18n="scan.advanced">پیشرفته</summary>

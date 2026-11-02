@@ -520,7 +520,7 @@ function fakeCtx(rig, { servers = [] } = {}) {
 function setup(spec = {}, extra = {}) {
   const rig = fakeRig(spec);
   const c = fakeCtx(rig, extra);
-  const scan = createScan(c.ctx, { probes: rig.probes, getFreePorts: rig.getFreePorts, waitReady: ready, runScan: extra.runScan, fetchEchConfig: extra.fetchEchConfig });
+  const scan = createScan(c.ctx, { probes: rig.probes, getFreePorts: rig.getFreePorts, waitReady: ready, runScan: extra.runScan, fetchEchConfig: extra.fetchEchConfig, checkPath: extra.checkPath || (async (up) => ({ via: up ? 'proxy' : 'direct', state: 'clean' })) });
   scan.register();
   return Object.assign({ rig, scan }, c);
 }
@@ -528,9 +528,9 @@ function setup(spec = {}, extra = {}) {
 const progressOf = (events) => events.filter(e => e.ch === 'scan-progress').map(e => e.payload);
 const EVENT_KEYS = ['alive', 'done', 'etaMs', 'reasons', 'runId', 'speedDone', 'speedTotal', 'stage', 'total'];
 
-test('register() puts exactly the thirteen scan channels on the context', () => {
+test('register() puts exactly the fourteen scan channels on the context', () => {
   const s = setup();
-  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:cdnUpdate', 'scan:copy', 'scan:export', 'scan:forget', 'scan:links', 'scan:plan', 'scan:presets', 'scan:retest', 'scan:sets', 'scan:start', 'scan:stop', 'scan:suggest']);
+  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:cdnUpdate', 'scan:copy', 'scan:export', 'scan:forget', 'scan:links', 'scan:pathCheck', 'scan:plan', 'scan:presets', 'scan:retest', 'scan:sets', 'scan:start', 'scan:stop', 'scan:suggest']);
   assert.equal(s.scan.busy(), false);
 });
 
@@ -614,7 +614,7 @@ test('scan:start runs in the background and streams scan-progress: one event per
 
   // the last request is remembered without results, with the engines it actually ran and the v2.1 option names
   const last = s.data.scan;
-  assert.deepEqual(Object.keys(last).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'variants']);
+  assert.deepEqual(Object.keys(last).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'upstream', 'variants']);
   assert.deepEqual(last.pick, { mode: 'all', perRange: 20, count: 1000, perBlock: 5, block: 24, fresh: true }, 'a request without a pick is every address');
   assert.deepEqual(last.variants, { dims: {}, limit: 300 }, 'no parameter dimensions: the plain run');
   assert.equal(last.serverId, 'sv-vless');
@@ -819,7 +819,7 @@ test('scan:start with a random pick draws perRange from every range, remembers t
   assert.equal(ips.filter(ip => ip.startsWith('1.1.1.')).length, 2);
   assert.equal(ips.filter(ip => ip.startsWith('2.2.2.')).length, 2);
   assert.deepEqual(s.data.scan.pick, { mode: 'random', perRange: 2, count: 1000, perBlock: 5, block: 24, fresh: true }, 'the pick is part of the remembered request');
-  assert.deepEqual(Object.keys(s.data.scan).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'variants']);
+  assert.deepEqual(Object.keys(s.data.scan).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'upstream', 'variants']);
   // the history: the four addresses, as integers, and the count in presets
   assert.equal(s.data.scanTested.length, 4);
   assert.ok(s.data.scanTested.every(n => typeof n === 'string'), 'v3 keeps normalised strings');

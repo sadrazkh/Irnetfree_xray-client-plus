@@ -56,6 +56,7 @@
  */
 const net = require('net');
 const { buildMultiTestConfig } = require('../configBuilder');
+const { withUpstream, dialVia } = require('./upstream');
 const { getFreePorts: realGetFreePorts } = require('../xrayManager');
 const { tcpPing, pLimit } = require('../netutils');
 const { applyTarget } = require('./substitute');
@@ -187,6 +188,9 @@ function makeContext(args) {
   const batchSize = posInt(o.batch, SCAN_DEFAULTS.batch);
   const ctx = {
     server: args.server, xray: args.xray, tests, o,
+    upstream: args.upstream || null,
+    // through a port only a TLS handshake says anything (upstream.js); without one, no pre-check
+    noPrecheck: !!args.upstream && !o.prefilterTls,
     transport: args.transport === 'udp' ? 'udp' : 'tcp',
     sni: typeof args.sni === 'string' ? args.sni : '',
     token: args.token || { cancelled: false },
@@ -248,7 +252,7 @@ function recordOf(ctx, tg) {
 async function withCore(ctx, engine, targets, work) {
   const servers = targets.map((tg) => recordOf(ctx, tg));
   const ports = await ctx.getFreePorts(targets.length);
-  const cfg = buildMultiTestConfig(servers, ports);
+  const cfg = withUpstream(buildMultiTestConfig(servers, ports), ctx.upstream);
   let test;
   try { test = await ctx.xray.startTest(cfg, engine); } catch (e) { throw Object.assign(e instanceof Error ? e : new Error(String(e)), { built: cfg }); }
   let cleaned = false;
@@ -270,7 +274,7 @@ async function withCore(ctx, engine, targets, work) {
 /* ----------------------------- the pre-check ----------------------------- */
 
 /** Does the pre-check (and the TCP column) apply: the TCP test ticked, a config over TCP. */
-const prechecks = (ctx) => ctx.tests.tcp && ctx.transport === 'tcp';
+const prechecks = (ctx) => ctx.tests.tcp && ctx.transport === 'tcp' && !ctx.noPrecheck;
 
 /**
  * The pre-check of one chunk: every distinct address:port (with its SNI for
@@ -289,7 +293,7 @@ async function precheck(ctx, items, enginesOf) {
     probe.set(k, ctx.preLimit(async () => {
       if (token.cancelled) return null;
       if (tlsForm) {
-        const r = await probes.tlsPing(it.addr, port, { servername: it.sni || ctx.sni, timeout: o.tcpTimeout });
+        const r = await probes.tlsPing(it.addr, port, Object.assign({ servername: it.sni || ctx.sni, timeout: o.tcpTimeout }, ctx.upstream ? { dial: dialVia(ctx.upstream) } : {}));
         return { ok: !!r.ok, ms: r.ok ? r.ms : -1, error: r.error || null, reason: r.ok ? '' : (r.reason || 'tls') };
       }
       const r = await probes.tcpPing(it.addr, port, o.tcpTimeout);
@@ -324,7 +328,7 @@ async function filterOne(ctx, item, engine, port) {
   const { tests, o, probes, token } = ctx;
   const r = emptyResult(item, engine, 1);
   if (item.tcp) r.tcp = Object.assign({}, item.tcp);
-  else if (tests.tcp && ctx.transport === 'tcp') {
+  else if (prechecks(ctx)) {
     // an item that skipped the pre-check (a caller's own list): the connect is made here, as before
     r.tcp = await probes.tcpPing(item.addr, item.port || ctx.server.port, o.tcpTimeout);
     if (!r.tcp.ok) { r.reason = 'no-tcp'; return r; }

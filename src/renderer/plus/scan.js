@@ -38,6 +38,11 @@
     'unsupported protocol': 'scan.err.proto',
     'json chain': 'scan.err.chain',
     'no targets': 'scan.err.noTargets',
+    'proxy-addr': 'scan.path.proxy-addr',
+    'proxy-down': 'scan.path.proxy-down',
+    'proxy-bad': 'scan.path.proxy-bad',
+    'proxy-auth': 'scan.path.proxy-auth',
+    'proxy-udp': 'scan.path.proxy-udp',
     'no engine': 'scan.err.noEngine',
     'core too old': 'scan.err.coreOld',
     'no tests': 'scan.err.noTests',
@@ -103,6 +108,9 @@
   let srcMode = 'server';        // 'server' | 'link'
   let pickMode = 'all';          // 'all' | 'sample' | 'random' | 'block'
   let cdnFailed = [];            // the last update's failures: [{ name, error }]
+  let pathState = null;          // the last answer about the way out: { via, state }, or 'checking'
+  let pathSeq = 0;               // an older check's answer must not overwrite a newer one's
+  let pathTimer = null;
   let run = null;                // { runId, startedAt } while a scan is in flight
   let prog = null;               // the newest progress; it outlives the run so the strip keeps its numbers
   let lastReq = null;            // the request the rows came from — links, saving and re-tests reuse its source
@@ -356,6 +364,32 @@
     return undefined;
   }
 
+  const proxyReq = () => ({ on: $('#scanProxyOn').checked, addr: $('#scanProxyAddr').value.trim() });
+
+  /** The line under the path row: what the last check found. */
+  function paintPath() {
+    const el = $('#scanPathLine');
+    $('#scanProxyAddr').hidden = !$('#scanProxyOn').checked;
+    if (pathState === 'checking') { el.textContent = t('scan.path.checking'); el.className = 'scan-path-line'; return; }
+    if (!pathState) { el.textContent = ''; el.className = 'scan-path-line'; return; }
+    const key = pathState.state === 'clean' || pathState.state === 'lying' ? `scan.path.${pathState.state}.${pathState.via}` : `scan.path.${pathState.state}`;
+    el.textContent = t(key);
+    el.className = 'scan-path-line ' + (pathState.state === 'clean' ? 'ok' : 'warn');
+  }
+
+  /** Asks main whether the way out is honest; the newest question's answer is the one shown. */
+  async function checkPathNow() {
+    clearTimeout(pathTimer);
+    const seq = ++pathSeq;
+    pathState = 'checking';
+    paintPath();
+    let r;
+    try { r = await window.api.scanPathCheck({ upstream: proxyReq() }); } catch { r = null; }
+    if (seq !== pathSeq) return;
+    pathState = r && r.state ? r : null;
+    paintPath();
+  }
+
   /** The line beside the update button: each list's size and date, then what the last update could not reach. */
   function paintCdnStatus() {
     const el = $('#scanCdnStatus');
@@ -372,7 +406,8 @@
     btn.disabled = true;
     $('#scanCdnStatus').textContent = t('scan.cdn.updating');
     try {
-      const r = await window.api.scanCdnUpdate({});
+      const r = await window.api.scanCdnUpdate({ upstream: proxyReq() });
+      if (r.error) { setError(r.error); return; }
       Object.assign(presets.ranges, r.ranges);
       cdnFailed = r.results.filter((x) => !x.ok).map((x) => ({ name: x.name, error: x.error }));
       if (!cdnFailed.length) toast(t('scan.cdn.doneAll'), 'ok');
@@ -824,6 +859,10 @@
       $('#scanFresh').checked = last.pick.fresh !== false;
       setPick(last.pick.mode);
     }
+    if (last.upstream && typeof last.upstream === 'object') {
+      $('#scanProxyOn').checked = !!last.upstream.on;
+      $('#scanProxyAddr').value = String(last.upstream.addr || '');
+    }
     if (Array.isArray(last.engines) && last.engines.length) {
       $$('#scanEngines input').forEach(b => { if (!b.disabled) b.checked = last.engines.includes(b.value); });
     }
@@ -1173,6 +1212,8 @@
       if (n.kind === 'ech') li.textContent = fill(t('scan.note.ech'), { via: n.via || '—', name: n.publicName || '—' });
       else if (n.kind === 'echFail') li.textContent = fill(t('scan.note.echFail'), { error: n.error || '—' });
       else if (n.kind === 'variant') li.textContent = fill(t('scan.note.variant'), { label: n.label, reason: n.reason || '' });
+      else if (n.kind === 'path') li.textContent = t(`scan.path.lying.${n.via}`);
+      else if (n.kind === 'proxyTricks') li.textContent = t('scan.path.tricks');
       else if (n.kind === 'dim') li.textContent = fill(t('scan.note.dim'), { dim: t((DIM_KEYS[n.dim] || [n.dim])[0]), reason: n.reason || '' });
       else li.textContent = fill(t('scan.note.skipped'), { engine: ENGINE_SHORT[n.engine] || n.engine, reason: n.reason || '' });
       if (n.kind !== 'ech') li.className = 'warn';
@@ -1183,6 +1224,8 @@
 
   function notesOf(res) {
     const out = [];
+    if (res && res.path && res.path.state === 'lying') out.push({ kind: 'path', via: res.path.via });
+    if (res && res.proxyTricks) out.push({ kind: 'proxyTricks' });
     if (res && res.ech) out.push(res.ech.ok ? Object.assign({ kind: 'ech' }, res.ech) : Object.assign({ kind: 'echFail' }, res.ech));
     for (const s of (res && res.skipped) || []) out.push(Object.assign({ kind: 'skipped' }, s));
     const v = res && res.variants;
@@ -1212,7 +1255,8 @@
       engines: selectedEngines(),
       tests: selectedTests(),
       opts: buildOpts(),
-      variants: buildSpec()
+      variants: buildSpec(),
+      upstream: proxyReq()
     }, formSource());
   }
 
@@ -1239,6 +1283,7 @@
     btn.disabled = false;
     notes = notesOf(res);
     paintNotes();
+    if (res && res.path) { pathSeq++; pathState = res.path; paintPath(); }
     if (!res || res.error) { setError((res && res.error) || 'no server'); return; }
     lastReq = req;
     variantByKey.clear();
@@ -1264,7 +1309,7 @@
     if (!src.serverId && !src.link) { setError('no server'); return; }
     setError('');
     let res;
-    try { res = await window.api.scanRetest(Object.assign({ rows: rowsOut, tests: { down: true, up: testOn('up') }, opts: buildOpts() }, src)); }
+    try { res = await window.api.scanRetest(Object.assign({ rows: rowsOut, tests: { down: true, up: testOn('up') }, opts: buildOpts(), upstream: proxyReq() }, src)); }
     catch (e) { setError((e && e.message) || String(e)); return; }
     if (!res || res.error) { setError((res && res.error) || 'no rows'); return; }
     const n = res.total || rowsOut.length;
@@ -1408,6 +1453,9 @@
     $('#scanPerBlock').oninput = updateCount;
     $('#scanBlock').onchange = updateCount;
     $('#btnScanCdnUpdate').onclick = updateCdnLists;
+    $('#btnScanPathCheck').onclick = checkPathNow;
+    $('#scanProxyOn').onchange = () => { paintPath(); checkPathNow(); };
+    $('#scanProxyAddr').oninput = () => { clearTimeout(pathTimer); pathTimer = setTimeout(checkPathNow, 700); };
     $('#scanLimit').oninput = schedulePlan;
     $('#scanEngines').addEventListener('change', schedulePlan);
     $('#scanAddrPresets').onclick = (e) => { const b = e.target.closest('button[data-preset]'); if (b) applyAddrPreset(b.dataset.preset); };
@@ -1482,6 +1530,7 @@
     renderEngines(presets.engines || []);
     paintCount();
     paintCdnStatus();
+    paintPath();
     paintStrip();
     paintSortMarks();
     paintFacts();
@@ -1525,6 +1574,8 @@
     paintRows();
     paintTested(presets.tested);
     paintCdnStatus();
+    paintPath();
+    checkPathNow();
     renderDims();
     refreshSourcePicker();
     wire();
