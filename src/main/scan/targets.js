@@ -16,6 +16,10 @@
  * addresses, so a block gives a sample of itself.
  */
 
+/** Fastly, CloudFront and Gcore as shipped: scripts/update-cdn-ranges.js writes it, the page's Update button goes past it (cdnRanges.js). */
+const CDN_SHIPPED = require('./cdnRanges.data.json');
+const CDN_SHIPPED_AT = Date.parse(CDN_SHIPPED.fetchedAt) || 0;
+
 /** Cloudflare's published IPv4 blocks (https://www.cloudflare.com/ips-v4). */
 const CF_IPV4_RANGES = [
   '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
@@ -37,6 +41,10 @@ const CF_IPV6_RANGES = [
  */
 const PRESETS = {
   cf: { ranges: CF_IPV4_RANGES.concat(CF_IPV6_RANGES) },
+  fastly: { ranges: CDN_SHIPPED.fastly },
+  cloudfront: { ranges: CDN_SHIPPED.cloudfront },
+  'cloudfront-regional': { ranges: CDN_SHIPPED['cloudfront-regional'] },
+  gcore: { ranges: CDN_SHIPPED.gcore },
   'warp-masque': { ranges: ['162.159.198.0/24'] },
   'warp-wg': {
     ranges: ['162.159.192.0/24', '162.159.193.0/24', '162.159.195.0/24', '188.114.96.0/24', '188.114.97.0/24', '188.114.98.0/24', '188.114.99.0/24'],
@@ -51,6 +59,10 @@ const PRESETS = {
 const DEFAULT_MAX = 5000;
 const DEFAULT_PER_RANGE = 20;
 const DEFAULT_V6_PER_RANGE = 100;
+const DEFAULT_PER_BLOCK = 5;
+const DEFAULT_BLOCK = 24;
+/** The block sizes the page offers: /24 is 256 addresses. */
+const BLOCK_PREFIXES = [16, 20, 22, 23, 24, 25, 26, 27, 28];
 const MIN_PREFIX = 8;
 const MIN_PREFIX6 = 16;
 const MAX_PORTS = 1000;
@@ -750,6 +762,148 @@ function sampleSpace(space, n, opts = {}) {
   return { space: listSpace(picked.map((i) => space.at(i))), taken: picked.length, repeated };
 }
 
+/*
+ * 2026-11-02 (the owner: "a /22 and a /32 are not alike; N for every 256
+ * addresses, so a /22 does not give only its 100"). A block is an aligned stretch
+ * of the address space — every /24 by default, whatever ranges the box wrote —
+ * so the share follows the size of the network: a /22 is four blocks, a /32 is
+ * one block of one address, and two /32s of one /24 share that /24's N. The
+ * ranges of a port are merged first, so a block counts once however the box
+ * cuts it. An IPv6 block has no such grid: each gives N of itself, at most
+ * DEFAULT_V6_PER_RANGE like everywhere else.
+ */
+
+const blockPrefix = (v) => (BLOCK_PREFIXES.includes(Number(v)) ? Number(v) : DEFAULT_BLOCK);
+const perBlockOf = (v) => posInt(v, DEFAULT_PER_BLOCK);
+
+/** The space's IPv4 addresses by port: port → sorted, disjoint [start, end], touching ones joined. */
+function v4ByPort(space) {
+  const out = new Map();
+  for (const s of space.segments) {
+    if (s.kind !== 'v4') continue;
+    if (!out.has(s.port)) out.set(s.port, []);
+    out.get(s.port).push([s.start, s.start + s.size - 1]);
+  }
+  for (const [port, ivs] of out) {
+    ivs.sort((a, b) => a[0] - b[0]);
+    const joined = [];
+    for (const iv of ivs) {
+      const end = joined[joined.length - 1];
+      if (end && iv[0] <= end[1] + 1) end[1] = Math.max(end[1], iv[1]);
+      else joined.push(iv.slice());
+    }
+    out.set(port, joined);
+  }
+  return out;
+}
+
+/** Calls onBlock(subs) once per block the intervals touch, subs being its parts; onBlock false stops it. */
+function walkBlocks(ivs, blockSize, onBlock) {
+  let subs = [], id = -1;
+  for (const [s, e] of ivs) {
+    const last = Math.floor(e / blockSize);
+    for (let b = Math.floor(s / blockSize); b <= last; b++) {
+      if (b !== id) {
+        if (subs.length && onBlock(subs) === false) return false;
+        subs = [];
+        id = b;
+      }
+      subs.push([Math.max(s, b * blockSize), Math.min(e, (b + 1) * blockSize - 1)]);
+    }
+  }
+  return !subs.length || onBlock(subs) !== false;
+}
+
+const subsSize = (subs) => subs.reduce((n, [s, e]) => n + e - s + 1, 0);
+
+/** The address box under pick `block`, its v6 blocks drawn to N. */
+function blockSpace(text, perBlock, opts = {}) {
+  return addressSpace(text, Object.assign({}, opts, { v6PerRange: Math.min(perBlock, DEFAULT_V6_PER_RANGE) }));
+}
+
+/** How many addresses pick `block` takes, without drawing them; at most MAX_SAMPLE. */
+function countPerBlock(text, pick = {}) {
+  const perBlock = perBlockOf(pick.perBlock);
+  const blockSize = 2 ** (32 - blockPrefix(pick.block));
+  const space = blockSpace(text, perBlock);
+  let n = 0;
+  for (const s of space.segments) if (s.kind !== 'v4') n += s.size;
+  for (const ivs of v4ByPort(space).values()) {
+    if (n >= MAX_SAMPLE) break;
+    walkBlocks(ivs, blockSize, (subs) => { n += Math.min(perBlock, subsSize(subs)); return n < MAX_SAMPLE; });
+  }
+  return Math.min(n, MAX_SAMPLE);
+}
+
+/**
+ * min(n, size) distinct addresses of one block, by a shuffle that goes no further
+ * than it must. What `exclude` holds is passed over while the block has others;
+ * when it has not, tested ones fill the rest and `repeated` says so.
+ */
+function drawBlock(subs, n, rng, exclude) {
+  const size = subsSize(subs);
+  const want = Math.min(n, size);
+  const intAt = (i) => {
+    for (const [s, e] of subs) {
+      const len = e - s + 1;
+      if (i < len) return s + i;
+      i -= len;
+    }
+    return null;
+  };
+  const moved = new Map();
+  const fresh = [], old = [];
+  for (let i = 0; i < size && fresh.length < want; i++) {
+    const j = i + Math.floor(rng() * (size - i));
+    const pick = moved.has(j) ? moved.get(j) : j;
+    moved.set(j, moved.has(i) ? moved.get(i) : i);
+    const addr = intToIp4(intAt(pick));
+    (exclude && exclude.has(addr) ? old : fresh).push(addr);
+  }
+  const repeated = fresh.length < want;
+  while (fresh.length < want && old.length) fresh.push(old.shift());
+  return { addrs: fresh, repeated };
+}
+
+/**
+ * drawBlocks(text, pick, { exclude, rng }) → { addrs: [{ addr, port }], exhausted, truncated }
+ *
+ * `perBlock` from every /`block` the box's IPv4 ranges touch, port by port in the
+ * order the box first names them; IPv6 blocks and host names where they stand.
+ * `exhausted` counts the blocks that had to repeat; `truncated` says MAX_SAMPLE cut it.
+ */
+function drawBlocks(text, pick = {}, opts = {}) {
+  const rng = typeof opts.rng === 'function' ? opts.rng : Math.random;
+  const exclude = opts.exclude instanceof Set && opts.exclude.size ? opts.exclude : null;
+  const perBlock = perBlockOf(pick.perBlock);
+  const blockSize = 2 ** (32 - blockPrefix(pick.block));
+  const space = blockSpace(text, perBlock, opts);
+  const byPort = v4ByPort(space);
+  const addrs = [];
+  const walked = new Set();
+  let exhausted = 0, truncated = false;
+  const add = (addr, port) => {
+    if (addrs.length >= MAX_SAMPLE) { truncated = true; return false; }
+    addrs.push({ addr, port });
+    return true;
+  };
+  for (const seg of space.segments) {
+    if (truncated) break;
+    if (seg.kind !== 'v4') {
+      for (let j = 0; j < seg.size && add(seg.addrAt(j), seg.port); j++) { /* add() says when it is full */ }
+      continue;
+    }
+    if (walked.has(seg.port)) continue;
+    walked.add(seg.port);
+    walkBlocks(byPort.get(seg.port), blockSize, (subs) => {
+      const d = drawBlock(subs, perBlock, rng, exclude);
+      if (d.repeated) exhausted++;
+      return d.addrs.every((a) => add(a, seg.port));
+    });
+  }
+  return { addrs, exhausted, truncated };
+}
+
 /**
  * targetSpace({ space, ports, snis, defaultAddr, defaultPort }) → { size, addresses, at(i) → { addr, port, sni, key } }
  *
@@ -789,7 +943,8 @@ function targetSpace(opts = {}) {
  * The address box read the way the page's pick says:
  *  - `all`: every address (addressSpace) — `taken` = `total`;
  *  - `sample`: `count` random from all of them together (sampleSpace);
- *  - `random`: `perRange` from each range, as drawTargets has always drawn.
+ *  - `random`: `perRange` from each range, as drawTargets has always drawn;
+ *  - `block`: `perBlock` from every /`block` of the ranges (drawBlocks).
  * `total` is how many addresses the box names (IPv6 blocks counted as their
  * sample), `taken` how many the run tests.
  */
@@ -803,6 +958,10 @@ function pickAddresses(text, pick = {}, opts = {}) {
   }
   if (p.mode === 'random') {
     const d = drawTargets(text, { perRange: Math.min(MAX_SAMPLE, posInt(p.perRange, DEFAULT_PER_RANGE)), max: MAX_SAMPLE, exclude: opts.exclude, rng: opts.rng });
+    return Object.assign(out, { space: listSpace(d.addrs), taken: d.addrs.length, exhausted: d.exhausted, truncated: d.truncated });
+  }
+  if (p.mode === 'block') {
+    const d = drawBlocks(text, p, opts);
     return Object.assign(out, { space: listSpace(d.addrs), taken: d.addrs.length, exhausted: d.exhausted, truncated: d.truncated });
   }
   return Object.assign(out, { space: all, taken: all.size });
@@ -831,18 +990,53 @@ function endpointHost(ep) {
   return i === -1 || e.indexOf(':') !== i ? e : e.slice(0, i);
 }
 
+/** A CDN's own host names, as a config may carry them in its address, SNI or Host. */
+const CDN_HOST_NAMES = [
+  [/(^|\.)(fastly\.net|fastlylb\.net)$/i, 'fastly'],
+  [/(^|\.)cloudfront\.net$/i, 'cloudfront'],
+  [/(^|\.)(gcdn\.co|gcorelabs\.com|edgecdn\.ru)$/i, 'gcore']
+];
+
+/** The lists a config's address may fall in, other than Cloudflare's. */
+const CDN_LIST_IDS = ['fastly', 'cloudfront', 'cloudfront-regional', 'gcore'];
+
+/** The names a stream config says it reaches: its address, SNI and Host. */
+function namesOf(addr, st) {
+  const of = (o) => (isObj(o) ? o : {});
+  const ws = of(st.wsSettings);
+  return [
+    addr, of(st.tlsSettings).serverName, ws.host, of(ws.headers).Host, of(ws.headers).host,
+    of(st.xhttpSettings).host, of(st.splithttpSettings).host, of(st.httpupgradeSettings).host, of(st.grpcSettings).authority
+  ].filter((n) => typeof n === 'string' && n);
+}
+
+/** Which CDN other than Cloudflare a config is on, by those names or by its address being in one's list; null when none says so. */
+function otherCdnOf(addr, st, lists) {
+  for (const name of namesOf(addr, st)) {
+    for (const [re, id] of CDN_HOST_NAMES) if (re.test(name.trim())) return id;
+  }
+  if (!addr || ip4ToInt(addr) === null) return null;
+  for (const id of CDN_LIST_IDS) {
+    const own = lists[id] && Array.isArray(lists[id].ranges) ? lists[id].ranges : [];
+    if (inRanges4(addr, own.filter((c) => !c.includes(':')))) return id;
+  }
+  return null;
+}
+
 /** The transports a CDN in front of the server carries. */
 const CDN_NETWORKS = new Set(['ws', 'xhttp', 'splithttp', 'httpupgrade', 'grpc']);
 const STREAM_PROTOCOLS = new Set(['vless', 'vmess', 'trojan', 'shadowsocks']);
 
 /**
- * suggestPreset(server) → 'warp-masque' | 'warp-wg' | 'cf' | null: the preset
- * that fits a config. MASQUE with a WARP account, or dialling 162.159.198.0/24
- * → WARP MASQUE; WireGuard to engage.cloudflareclient.com or inside the WARP
- * ranges → WARP WireGuard; a ws / xhttp / httpupgrade / gRPC config over TLS
- * or plain (what a CDN carries; never REALITY) → Cloudflare.
+ * suggestPreset(server, lists) → 'warp-masque' | 'warp-wg' | 'cf' | 'fastly' |
+ * 'cloudfront' | 'cloudfront-regional' | 'gcore' | null: the preset that fits a config. MASQUE with a
+ * WARP account, or dialling 162.159.198.0/24 → WARP MASQUE; WireGuard to
+ * engage.cloudflareclient.com or inside the WARP ranges → WARP WireGuard; a ws /
+ * xhttp / httpupgrade / gRPC config over TLS or plain (what a CDN carries; never
+ * REALITY) → the CDN its names or address belong to, Cloudflare when none says.
+ * `lists` is the presets as they stand now (updated lists); PRESETS without it.
  */
-function suggestPreset(server) {
+function suggestPreset(server, lists = PRESETS) {
   const ob = server && server.outbound;
   if (!isObj(ob)) return null;
   const set = isObj(ob.settings) ? ob.settings : {};
@@ -861,13 +1055,16 @@ function suggestPreset(server) {
   if (STREAM_PROTOCOLS.has(ob.protocol)) {
     const sec = String(st.security || 'none').toLowerCase();
     const net = String(st.network || 'tcp').toLowerCase();
-    if ((sec === 'tls' || sec === 'none') && CDN_NETWORKS.has(net)) return 'cf';
+    if ((sec === 'tls' || sec === 'none') && CDN_NETWORKS.has(net)) {
+      const peer = (Array.isArray(set.vnext) && isObj(set.vnext[0]) && set.vnext[0]) || (Array.isArray(set.servers) && isObj(set.servers[0]) && set.servers[0]) || set;
+      return otherCdnOf(normalizeAddr(peer.address || server.address), st, lists) || 'cf';
+    }
   }
   return null;
 }
 
 module.exports = {
   parseTargetText, normalizeAddr, addrPort, expandTargets, drawTargets, parsePorts, parseSnis, buildTargets,
-  addressSpace, sampleSpace, listSpace, targetSpace, pickAddresses, MAX_SAMPLE,
-  PRESETS, suggestPreset, CF_IPV4_RANGES, ip4ToInt, intToIp4
+  addressSpace, sampleSpace, listSpace, targetSpace, pickAddresses, drawBlocks, countPerBlock, MAX_SAMPLE, BLOCK_PREFIXES,
+  PRESETS, suggestPreset, CF_IPV4_RANGES, CDN_SHIPPED_AT, ip4ToInt, intToIp4
 };

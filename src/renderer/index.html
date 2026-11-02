@@ -117,10 +117,18 @@
                 <div class="row-gap scan-presets" id="scanAddrPresets">
                   <button type="button" class="btn ghost small" data-preset="suggest" id="btnScanSuggest" data-i18n="scan.p.suggest">پیشنهادی</button>
                   <button type="button" class="btn ghost small" data-preset="cf" data-i18n="scan.p.cf">کلودفلر</button>
+                  <button type="button" class="btn ghost small" data-preset="fastly" data-i18n="scan.p.fastly">Fastly</button>
+                  <button type="button" class="btn ghost small" data-preset="cloudfront" data-i18n="scan.p.cloudfront">CloudFront</button>
+                  <button type="button" class="btn ghost small" data-preset="cloudfront-regional" data-i18n="scan.p.cloudfrontRegional" data-i18n-title="scan.p.cloudfrontRegionalHint">CloudFront منطقه‌ای</button>
+                  <button type="button" class="btn ghost small" data-preset="gcore" data-i18n="scan.p.gcore">Gcore</button>
                   <button type="button" class="btn ghost small" data-preset="warp-masque" data-i18n="scan.p.warpMasque">WARP MASQUE</button>
                   <button type="button" class="btn ghost small" data-preset="warp-wg" data-i18n="scan.p.warpWg">WARP وایرگارد</button>
                   <button type="button" class="btn ghost small" id="btnScanFile" data-i18n="scan.file">از فایل</button>
                   <input type="file" id="scanFile" accept=".txt,.csv,.log,text/plain" class="vis-hidden" tabindex="-1" aria-hidden="true" />
+                </div>
+                <div class="row-gap scan-cdn">
+                  <button type="button" class="btn ghost small" id="btnScanCdnUpdate" data-i18n="scan.cdn.update" data-i18n-title="scan.cdn.updateHint">به‌روزرسانی لیست‌ها</button>
+                  <span class="scan-cdn-status" id="scanCdnStatus"></span>
                 </div>
                 <textarea id="scanIps" class="textarea scan-ips" rows="5" dir="ltr" spellcheck="false" data-i18n-ph="scan.ipsPh"></textarea>
                 <div class="row-gap scan-ip-actions">
@@ -128,6 +136,7 @@
                     <button type="button" class="seg-btn active" data-pick="all" data-i18n="scan.pick.all">همهٔ آدرس‌ها</button>
                     <button type="button" class="seg-btn" data-pick="sample" data-i18n="scan.pick.sample">N تصادفی از همه</button>
                     <button type="button" class="seg-btn" data-pick="random" data-i18n="scan.pick.random">N از هر رنج</button>
+                    <button type="button" class="seg-btn" data-pick="block" data-i18n="scan.pick.block" data-i18n-title="scan.pick.blockHint">N از هر بلوک</button>
                   </div>
                   <span class="scan-count" id="scanCount"></span>
                 </div>
@@ -135,6 +144,21 @@
                   <label class="field-label scan-inline-label" for="scanPickN" id="scanPickNLabel" data-i18n="scan.pickN">تعداد</label>
                   <input type="number" id="scanPickN" class="input scan-num" dir="ltr" min="1" max="1000000" value="1000" data-i18n-title="scan.pickNHint" />
                   <input type="number" id="scanPerRange" class="input scan-num" dir="ltr" min="1" max="1000000" value="20" data-i18n-title="scan.perRangeHint" />
+                  <input type="number" id="scanPerBlock" class="input scan-num" dir="ltr" min="1" max="65536" value="5" data-i18n-title="scan.pick.blockHint" />
+                  <span class="row-gap scan-block-size" id="scanBlockWrap">
+                    <label class="field-label scan-inline-label" for="scanBlock" data-i18n="scan.blockSize">اندازهٔ بلوک</label>
+                    <select id="scanBlock" class="select scan-block-pick" dir="ltr">
+                      <option value="16">65,536 (/16)</option>
+                      <option value="20">4,096 (/20)</option>
+                      <option value="22">1,024 (/22)</option>
+                      <option value="23">512 (/23)</option>
+                      <option value="24" selected>256 (/24)</option>
+                      <option value="25">128 (/25)</option>
+                      <option value="26">64 (/26)</option>
+                      <option value="27">32 (/27)</option>
+                      <option value="28">16 (/28)</option>
+                    </select>
+                  </span>
                   <label class="scan-check"><input type="checkbox" id="scanFresh" checked /><span class="scan-check-label" data-i18n="scan.fresh">فقط آدرس‌های تست‌نشده</span></label>
                   <button type="button" class="btn ghost small" id="btnScanForget" data-i18n="scan.forget">فراموش کردن تاریخچه</button>
                   <span class="scan-count" id="scanTested" hidden></span>

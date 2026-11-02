@@ -10,8 +10,9 @@
  * the union of the ranges (a range weighted by its size), distinct, in address
  * order, repeatable with a seed, and skips what was tested before while it
  * can; the product address × port × SNI is a space too, in buildTargets'
- * order with its keys; and the three picks say how many the box names and how
- * many the run takes.
+ * order with its keys; the four picks say how many the box names and how many
+ * the run takes; and N from each block follows a range's size, block by block,
+ * however the box cuts the ranges.
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -127,4 +128,81 @@ test('pickAddresses: all of them, N random from all together, N from each range 
   assert.equal(bad.taken, 1);
   assert.equal(T.pickAddresses('10.0.0.0/8', { mode: 'all' }).taken, 16777216, 'no cap on all of them');
   assert.equal(T.pickAddresses('10.0.0.0/8', { mode: 'sample', count: 5e9 }).taken, T.MAX_SAMPLE, 'a sample is a list: it stops at MAX_SAMPLE');
+});
+
+/* ----------------------------- N from each block (2026-11-02) ----------------------------- */
+
+const blockOf = (ip, prefix = 24) => (T.ip4ToInt(ip) - (T.ip4ToInt(ip) % 2 ** (32 - prefix))) / 2 ** (32 - prefix);
+const perBlockCounts = (addrs, prefix) => {
+  const m = new Map();
+  for (const a of addrs) m.set(blockOf(a.addr, prefix), (m.get(blockOf(a.addr, prefix)) || 0) + 1);
+  return [...m.values()];
+};
+
+test('drawBlocks: a range gives N for every 256 addresses, so its share follows its size', () => {
+  const r = T.drawBlocks('10.0.0.0/22\n20.0.0.1/32\n30.0.0.0/30', { perBlock: 3, block: 24 }, { rng: seeded(21) });
+  const of = (prefix) => r.addrs.filter((a) => a.addr.startsWith(prefix));
+  assert.equal(of('10.').length, 12, 'a /22 is four /24s, 3 from each');
+  assert.deepEqual(perBlockCounts(of('10.'), 24), [3, 3, 3, 3]);
+  assert.deepEqual(of('20.').map((a) => a.addr), ['20.0.0.1'], 'a /32 is its one address');
+  assert.equal(of('30.').length, 3, 'a /30 is one block of four');
+  assert.equal(new Set(r.addrs.map((a) => a.addr)).size, r.addrs.length, 'distinct');
+  assert.deepEqual([r.exhausted, r.truncated], [0, false]);
+});
+
+test('drawBlocks: a block is the address grid, not the way the box wrote the ranges', () => {
+  const two = T.drawBlocks('1.1.1.1/32\n1.1.1.9/32\n1.1.2.1/32', { perBlock: 1, block: 24 }, { rng: seeded(22) }).addrs;
+  assert.equal(two.length, 2, 'two /32s of one /24 share its one place');
+  const across = T.drawBlocks('1.1.1.128-1.1.2.127', { perBlock: 2, block: 24 }, { rng: seeded(23) }).addrs;
+  assert.deepEqual(perBlockCounts(across, 24), [2, 2], '256 addresses over a /24 boundary are two blocks');
+  const twice = T.drawBlocks('1.1.1.0/25\n1.1.1.0/24', { perBlock: 3, block: 24 }, { rng: seeded(24) }).addrs;
+  assert.equal(twice.length, 3, 'written twice, it is still one block');
+});
+
+test('drawBlocks: the block size is the setting; each port has its own blocks; a seed repeats it', () => {
+  assert.deepEqual(perBlockCounts(T.drawBlocks('1.1.1.0/24', { perBlock: 2, block: 26 }, { rng: seeded(25) }).addrs, 26), [2, 2, 2, 2]);
+  assert.equal(T.drawBlocks('1.1.0.0/20', { perBlock: 7, block: 20 }, { rng: seeded(26) }).addrs.length, 7);
+  assert.equal(T.drawBlocks('1.1.1.0/24', { perBlock: 2, block: 99 }, { rng: seeded(27) }).addrs.length, 2, 'an unknown size reads as /24');
+  const ports = T.drawBlocks('1.1.1.0/24:443\n1.1.1.0/24:2053', { perBlock: 2, block: 24 }, { rng: seeded(28) }).addrs;
+  assert.deepEqual(ports.map((a) => a.port), [443, 443, 2053, 2053]);
+  const once = T.drawBlocks('1.1.0.0/22', { perBlock: 4, block: 24 }, { rng: seeded(29) });
+  assert.deepEqual(T.drawBlocks('1.1.0.0/22', { perBlock: 4, block: 24 }, { rng: seeded(29) }), once);
+  assert.notDeepEqual(T.drawBlocks('1.1.0.0/22', { perBlock: 4, block: 24 }, { rng: seeded(30) }), once);
+});
+
+test('drawBlocks: what was tested is passed over while the block has others; then it repeats and says so', () => {
+  const exclude = new Set(['1.1.1.0', '1.1.1.1', '1.1.1.2']);
+  const fresh = T.drawBlocks('1.1.1.0/30', { perBlock: 1, block: 24 }, { rng: seeded(31), exclude });
+  assert.deepEqual([fresh.addrs.map((a) => a.addr), fresh.exhausted], [['1.1.1.3'], 0]);
+  const more = T.drawBlocks('1.1.1.0/30', { perBlock: 2, block: 24 }, { rng: seeded(32), exclude });
+  assert.equal(more.addrs.length, 2);
+  assert.ok(more.addrs.some((a) => a.addr === '1.1.1.3'));
+  assert.equal(more.exhausted, 1);
+});
+
+test('drawBlocks: an IPv6 block gives N of itself, a host name itself; countPerBlock says the same number without drawing', () => {
+  const text = '2606:4700::/32\n2606:4700::1/128\nhost.example:2087\n10.0.0.0/23\n10.0.1.5/32:443';
+  const r = T.drawBlocks(text, { perBlock: 4, block: 24 }, { rng: seeded(33) });
+  assert.equal(r.addrs.filter((a) => a.addr.includes(':')).length, 5, '4 of the /32, the /128 is its one address');
+  assert.equal(r.addrs.filter((a) => a.addr === 'host.example').length, 1);
+  assert.equal(r.addrs.filter((a) => a.addr.startsWith('10.') && a.port === null).length, 8);
+  assert.equal(r.addrs.filter((a) => a.port === 443).length, 1);
+  assert.equal(T.countPerBlock(text, { perBlock: 4, block: 24 }), r.addrs.length);
+  assert.equal(T.drawBlocks('2606:4700::/32', { perBlock: 5000, block: 24 }, { rng: seeded(34) }).addrs.length, 100, 'IPv6 stays at most its usual sample');
+});
+
+test('countPerBlock: a /8 is arithmetic on its blocks, stopped at the sample limit', () => {
+  assert.equal(T.countPerBlock('10.0.0.0/8', { perBlock: 1, block: 24 }), 65536);
+  assert.equal(T.countPerBlock('10.0.0.0/8', { perBlock: 5, block: 16 }), 256 * 5);
+  assert.equal(T.countPerBlock('10.0.0.0/8', { perBlock: 100, block: 24 }), T.MAX_SAMPLE);
+  const big = T.drawBlocks('10.0.0.0/8', { perBlock: 1, block: 24 }, { rng: seeded(35) });
+  assert.equal(big.addrs.length, 65536);
+  assert.deepEqual(perBlockCounts(big.addrs.slice(0, 500), 24).every((n) => n === 1), true);
+});
+
+test('pickAddresses: pick block reads the box and says what it takes', () => {
+  const p = T.pickAddresses('10.0.0.0/22\n20.0.0.1/32', { mode: 'block', perBlock: 2, block: 24 }, { rng: seeded(36) });
+  assert.deepEqual([p.total, p.taken, p.ranges, p.exhausted, p.truncated], [1025, 9, 2, 0, false]);
+  assert.equal(p.space.size, 9);
+  assert.equal(new Set(Array.from({ length: 9 }, (_, i) => p.space.at(i).addr)).size, 9);
 });
