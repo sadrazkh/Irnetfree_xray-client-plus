@@ -17,7 +17,9 @@
  */
 const http = require('http');
 const https = require('https');
+const tls = require('tls');
 const T = require('./targets');
+const { socksConnect } = require('./upstream');
 
 const STORE_KEY = 'scanCdnRanges';
 const IDLE_MS = 20000;
@@ -88,13 +90,24 @@ function cleanRanges(items) {
  * The reason is settled before the request is destroyed, and destroyed without
  * an error: req.destroy(err) on a response whose last bytes are being read gives
  * the error to a socket no request holds any more, which ends the process.
+ * `via`: through a SOCKS5 port (upstream.js) instead of a plain connect.
  */
-function fetchText(url, { idleMs = IDLE_MS, maxBytes = MAX_BYTES } = {}) {
+function fetchText(url, { idleMs = IDLE_MS, maxBytes = MAX_BYTES, via = null } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const mod = u.protocol === 'https:' ? https : (u.protocol === 'http:' && u.hostname === '127.0.0.1' ? http : null);
     if (!mod) return reject(new Error('https only'));
-    const req = mod.get(u, { headers: { 'User-Agent': 'IRNetFree-Plus', Accept: '*/*' } }, (res) => {
+    const opts = { headers: { 'User-Agent': 'IRNetFree-Plus', Accept: '*/*' } };
+    if (via) {
+      opts.createConnection = (o, done) => {
+        socksConnect(via, u.hostname, Number(u.port) || (mod === https ? 443 : 80), idleMs).then((sock) => {
+          if (mod === https) { done(null, tls.connect({ socket: sock, servername: u.hostname, ALPNProtocols: ['http/1.1'] })); return; }
+          sock.resume();
+          done(null, sock);
+        }, done);
+      };
+    }
+    const req = mod.get(u, opts, (res) => {
       const code = res.statusCode || 0;
       if (code !== 200) { res.resume(); return reject(new Error(`HTTP ${code}`)); }
       const chunks = [];

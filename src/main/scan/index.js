@@ -9,7 +9,7 @@
  *
  * Channels: scan:start, scan:retest, scan:stop, scan:presets, scan:suggest,
  * scan:plan, scan:apply, scan:links, scan:copy, scan:export, scan:forget,
- * scan:sets, scan:cdnUpdate. Event: scan-progress { runId, stage, done, total, alive,
+ * scan:sets, scan:cdnUpdate, scan:pathCheck. Event: scan-progress { runId, stage, done, total, alive,
  * speedDone, speedTotal, etaMs, reasons, result } per result, the same
  * without a result when the stage changes, then { ..., finished: true,
  * cancelled } (plus `error` when the run itself failed). One run at a time.
@@ -41,6 +41,7 @@ const { xrayEngines, engineLabel } = require('../engines');
 const T = require('./targets');
 const V = require('./variants');
 const C = require('./cdnRanges');
+const U = require('./upstream');
 const { readExpect } = require('./probes');
 const { applyTarget, dialOf, transportOf, sniSupport } = require('./substitute');
 const { fetchEchConfig: defaultFetchEch } = require('./ech');
@@ -222,6 +223,7 @@ function createScan(ctx, deps = {}) {
   const runScan = deps.runScan || defaultRunScan;
   const runSpeed = deps.runSpeed || defaultRunSpeed;
   const fetchEch = deps.fetchEchConfig || defaultFetchEch;
+  const checkPath = deps.checkPath || U.checkPath;
   let cdnStored = null;     // the store's updated lists, read once
   let cdnUpdating = null;   // the update under way: a second click joins it
   let run = null;                    // { runId, token, promise } while a scan is in flight
@@ -588,21 +590,31 @@ function createScan(ctx, deps = {}) {
     if (!measures) return { error: 'no tests' };
     const opts = sanitizeOpts(req.opts);
 
+    // the way out, and whether it tells the truth (upstream.js): asked beside the cores, not after them
+    const up = U.upstreamOf(req.upstream);
+    if (up && up.error) return { error: up.error };
+    if (up && transport === 'udp') return { error: 'proxy-udp' };
+    const pathAnswer = checkPath(up);
+
     const prep = await prepare(req);
     if (prep.error) return prep;
     if (run) return { error: 'busy' };   // another start won while this one asked DNS
+    const path = await pathAnswer;
+    if (/^proxy-/.test(path.state)) return { error: path.state, path };
+    if (run) return { error: 'busy' };   // …or while this one asked the way out
 
     const s = await shape(req, prep.server, { draw: true, engines: prep.engines });
     if (s.error) return Object.assign({ error: s.error, skipped: prep.skipped }, s.variants ? { variants: s.variants } : {}, s.max ? { max: s.max, total: s.variants && s.variants.total } : {});
     // the TLS pre-check only where a plain handshake says something: TLS, no ECH, no anti-DPI trick anywhere
     const trick = (v, id, none) => !!v.raw[id] && v.raw[id] !== none;
     const variantTricks = !!(s.variants && s.variants.list.some((v) => trick(v, 'fragment', 'off') || trick(v, 'finalMask', 'none') || trick(v, 'dialMode', 'none')));
-    const tlsCheck = opts.prefilterTls && sniSupport(server).ok && !hasDpiTricks(server) && !variantTricks;
+    // through a port: always, it is the only pre-check that says anything; no trick of the config's reaches the line there anyway
+    const tlsCheck = up ? sniSupport(server).ok : (opts.prefilterTls && sniSupport(server).ok && !hasDpiTricks(server) && !variantTricks);
 
     const remembered = {
       serverId: req.serverId || null, link: req.serverId ? null : (req.link || null),
       ipsText: String(req.ipsText || ''), portsText: String(req.portsText || ''), snisText: String(req.snisText || ''),
-      pick: s.pick, engines: prep.engines, tests, opts, variants: storableSpec(req.variants)
+      pick: s.pick, engines: prep.engines, tests, opts, variants: storableSpec(req.variants), upstream: U.sanitizeUpstream(req.upstream)
     };
     try { ctx.store.setLazy(STORE_KEY, remembered); } catch { /* the run matters more than the memory of it */ }
 
@@ -613,7 +625,7 @@ function createScan(ctx, deps = {}) {
     const { runId, label } = launch({
       server: prep.server, total, stage: 'filter', token, streamAll, variants: !!(s.variants && s.variants.count),
       start: (hooks) => runScan(Object.assign({
-        server: prep.server, targets: s.items, total, engines: prep.engines, tests, transport, sni: dial.sni, keepRows: streamAll,
+        server: prep.server, targets: s.items, total, engines: prep.engines, tests, transport, sni: dial.sni, keepRows: streamAll, upstream: up,
         opts: Object.assign({}, opts, { prefilterTls: tlsCheck, probes: deps.probes, getFreePorts: deps.getFreePorts, waitReady: deps.waitReady }),
         xray: ctx.xray, token
       }, hooks))
@@ -622,7 +634,8 @@ function createScan(ctx, deps = {}) {
     const how = !a.total ? '' : ` — ${a.taken} of ${a.total} address(es)` + (s.pick.mode === 'sample' ? ', a random sample of all the ranges together' : (s.pick.mode === 'random' ? `, ${s.pick.perRange} from each of ${a.ranges} range(s)` : (s.pick.mode === 'block' ? `, ${s.pick.perBlock} from every /${s.pick.block}` : ''))) +
       (s.pick.mode !== 'all' && s.pick.fresh ? `, ${testedSet().size} tested before skipped` : '') + (a.exhausted ? `, ${a.exhausted} range(s) had to repeat` : '');
     const vs = s.variants && s.variants.count ? ` × ${s.variants.count} variant(s)${s.variants.sampled ? ` (${s.variants.tests} of ${s.variants.count * s.targets.size} tests, an even sample)` : ''}` : '';
-    ctx.log(`Scan ${runId}: ${s.targets.size} target(s)${vs} × ${prep.engines.join(', ')} through "${label}"${how}${tlsCheck ? '; TLS pre-check' : ''}`, 'info');
+    ctx.log(`Scan ${runId}: ${s.targets.size} target(s)${vs} × ${prep.engines.join(', ')} through "${label}"${how}${tlsCheck ? '; TLS pre-check' : ''}${up ? `; through ${up.host}:${up.port}` : ''}`, 'info');
+    if (path.state === 'lying') ctx.log(up ? 'Scan: this port answers for an address that cannot exist: it goes through a VPN or a sniffing proxy, and the results will not be real' : 'Scan: something on this machine answers for an address that cannot exist (a VPN in TUN mode?): the results will not be real', 'warn');
     for (const x of prep.skipped) ctx.log('Scan: ' + x.reason, 'warn');
     for (const x of (s.variants && s.variants.skipped) || []) ctx.log(`Scan: variant ${x.label} left out — ${x.reason}`, 'warn');
     return {
@@ -631,7 +644,8 @@ function createScan(ctx, deps = {}) {
       pick: s.pick, ranges: a.ranges || 0, exhausted: a.exhausted || 0,
       addresses: a.total ? { total: a.total, taken: a.taken } : null,
       streamAll, transport, ech: prep.ech, skipped: prep.skipped, engines: prep.engines,
-      variants: s.variants, prefilter: tests.tcp && transport === 'tcp' ? (tlsCheck ? 'tls' : 'tcp') : ''
+      variants: s.variants, prefilter: tests.tcp && transport === 'tcp' && (tlsCheck || !up) ? (tlsCheck ? 'tls' : 'tcp') : '',
+      path, proxyTricks: !!up && (hasDpiTricks(server) || variantTricks)
     };
   }
 
@@ -670,12 +684,15 @@ function createScan(ctx, deps = {}) {
     const tests = { tcp: false, delay: false, down: !!t.down, up: !!t.up };
     if (!tests.down && !tests.up) return { error: 'no tests' };
     const opts = sanitizeOpts(req.opts);
+    const up = U.upstreamOf(req.upstream);
+    if (up && up.error) return { error: up.error };
+    if (up && transportOf(prep.server) === 'udp') return { error: 'proxy-udp' };
 
     const token = { cancelled: false };
     const { runId, label } = launch({
       server: prep.server, total: rows.length, stage: 'speed', token,
       start: (hooks) => runSpeed(Object.assign({
-        server: prep.server, rows, tests,
+        server: prep.server, rows, tests, upstream: up,
         opts: Object.assign({}, opts, { probes: deps.probes, getFreePorts: deps.getFreePorts, waitReady: deps.waitReady }),
         xray: ctx.xray, token
       }, hooks))
@@ -697,15 +714,18 @@ function createScan(ctx, deps = {}) {
   }
 
   /**
-   * scan:cdnUpdate { ids? } → { results, ranges }: every CDN's list (or `ids`'),
-   * asked from the CDN itself. `results` is one row per CDN (cdnRanges.updateLists);
-   * `ranges` is every list as it now stands. A list that failed stays as it was.
+   * scan:cdnUpdate { ids?, upstream? } → { results, ranges }: every CDN's list (or
+   * `ids`'), asked from the CDN itself, through the scan's port when it has one.
+   * `results` is one row per CDN (cdnRanges.updateLists); `ranges` is every list as
+   * it now stands. A list that failed stays as it was.
    */
   function cdnUpdate(raw) {
     if (cdnUpdating) return cdnUpdating;
     const ids = raw && Array.isArray(raw.ids) ? raw.ids : null;
+    const up = U.upstreamOf(raw && raw.upstream);
+    if (up && up.error) return { error: up.error };
     cdnUpdating = (async () => {
-      const u = await C.updateLists(ids, cdnLists(), { get: deps.fetchText });
+      const u = await C.updateLists(ids, cdnLists(), { get: deps.fetchText || (up ? (url) => C.fetchText(url, { via: up }) : undefined) });
       cdnStored = u.stored;
       try { ctx.store.set(C.STORE_KEY, u.stored); } catch (e) { ctx.log('Scan: the updated lists were not saved: ' + ((e && e.message) || e), 'warn'); }
       for (const r of u.results) {
@@ -715,6 +735,13 @@ function createScan(ctx, deps = {}) {
       return { results: u.results, ranges: C.presetsOf(u.stored) };
     })().finally(() => { cdnUpdating = null; });
     return cdnUpdating;
+  }
+
+  /** scan:pathCheck { upstream? } → { via, state, error? }: is the way out honest? (upstream.js) */
+  async function pathCheck(raw) {
+    const up = U.upstreamOf(raw && raw.upstream);
+    if (up && up.error) return { via: 'proxy', state: 'proxy-addr' };
+    return checkPath(up);
   }
 
   function presets() {
@@ -862,7 +889,8 @@ function createScan(ctx, deps = {}) {
     'scan:export': exportText,
     'scan:forget': forget,
     'scan:sets': sets,
-    'scan:cdnUpdate': cdnUpdate
+    'scan:cdnUpdate': cdnUpdate,
+    'scan:pathCheck': pathCheck
   };
 
   return {
