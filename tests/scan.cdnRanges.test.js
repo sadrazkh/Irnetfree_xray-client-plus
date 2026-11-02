@@ -17,7 +17,7 @@ const FASTLY = JSON.stringify({ addresses: ['23.235.32.0/20', '43.249.72.0/22', 
 const GCORE = JSON.stringify({ addresses: ['92.223.40.5/32', '95.85.69.4/32', '80.93.215.5/32', '5.188.126.8/32'], addresses_v6: ['2a01:68c0:0:1:ffff::22/128', '2a03:90c0:4c1:2801::4/128'] });
 const CF_GLOBAL = JSON.stringify({
   CLOUDFRONT_GLOBAL_IP_LIST: ['18.160.0.0/15', '54.192.0.0/16', '204.246.168.0/22', '205.251.249.0/24', '120.52.22.96/27'],
-  CLOUDFRONT_REGIONAL_EDGE_IP_LIST: ['13.113.196.64/26']
+  CLOUDFRONT_REGIONAL_EDGE_IP_LIST: ['13.113.196.64/26', '13.124.199.0/24', '18.199.68.0/22', '52.56.127.0/25', '54.233.255.128/26']
 });
 const AWS = JSON.stringify({
   prefixes: [{ ip_prefix: '13.113.196.64/26', service: 'CLOUDFRONT' }, { ip_prefix: '3.5.140.0/22', service: 'AMAZON' }],
@@ -47,9 +47,11 @@ test('fetchList reads each CDN as its own list really looks', async () => {
   assert.deepEqual(await C.fetchList('gcore', { get }), ['92.223.40.5/32', '95.85.69.4/32', '80.93.215.5/32', '5.188.126.8/32', '2a01:68c0:0:1:ffff::22/128', '2a03:90c0:4c1:2801::4/128']);
 });
 
-test('CloudFront: the edges a viewer dials, not the regional caches, and only CloudFront\'s IPv6', async () => {
+test('CloudFront: the edges and the regional caches apart, and only CloudFront\'s IPv6', async () => {
   const got = await C.fetchList('cloudfront', { get: answering() });
   assert.deepEqual(got, ['18.160.0.0/15', '54.192.0.0/16', '204.246.168.0/22', '205.251.249.0/24', '120.52.22.96/27', '2600:9000:3000::/36']);
+  const regional = await C.fetchList('cloudfront-regional', { get: answering() });
+  assert.deepEqual(regional, ['13.113.196.64/26', '13.124.199.0/24', '18.199.68.0/22', '52.56.127.0/25', '54.233.255.128/26']);
 });
 
 test('fetchList refuses what is not the list', async () => {
@@ -70,7 +72,7 @@ test('updateLists: what arrives replaces the list with the difference counted; w
   const stored = { fastly: { ranges: ['151.101.0.0/16', '1.2.3.0/24'], updatedAt: 5 }, gcore: { ranges: ['9.9.9.9/32'], updatedAt: 7 } };
   const u = await C.updateLists(null, stored, { get: answering({ 'https://api.gcore.com/cdn/public-ip-list': new Error('no answer in time') }), now: 1000 });
   const row = (id) => u.results.find((r) => r.id === id);
-  assert.deepEqual(u.results.map((r) => r.id), ['cf', 'fastly', 'cloudfront', 'gcore']);
+  assert.deepEqual(u.results.map((r) => r.id), ['cf', 'fastly', 'cloudfront', 'cloudfront-regional', 'gcore']);
   assert.deepEqual(row('fastly'), { id: 'fastly', name: 'Fastly', ok: true, count: 6, added: 5, removed: 1 });
   assert.deepEqual(row('gcore'), { id: 'gcore', name: 'Gcore', ok: false, error: 'no answer in time' });
   assert.equal(u.stored.fastly.updatedAt, 1000);
@@ -87,7 +89,7 @@ test('readStored keeps what still reads; presetsOf falls back to what shipped', 
   const p = C.presetsOf({ fastly: good });
   assert.deepEqual(p.fastly, good);
   assert.deepEqual(p.gcore, { ranges: T.PRESETS.gcore.ranges, updatedAt: T.CDN_SHIPPED_AT });
-  assert.deepEqual(Object.keys(p), ['cf', 'fastly', 'cloudfront', 'gcore']);
+  assert.deepEqual(Object.keys(p), ['cf', 'fastly', 'cloudfront', 'cloudfront-regional', 'gcore']);
 });
 
 test('the lists the app ships are all readable, dated, and big enough to be the real thing', () => {
@@ -97,7 +99,8 @@ test('the lists the app ships are all readable, dated, and big enough to be the 
     assert.ok(list.length >= 20, `${id}: ${list.length}`);
     assert.deepEqual(C.cleanRanges(list), list, `${id}: every entry reads, once`);
     assert.deepEqual(T.parseTargetText(list.join('\n')).errors, []);
-    assert.ok(list.some((r) => r.includes(':')) && list.some((r) => !r.includes(':')), `${id}: both IPv4 and IPv6`);
+    assert.ok(list.some((r) => !r.includes(':')), `${id}: IPv4`);
+    if (id !== 'cloudfront-regional') assert.ok(list.some((r) => r.includes(':')), `${id}: IPv6`);
   }
 });
 

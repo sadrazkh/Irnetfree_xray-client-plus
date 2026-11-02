@@ -564,7 +564,7 @@ test('scan:presets — the Cloudflare ranges, the exact defaults, the three pres
   assert.deepEqual(p.dimensions.map((d) => d.id), ['fingerprint', 'alpn', 'cipherSuites', 'fragment', 'finalMask', 'dialMode', 'mux', 'xhttpMode']);
   assert.deepEqual([p.limits.variants, p.limits.sampleMax, p.limits.pick], [300, 1000000, { mode: 'all', perRange: 20, count: 1000, perBlock: 5, block: 24, fresh: true }]);
   assert.deepEqual(p.sets, []);
-  assert.deepEqual(Object.keys(p.ranges).sort(), ['cf', 'cf-plain-ports', 'cf-tls-ports', 'cloudfront', 'fastly', 'gcore', 'warp-masque', 'warp-wg']);
+  assert.deepEqual(Object.keys(p.ranges).sort(), ['cf', 'cf-plain-ports', 'cf-tls-ports', 'cloudfront', 'cloudfront-regional', 'fastly', 'gcore', 'warp-masque', 'warp-wg']);
 });
 
 test('scan:start refuses what it cannot run, with the agreed reasons', async () => {

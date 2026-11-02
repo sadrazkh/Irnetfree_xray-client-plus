@@ -7,11 +7,13 @@
  * kept in the store over the shipped one. A list that fails leaves what was
  * there, with the reason. Only addresses: nothing here picks a host or an SNI.
  *
- * Amazon's two lists are each half of what a scan wants. ip-ranges.json's
- * CLOUDFRONT service also holds the regional edge caches, which sit between the
- * edges and the origin and are not what a viewer dials (98 of its 216 IPv4
- * prefixes on 2026-11-02), so IPv4 comes from list-cloudfront-ips' global list.
- * That list has no IPv6, so IPv6 comes from ip-ranges.json.
+ * Amazon's lists: ip-ranges.json's CLOUDFRONT service mixes the edges with the
+ * regional edge caches, so IPv4 comes from list-cloudfront-ips, which keeps them
+ * apart, and IPv6, which it lacks, from ip-ranges.json. Measured from a clean
+ * network on 2026-11-02 with a CloudFront host, random addresses: edges 110 of
+ * 300 answered, regional caches 0 of 300, CLOUDFRONT_ORIGIN_FACING 1 of 300. The
+ * regional list stays a preset of its own because the owner wants to try it from
+ * his network; the origin-facing one is left out.
  */
 const http = require('http');
 const https = require('https');
@@ -55,6 +57,10 @@ const PROVIDERS = {
         read: (text) => fieldOf(JSON.parse(text), 'ipv6_prefixes').filter((p) => p && p.service === 'CLOUDFRONT').map((p) => p.ipv6_prefix)
       }
     ]
+  },
+  'cloudfront-regional': {
+    name: 'CloudFront regional',
+    sources: [{ url: 'https://d7uri8nf7uskq.cloudfront.net/tools/list-cloudfront-ips', read: fields('CLOUDFRONT_REGIONAL_EDGE_IP_LIST') }]
   },
   gcore: {
     name: 'Gcore',
@@ -150,17 +156,24 @@ function presetsOf(stored) {
 /**
  * updateLists(ids, stored, { get, now }) → { stored, results }: each CDN asked at
  * once. `results` is one row per CDN: { id, name, ok, count, added, removed } or
- * { id, name, ok: false, error }; a failed one keeps its place in `stored`.
+ * { id, name, ok: false, error }; a failed one keeps its place in `stored`. A
+ * URL two lists share is fetched once.
  */
 async function updateLists(ids, stored, opts = {}) {
   const wanted = CDN_IDS.filter((id) => !Array.isArray(ids) || !ids.length || ids.includes(id));
   const now = Number(opts.now) || Date.now();
   const before = presetsOf(stored);
   const next = Object.assign({}, stored);
+  const fetchOne = opts.get || fetchText;
+  const asked = new Map();
+  const get = (url) => {
+    if (!asked.has(url)) asked.set(url, fetchOne(url));
+    return asked.get(url);
+  };
   const results = await Promise.all(wanted.map(async (id) => {
     const name = PROVIDERS[id].name;
     try {
-      const ranges = await fetchList(id, opts);
+      const ranges = await fetchList(id, { get });
       const had = new Set(before[id].ranges);
       const has = new Set(ranges);
       next[id] = { ranges, updatedAt: now };

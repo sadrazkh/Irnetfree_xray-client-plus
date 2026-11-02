@@ -43,6 +43,7 @@ const PRESETS = {
   cf: { ranges: CF_IPV4_RANGES.concat(CF_IPV6_RANGES) },
   fastly: { ranges: CDN_SHIPPED.fastly },
   cloudfront: { ranges: CDN_SHIPPED.cloudfront },
+  'cloudfront-regional': { ranges: CDN_SHIPPED['cloudfront-regional'] },
   gcore: { ranges: CDN_SHIPPED.gcore },
   'warp-masque': { ranges: ['162.159.198.0/24'] },
   'warp-wg': {
@@ -996,12 +997,15 @@ const CDN_HOST_NAMES = [
   [/(^|\.)(gcdn\.co|gcorelabs\.com|edgecdn\.ru)$/i, 'gcore']
 ];
 
+/** The lists a config's address may fall in, other than Cloudflare's. */
+const CDN_LIST_IDS = ['fastly', 'cloudfront', 'cloudfront-regional', 'gcore'];
+
 /** The names a stream config says it reaches: its address, SNI and Host. */
 function namesOf(addr, st) {
   const of = (o) => (isObj(o) ? o : {});
   const ws = of(st.wsSettings);
   return [
-    addr, of(st.tlsSettings).serverName, ws.host, of(ws.headers).Host,
+    addr, of(st.tlsSettings).serverName, ws.host, of(ws.headers).Host, of(ws.headers).host,
     of(st.xhttpSettings).host, of(st.splithttpSettings).host, of(st.httpupgradeSettings).host, of(st.grpcSettings).authority
   ].filter((n) => typeof n === 'string' && n);
 }
@@ -1012,7 +1016,7 @@ function otherCdnOf(addr, st, lists) {
     for (const [re, id] of CDN_HOST_NAMES) if (re.test(name.trim())) return id;
   }
   if (!addr || ip4ToInt(addr) === null) return null;
-  for (const [, id] of CDN_HOST_NAMES) {
+  for (const id of CDN_LIST_IDS) {
     const own = lists[id] && Array.isArray(lists[id].ranges) ? lists[id].ranges : [];
     if (inRanges4(addr, own.filter((c) => !c.includes(':')))) return id;
   }
@@ -1025,7 +1029,7 @@ const STREAM_PROTOCOLS = new Set(['vless', 'vmess', 'trojan', 'shadowsocks']);
 
 /**
  * suggestPreset(server, lists) → 'warp-masque' | 'warp-wg' | 'cf' | 'fastly' |
- * 'cloudfront' | 'gcore' | null: the preset that fits a config. MASQUE with a
+ * 'cloudfront' | 'cloudfront-regional' | 'gcore' | null: the preset that fits a config. MASQUE with a
  * WARP account, or dialling 162.159.198.0/24 → WARP MASQUE; WireGuard to
  * engage.cloudflareclient.com or inside the WARP ranges → WARP WireGuard; a ws /
  * xhttp / httpupgrade / gRPC config over TLS or plain (what a CDN carries; never

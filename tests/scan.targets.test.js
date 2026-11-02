@@ -475,6 +475,7 @@ test('suggestPreset: the CDN a ws config names or dials; Cloudflare when nothing
   assert.equal(suggestPreset(ws('example.com')), 'cf');
   assert.equal(suggestPreset(ws('example.com', { wsSettings: { host: 'me.global.ssl.fastly.net' } })), 'fastly', 'a decoy SNI and a Fastly Host');
   assert.equal(suggestPreset(ws('example.com', { wsSettings: { headers: { Host: 'ME.FASTLY.NET' } } })), 'fastly');
+  assert.equal(suggestPreset(ws('example.com', { wsSettings: { headers: { host: 'me.fastly.net' } } })), 'fastly');
   assert.equal(suggestPreset(ws('d1.cloudfront.net')), 'cloudfront');
   assert.equal(suggestPreset(ws('example.com', { tlsSettings: { serverName: 'd1.cloudfront.net' } })), 'cloudfront');
   assert.equal(suggestPreset(ws('cl-1.gcdn.co')), 'gcore');
@@ -482,8 +483,9 @@ test('suggestPreset: the CDN a ws config names or dials; Cloudflare when nothing
   assert.equal(suggestPreset(ws('151.101.1.1')), 'fastly', 'an address inside Fastly\'s list');
   assert.equal(suggestPreset(ws('104.16.0.1')), 'cf');
   // the list as it stands now, not as it shipped
-  const lists = { fastly: { ranges: ['9.9.9.0/24', '2a04:4e40::/32'] }, cloudfront: { ranges: [] }, gcore: { ranges: [] } };
+  const lists = { fastly: { ranges: ['9.9.9.0/24', '2a04:4e40::/32'] }, cloudfront: { ranges: [] }, 'cloudfront-regional': { ranges: ['8.8.8.0/24'] }, gcore: { ranges: [] } };
   assert.equal(suggestPreset(ws('9.9.9.9'), lists), 'fastly');
+  assert.equal(suggestPreset(ws('8.8.8.8'), lists), 'cloudfront-regional');
   assert.equal(suggestPreset(ws('151.101.1.1'), lists), 'cf');
 });
 
