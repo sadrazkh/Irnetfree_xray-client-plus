@@ -10,11 +10,11 @@ const fs = require('fs');
 const path = require('path');
 
 const DATA = path.join(__dirname, '..', 'src', 'main', 'scan', 'cdnRanges.data.json');
-const SHIPPED = ['fastly', 'cloudfront', 'gcore'];
+const SHIPPED = ['fastly', 'cloudfront', 'cloudfront-regional', 'gcore'];
 
 async function main() {
   // the data file must exist for targets.js to load; a first run writes it empty
-  if (!fs.existsSync(DATA)) fs.writeFileSync(DATA, JSON.stringify({ fetchedAt: '', fastly: [], cloudfront: [], gcore: [] }));
+  if (!fs.existsSync(DATA)) fs.writeFileSync(DATA, JSON.stringify({ fetchedAt: '', fastly: [], cloudfront: [], 'cloudfront-regional': [], gcore: [] }));
   const C = require('../src/main/scan/cdnRanges');
   const T = require('../src/main/scan/targets');
 

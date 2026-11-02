@@ -137,7 +137,7 @@ test('the Scan page’s defaults: every input a row with a switch — the addres
   const { BLOCK_PREFIXES } = require('../src/main/scan/targets');
   assert.deepEqual([...HTML.matchAll(/<option value="(\d+)"[^>]*>[\d,]+ \(\/\d+\)</g)].map((m) => Number(m[1])), BLOCK_PREFIXES, 'the block sizes on the page are the ones main takes');
   // the CDN lists beside Cloudflare's, and the button that updates them
-  assert.deepEqual([...HTML.matchAll(/data-preset="([\w-]+)" data-i18n="scan\.p\./g)].map((m) => m[1]), ['cf', 'fastly', 'cloudfront', 'gcore', 'warp-masque', 'warp-wg']);
+  assert.deepEqual([...HTML.matchAll(/data-preset="([\w-]+)" data-i18n="scan\.p\./g)].map((m) => m[1]), ['cf', 'fastly', 'cloudfront', 'cloudfront-regional', 'gcore', 'warp-masque', 'warp-wg']);
   assert.match(HTML, /id="btnScanCdnUpdate"/);
   assert.ok(HTML.indexOf('id="scanSummary"') < HTML.indexOf('class="scan-forms"'), 'the summary sits above the forms');
   assert.match(read('plus/scan.css'), /\.scan-summary \{[^}]*position: sticky/);

@@ -73,9 +73,9 @@
   const TABLE_MAX = 3000;
   /** How long after the last change the summary asks main again. */
   const PLAN_MS = 300;
-  const PRESET_NAMES = { cf: 'scan.p.cf', fastly: 'scan.p.fastly', cloudfront: 'scan.p.cloudfront', gcore: 'scan.p.gcore', 'warp-masque': 'scan.p.warpMasque', 'warp-wg': 'scan.p.warpWg' };
+  const PRESET_NAMES = { cf: 'scan.p.cf', fastly: 'scan.p.fastly', cloudfront: 'scan.p.cloudfront', 'cloudfront-regional': 'scan.p.cloudfrontRegional', gcore: 'scan.p.gcore', 'warp-masque': 'scan.p.warpMasque', 'warp-wg': 'scan.p.warpWg' };
   /** The presets the update button refreshes, in the order of their buttons. */
-  const CDN_IDS = ['cf', 'fastly', 'cloudfront', 'gcore'];
+  const CDN_IDS = ['cf', 'fastly', 'cloudfront', 'cloudfront-regional', 'gcore'];
   /** Each dimension's name, hint and plural (for the summary), as dictionary keys. */
   const DIM_KEYS = {
     fingerprint: ['scan.dim.fingerprint', 'scan.dim.fingerprint.hint', 'scan.dim.fingerprint.many'],
