@@ -12,6 +12,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const os = require('node:os');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const { createScan, STREAM_ALL } = require('../src/main/scan/index');
 const { delayStats } = require('../src/main/scan/score');
@@ -62,7 +64,7 @@ function setup(spec = {}, servers = []) {
     resolveTarget: (id) => { const s = servers.find((x) => x.id === id); return s ? { server: s, chain: null } : { server: null, chain: null }; },
     log: (line, level) => logs.push({ line, level }), platform: process.platform, isElectron: false
   };
-  const scan = createScan(ctx, { probes, getFreePorts: async (n) => { const b = base; base += 100; return Array.from({ length: n }, (_, k) => b + k); }, waitReady: async () => true });
+  const scan = createScan(ctx, { probes, getFreePorts: async (n) => { const b = base; base += 100; return Array.from({ length: n }, (_, k) => b + k); }, waitReady: async () => true, checkPath: spec.checkPath || (async (up) => ({ via: up ? 'proxy' : 'direct', state: 'clean' })), fetchText: spec.fetchText });
   scan.register();
   const progress = () => events.filter((e) => e.ch === 'scan-progress').map((e) => e.payload);
   const finished = (n = 1) => until(() => progress().filter((p) => p.finished).length >= n, 15000, 'finished');
@@ -290,4 +292,124 @@ test('scan:suggest tells the page which dimensions this config takes and its own
   assert.equal(f.variants.fingerprint.ok, true);
   assert.equal(f.variants.fingerprint.current, 'chrome');
   assert.equal(f.variants.xhttpMode.ok, false);
+});
+
+/* ------------------------------- the way out: a port, and whether the path tells the truth ------------------------------- */
+
+const VIA = { on: true, addr: '127.0.0.1:30810' };
+
+test('scan:start through a port: every core dials through it, the pre-check is the TLS handshake, the option is remembered', async () => {
+  const s = setup({ installed: ['xray'] }, [VLESS()]);
+  const reply = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 }, upstream: VIA });
+  assert.equal(reply.error, undefined, JSON.stringify(reply));
+  assert.equal(reply.prefilter, 'tls');
+  assert.deepEqual(reply.path, { via: 'proxy', state: 'clean' });
+  await s.finished();
+  const cfg = s.cores[0].cfg;
+  assert.equal(cfg.outbounds.find((o) => o.tag === 'test-out-0').streamSettings.sockopt.dialerProxy, 'scan-upstream');
+  assert.deepEqual(cfg.outbounds.find((o) => o.tag === 'scan-upstream').settings.servers, [{ address: '127.0.0.1', port: 30810 }]);
+  assert.ok(s.log.some(([k]) => k === 'tls'));
+  assert.equal(s.log.some(([k]) => k === 'tcp'), false, 'never a plain connect past the port');
+  assert.deepEqual(s.data.scan.upstream, VIA);
+  assert.ok(s.logs.some((l) => /through 127\.0\.0\.1:30810/.test(l.line)));
+});
+
+test('scan:start through a port, a config with no TLS to shake hands with: no pre-check at all, the row says skipped', async () => {
+  const plain = Object.assign(parseLink('vless://11111111-1111-1111-1111-111111111111@a.example:80?type=ws&security=none&path=%2F#p'), { id: 'sv-plain' });
+  const s = setup({ installed: ['xray'] }, [plain]);
+  const reply = await s.handlers['scan:start']({ serverId: 'sv-plain', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 }, upstream: VIA });
+  assert.equal(reply.prefilter, '');
+  await s.finished();
+  assert.equal(s.log.some(([k]) => k === 'tcp' || k === 'tls'), false);
+  const row = s.progress().filter((p) => p.result).map((p) => p.result)[0];
+  assert.equal(row.tcp.skipped, true);
+  assert.ok(row.score > 0, 'the core\'s own answer decides');
+});
+
+test('scan:start off: not a trace of the port in the config, and the plain pre-check as before', async () => {
+  const s = setup({ installed: ['xray'] }, [VLESS()]);
+  const reply = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 }, upstream: { on: false, addr: '127.0.0.1:30810' } });
+  assert.equal(reply.prefilter, 'tcp');
+  assert.deepEqual(reply.path, { via: 'direct', state: 'clean' });
+  await s.finished();
+  assert.equal(s.cores[0].cfg.outbounds.some((o) => o.tag === 'scan-upstream'), false);
+  assert.ok(s.log.some(([k]) => k === 'tcp'));
+});
+
+test('scan:start refuses what cannot go through a port, and a port that does not work; nothing starts', async () => {
+  const hy2 = Object.assign(parseLink('hy2://secret@h.example.com:443?sni=h.example.com#hy'), { id: 'sv-hy2' });
+  const s = setup({ installed: ['xray'] }, [VLESS(), hy2]);
+  const req = { serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 } };
+  assert.deepEqual(await s.handlers['scan:start'](Object.assign({}, req, { upstream: { on: true, addr: 'junk' } })), { error: 'proxy-addr' });
+  assert.deepEqual(await s.handlers['scan:start'](Object.assign({}, req, { serverId: 'sv-hy2', upstream: VIA })), { error: 'proxy-udp' });
+  for (const state of ['proxy-down', 'proxy-bad', 'proxy-auth']) {
+    const t = setup({ installed: ['xray'], checkPath: async () => ({ via: 'proxy', state, error: 'x' }) }, [VLESS()]);
+    const r = await t.handlers['scan:start'](Object.assign({}, req, { upstream: VIA }));
+    assert.equal(r.error, state);
+    assert.equal(t.cores.length, 0);
+  }
+  assert.equal(s.cores.length, 0);
+});
+
+test('a path that lies does not stop the run, but the reply and the log say so', async () => {
+  const s = setup({ installed: ['xray'], checkPath: async () => ({ via: 'direct', state: 'lying' }) }, [VLESS()]);
+  const reply = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 } });
+  assert.equal(reply.error, undefined);
+  assert.deepEqual(reply.path, { via: 'direct', state: 'lying' });
+  assert.ok(s.logs.some((l) => l.level === 'warn' && /cannot exist/.test(l.line)));
+  await s.finished();
+});
+
+test('through a port, tricks on the packets are said not to reach the line', async () => {
+  const s = setup({ installed: ['xray', 'xray-pattn'] }, [VLESS()]);
+  const withTricks = await s.handlers['scan:start']({
+    serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 }, upstream: VIA,
+    variants: { dims: { dialMode: ['none', 'oob.0'] } }
+  });
+  assert.equal(withTricks.proxyTricks, true);
+  await s.finished();
+  const t = setup({ installed: ['xray'] }, [VLESS()]);
+  const without = await t.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 }, upstream: VIA });
+  assert.equal(without.proxyTricks, false);
+  await t.finished();
+});
+
+test('scan:pathCheck answers for the option as it reads, and a retest dials through the port too', async () => {
+  const asked = [];
+  const s = setup({ installed: ['xray'], checkPath: async (up) => { asked.push(up); return { via: up ? 'proxy' : 'direct', state: 'clean' }; } }, [VLESS()]);
+  assert.deepEqual(await s.handlers['scan:pathCheck']({}), { via: 'direct', state: 'clean' });
+  assert.deepEqual(await s.handlers['scan:pathCheck']({ upstream: VIA }), { via: 'proxy', state: 'clean' });
+  assert.deepEqual(asked, [null, { host: '127.0.0.1', port: 30810 }]);
+  assert.deepEqual(await s.handlers['scan:pathCheck']({ upstream: { on: true, addr: 'junk' } }), { via: 'proxy', state: 'proxy-addr' });
+
+  const r = await s.handlers['scan:retest']({ serverId: 'sv-vless', rows: [{ addr: '1.1.1.1', port: 443, engine: 'xray' }], tests: { down: true, up: false }, opts: { batch: 20 }, upstream: VIA });
+  assert.equal(r.error, undefined, JSON.stringify(r));
+  await s.finished();
+  assert.ok(s.cores[0].cfg.outbounds.some((o) => o.tag === 'scan-upstream'));
+  assert.deepEqual(await s.handlers['scan:retest']({ serverId: 'sv-vless', rows: [{ addr: '1.1.1.1', port: 443, engine: 'xray' }], tests: { down: true, up: false }, upstream: { on: true, addr: 'junk' } }), { error: 'proxy-addr' });
+});
+
+test('scan:cdnUpdate with an unreadable port refuses before it asks anyone', async () => {
+  let asked = 0;
+  const s = setup({ fetchText: async () => { asked++; return ''; } }, []);
+  assert.deepEqual(await s.handlers['scan:cdnUpdate']({ upstream: { on: true, addr: 'junk' } }), { error: 'proxy-addr' });
+  assert.equal(asked, 0);
+});
+
+test('two starts at once: the second is told busy, whatever the first is still waiting on', async () => {
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const s = setup({ installed: ['xray'], checkPath: async () => { await held; return { via: 'direct', state: 'clean' }; } }, [VLESS()]);
+  const req = { serverId: 'sv-vless', ipsText: '1.1.1.1', tests: FILTER, opts: { batch: 20 } };
+  const first = s.handlers['scan:start'](req);
+  assert.deepEqual(await s.handlers['scan:start'](req), { error: 'busy' });
+  release();
+  assert.equal((await first).error, undefined);
+  await s.finished();
+  assert.equal(s.cores.length, 1, 'one run');
+});
+
+test('the page sends its way out with a re-test as with a start', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'plus', 'scan.js'), 'utf8');
+  assert.match(src, /scanRetest\([^\n]*upstream: proxyReq\(\)/);
 });

@@ -58,7 +58,8 @@ const INVOKE = {
   scanExport: ['scan:export', 'one'],
   scanForget: ['scan:forget', 'none'],
   scanSets: ['scan:sets', 'one'],
-  scanCdnUpdate: ['scan:cdnUpdate', 'one']
+  scanCdnUpdate: ['scan:cdnUpdate', 'one'],
+  scanPathCheck: ['scan:pathCheck', 'one']
 };
 
 const EVENTS = {

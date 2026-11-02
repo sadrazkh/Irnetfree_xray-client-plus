@@ -23,6 +23,7 @@
  *   node scripts/probe-scan.js       (IRNF_ENGINES=xray,xray-pattn to choose)
  */
 const http = require('http');
+const net = require('net');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
@@ -168,6 +169,13 @@ async function main() {
       vres = await variantRun(PUBLIC);
     }
     if (!vres.ok) failed++;
+
+    // through a SOCKS port: real cores dial by way of it, and the port that is down stops the run
+    const ur = await upstreamRun(LOCAL);
+    if (!ur.ok && ur.tunnelUp) {
+      console.log('  through a port: the local page was not reached through the server core — repeating against public pages');
+      if (!(await upstreamRun(PUBLIC)).ok) failed++;
+    } else if (!ur.ok) failed++;
   } finally {
     try { await scan.stop(); } catch { /* none running */ }
     if (server) { try { server.cleanup(); } catch { /* gone */ } }
@@ -175,8 +183,80 @@ async function main() {
     await delay(300);
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* a core still closing */ }
   }
-  console.log(`scan probe: ${engines.length + 1 - failed} pass, ${failed} fail (one run per core, then the parameter matrix)`);
+  console.log(`scan probe: ${engines.length + 2 - failed} pass, ${failed} fail (one run per core, the parameter matrix, then through a port)`);
   return failed ? 1 : 0;
+
+  /**
+   * Through a port (upstream.js), on every core: a little SOCKS5 server here that
+   * only forwards and counts, on loopback. What must hold: the live port passes and
+   * the port saw it, so the core really dialed by way of it; the dead port does not
+   * pass, whatever the SOCKS reply said; a ws config with no TLS skips the pre-check
+   * and still passes on the core's own answer; a port that is down stops the run.
+   */
+  async function upstreamRun(targetsOpts) {
+    const seen = [];
+    const proxy = net.createServer((c) => {
+      let buf = Buffer.alloc(0), stage = 0;
+      c.on('error', () => {});
+      c.on('data', function onData(d) {
+        buf = Buffer.concat([buf, d]);
+        if (stage === 0 && buf.length >= 2 + buf[1]) { buf = buf.subarray(2 + buf[1]); c.write(Buffer.from([5, 0])); stage = 1; }
+        if (stage !== 1 || buf.length < 5) return;
+        const atyp = buf[3], hlen = atyp === 1 ? 4 : atyp === 4 ? 16 : 1 + buf[4];
+        if (buf.length < 4 + hlen + 2) return;
+        const host = atyp === 1 ? [...buf.subarray(4, 8)].join('.') : atyp === 3 ? buf.subarray(5, 4 + hlen).toString() : '::1';
+        const port = buf.readUInt16BE(4 + hlen);
+        const rest = buf.subarray(4 + hlen + 2);
+        stage = 2;
+        seen.push(port);
+        c.removeListener('data', onData);
+        c.pause();   // what the core sends next waits for the pipe, or it is lost
+        // success at once, as Xray's inbound answers; what is dead simply closes after
+        c.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+        const up = net.connect(port, host, () => { if (rest.length) up.write(rest); c.pipe(up); up.pipe(c); });
+        up.on('error', () => c.destroy());
+        up.on('close', () => c.destroy());
+        c.on('close', () => up.destroy());
+      });
+    });
+    await new Promise((r) => proxy.listen(0, '127.0.0.1', r));
+    const upstream = { on: true, addr: `127.0.0.1:${proxy.address().port}` };
+    const problems = [];
+    let tunnelUp = false;
+    const once = async (engine, startLink, livePort, wantPrefilter) => {
+      events.length = 0;
+      seen.length = 0;
+      const reply = await handlers['scan:start']({
+        link: startLink, engines: [engine], ipsText: '127.0.0.1', portsText: `${livePort}, ${pDead}`,
+        tests: { tcp: true, delay: true, down: false, up: false },
+        opts: Object.assign({ batch: 10, delaySamples: 2, tcpTimeout: 1500, delayTimeout: 6000, speedTop: 0 }, targetsOpts), upstream
+      });
+      if (reply.error) { problems.push(`${engine}: refused — ${reply.error}`); return; }
+      if (reply.prefilter !== wantPrefilter) problems.push(`${engine}: pre-check "${reply.prefilter}", not "${wantPrefilter}"`);
+      const t0 = Date.now();
+      while (!events.some(e => e.finished) && Date.now() - t0 < 60000) await delay(100);
+      const rows = new Map();
+      for (const e of events) if (e.result) rows.set(e.result.port, e.result);
+      const live = rows.get(livePort), dead = rows.get(pDead);
+      const say = (r) => (r ? `score ${r.score}, ${r.reason || 'no reason'}` : 'no row');
+      console.log(`  ${engine} through a port (${wantPrefilter || 'no pre-check'}): live ${say(live)}; dead ${say(dead)}; the port saw ${seen.length} connection(s)`);
+      if (seen.includes(livePort)) tunnelUp = true;
+      if (!live || !(live.score > 0)) problems.push(`${engine}: the live port did not pass (${say(live)})`);
+      if (!seen.includes(livePort)) problems.push(`${engine}: the port never saw the live address`);
+      if (!dead || dead.score > 0) problems.push(`${engine}: the dead port passed (${say(dead)})`);
+    };
+    for (const engine of engines) {
+      await once(engine, tlsLink, pTls, 'tls');
+      await once(engine, link, pIn, '');
+    }
+    await new Promise((r) => proxy.close(r));
+    const down = await handlers['scan:start']({ link, engines: [engines[0]], ipsText: '127.0.0.1', tests: { tcp: true, delay: true, down: false, up: false }, opts: targetsOpts, upstream });
+    if (down.error !== 'proxy-down') problems.push(`a port that is down gave "${down.error || 'a run'}", not proxy-down`);
+    const ok = !problems.length;
+    console.log(`through a port: ${ok ? 'PASS' : 'FAIL — ' + problems.join('; ')}`);
+    if (!ok) annotate('error', 'through a port: ' + problems.join('; '));
+    return { ok, tunnelUp };
+  }
 
   /**
    * The matrix on the TLS server (raw TCP + TLS, http/1.1 only, a pinned
