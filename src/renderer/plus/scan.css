@@ -38,6 +38,13 @@
 .scan-pick { margin-block-end: 0; }
 .scan-pick-opts { align-items: center; flex-wrap: wrap; margin-block-start: 8px; }
 .scan-inline-label { margin: 0; }
+.scan-block-size { align-items: center; }
+.scan-block-size[hidden] { display: none; }
+.scan-block-pick { inline-size: auto; flex: 0 0 auto; }
+/* an LTR value in an RTL page: the chevron stays on the page's end, the text clears it */
+[dir="rtl"] .scan-block-pick { padding-inline: 26px 10px; }
+.scan-cdn { align-items: center; flex-wrap: wrap; margin-block-end: 8px; }
+.scan-cdn-status { flex: 1 1 240px; min-inline-size: 0; font-size: 11px; color: var(--ink3); line-height: 1.6; }
 .scan-count {
   font-family: var(--mono);
   font-size: 11px;

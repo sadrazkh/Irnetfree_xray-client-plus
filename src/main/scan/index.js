@@ -9,7 +9,7 @@
  *
  * Channels: scan:start, scan:retest, scan:stop, scan:presets, scan:suggest,
  * scan:plan, scan:apply, scan:links, scan:copy, scan:export, scan:forget,
- * scan:sets. Event: scan-progress { runId, stage, done, total, alive,
+ * scan:sets, scan:cdnUpdate. Event: scan-progress { runId, stage, done, total, alive,
  * speedDone, speedTotal, etaMs, reasons, result } per result, the same
  * without a result when the stage changes, then { ..., finished: true,
  * cancelled } (plus `error` when the run itself failed). One run at a time.
@@ -40,6 +40,7 @@ const { isSingboxOnly } = require('../engineChoice');
 const { xrayEngines, engineLabel } = require('../engines');
 const T = require('./targets');
 const V = require('./variants');
+const C = require('./cdnRanges');
 const { readExpect } = require('./probes');
 const { applyTarget, dialOf, transportOf, sniSupport } = require('./substitute');
 const { fetchEchConfig: defaultFetchEch } = require('./ech');
@@ -57,10 +58,13 @@ const STREAM_ALL = 20000;
 const PROGRESS_MS = 250;
 /**
  * How the address box is read: `all` (every address of every range, no cap),
- * `sample` (`count` random from all the ranges together) or `random`
- * (`perRange` from each range); `fresh` skips what was tested before.
+ * `sample` (`count` random from all the ranges together), `random`
+ * (`perRange` from each range) or `block` (`perBlock` from every /`block` of
+ * the ranges, so a share follows a range's size); `fresh` skips what was tested before.
  */
-const PICK_DEFAULTS = { mode: 'all', perRange: 20, count: 1000, fresh: true };
+const PICK_DEFAULTS = { mode: 'all', perRange: 20, count: 1000, perBlock: 5, block: 24, fresh: true };
+/** A block holds at most 65536 addresses (/16). */
+const PER_BLOCK_MAX = 65536;
 /** What the page shows before the user changes anything: the balanced preset. */
 const PRESET_DEFAULTS = {
   batch: 20, filterConcurrency: 16, prefilterConcurrency: 128, coresInParallel: 2, delaySamples: 3, passRatio: 0.66,
@@ -93,9 +97,11 @@ const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 function sanitizePick(raw) {
   const p = raw && typeof raw === 'object' ? raw : {};
   return {
-    mode: p.mode === 'random' || p.mode === 'sample' ? p.mode : 'all',
+    mode: p.mode === 'random' || p.mode === 'sample' || p.mode === 'block' ? p.mode : 'all',
     perRange: num(p.perRange, PICK_DEFAULTS.perRange, 1, T.MAX_SAMPLE),
     count: num(p.count, PICK_DEFAULTS.count, 1, T.MAX_SAMPLE),
+    perBlock: num(p.perBlock, PICK_DEFAULTS.perBlock, 1, PER_BLOCK_MAX),
+    block: T.BLOCK_PREFIXES.includes(Number(p.block)) ? Number(p.block) : PICK_DEFAULTS.block,
     fresh: p.fresh === undefined ? PICK_DEFAULTS.fresh : !!p.fresh
   };
 }
@@ -216,6 +222,8 @@ function createScan(ctx, deps = {}) {
   const runScan = deps.runScan || defaultRunScan;
   const runSpeed = deps.runSpeed || defaultRunSpeed;
   const fetchEch = deps.fetchEchConfig || defaultFetchEch;
+  let cdnStored = null;     // the store's updated lists, read once
+  let cdnUpdating = null;   // the update under way: a second click joins it
   let run = null;                    // { runId, token, promise } while a scan is in flight
 
   function engineOffer() {
@@ -269,7 +277,7 @@ function createScan(ctx, deps = {}) {
       echQuery: !!echQueryOf(tls.echConfigList),
       masque: (server.outbound && server.outbound.protocol) === 'masque',
       warp: !!(ms && ms.warp),
-      preset: T.suggestPreset(server),
+      preset: T.suggestPreset(server, C.presetsOf(cdnLists())),
       unsupported: refusal(server),
       variants: V.applicability(server)
     };
@@ -381,13 +389,15 @@ function createScan(ctx, deps = {}) {
   function addressesOf(text, pick, draw) {
     if (draw) {
       const exclude = pick.fresh && pick.mode !== 'all' ? testedSet() : undefined;
-      return T.pickAddresses(text, { mode: pick.mode, count: pick.count, perRange: pick.perRange }, { exclude });
+      return T.pickAddresses(text, { mode: pick.mode, count: pick.count, perRange: pick.perRange, perBlock: pick.perBlock, block: pick.block }, { exclude });
     }
     const all = T.addressSpace(text);
     let taken = all.size;
     if (pick.mode === 'sample') taken = Math.min(pick.count, all.size, T.MAX_SAMPLE);
     else if (pick.mode === 'random') {
       taken = Math.min(T.MAX_SAMPLE, T.parseTargetText(text).ranges.reduce((s, r) => s + Math.min(pick.perRange, r.size), 0));
+    } else if (pick.mode === 'block') {
+      taken = T.countPerBlock(text, pick);
     }
     return { space: all, total: all.size, taken, ranges: all.ranges, errors: all.errors, exhausted: 0, repeated: 0 };
   }
@@ -609,7 +619,7 @@ function createScan(ctx, deps = {}) {
       }, hooks))
     });
     const a = s.addr;
-    const how = !a.total ? '' : ` — ${a.taken} of ${a.total} address(es)` + (s.pick.mode === 'sample' ? ', a random sample of all the ranges together' : (s.pick.mode === 'random' ? `, ${s.pick.perRange} from each of ${a.ranges} range(s)` : '')) +
+    const how = !a.total ? '' : ` — ${a.taken} of ${a.total} address(es)` + (s.pick.mode === 'sample' ? ', a random sample of all the ranges together' : (s.pick.mode === 'random' ? `, ${s.pick.perRange} from each of ${a.ranges} range(s)` : (s.pick.mode === 'block' ? `, ${s.pick.perBlock} from every /${s.pick.block}` : ''))) +
       (s.pick.mode !== 'all' && s.pick.fresh ? `, ${testedSet().size} tested before skipped` : '') + (a.exhausted ? `, ${a.exhausted} range(s) had to repeat` : '');
     const vs = s.variants && s.variants.count ? ` × ${s.variants.count} variant(s)${s.variants.sampled ? ` (${s.variants.tests} of ${s.variants.count * s.targets.size} tests, an even sample)` : ''}` : '';
     ctx.log(`Scan ${runId}: ${s.targets.size} target(s)${vs} × ${prep.engines.join(', ')} through "${label}"${how}${tlsCheck ? '; TLS pre-check' : ''}`, 'info');
@@ -680,10 +690,37 @@ function createScan(ctx, deps = {}) {
     return { ok: true, running: true, runId: run.runId };
   }
 
+  /** The CDN lists the update button has brought; what the store holds that still reads. */
+  function cdnLists() {
+    if (!cdnStored) cdnStored = C.readStored(ctx.store.get(C.STORE_KEY, null));
+    return cdnStored;
+  }
+
+  /**
+   * scan:cdnUpdate { ids? } → { results, ranges }: every CDN's list (or `ids`'),
+   * asked from the CDN itself. `results` is one row per CDN (cdnRanges.updateLists);
+   * `ranges` is every list as it now stands. A list that failed stays as it was.
+   */
+  function cdnUpdate(raw) {
+    if (cdnUpdating) return cdnUpdating;
+    const ids = raw && Array.isArray(raw.ids) ? raw.ids : null;
+    cdnUpdating = (async () => {
+      const u = await C.updateLists(ids, cdnLists(), { get: deps.fetchText });
+      cdnStored = u.stored;
+      try { ctx.store.set(C.STORE_KEY, u.stored); } catch (e) { ctx.log('Scan: the updated lists were not saved: ' + ((e && e.message) || e), 'warn'); }
+      for (const r of u.results) {
+        if (r.ok) ctx.log(`Scan: ${r.name} list updated — ${r.count} range(s), ${r.added} new, ${r.removed} gone`, 'info');
+        else ctx.log(`Scan: ${r.name} list not updated (${r.error}); the one it had stays`, 'warn');
+      }
+      return { results: u.results, ranges: C.presetsOf(u.stored) };
+    })().finally(() => { cdnUpdating = null; });
+    return cdnUpdating;
+  }
+
   function presets() {
     return {
       cfRanges: T.CF_IPV4_RANGES.slice(),
-      ranges: JSON.parse(JSON.stringify(T.PRESETS)),
+      ranges: Object.assign(JSON.parse(JSON.stringify(T.PRESETS)), C.presetsOf(cdnLists())),
       defaults: Object.assign({}, PRESET_DEFAULTS),
       presets: { fast: Object.assign({}, PRESETS.fast), balanced: Object.assign({}, PRESETS.balanced), accurate: Object.assign({}, PRESETS.accurate) },
       last: ctx.store.get(STORE_KEY, null) || null,
@@ -824,7 +861,8 @@ function createScan(ctx, deps = {}) {
     'scan:copy': copy,
     'scan:export': exportText,
     'scan:forget': forget,
-    'scan:sets': sets
+    'scan:sets': sets,
+    'scan:cdnUpdate': cdnUpdate
   };
 
   return {

@@ -132,8 +132,13 @@ test('the Scan page’s defaults: every input a row with a switch — the addres
   const params = (/<details class="scan-params" id="scanParams"[^>]*>/.exec(HTML) || [''])[0];
   assert.ok(params, 'the parameters section is a <details>');
   assert.doesNotMatch(params, /\sopen/, 'folded by default');
-  // the three address picks and the summary line above the forms
-  assert.deepEqual([...HTML.matchAll(/data-pick="(\w+)"/g)].map((m) => m[1]), ['all', 'sample', 'random']);
+  // the four address picks and the summary line above the forms
+  assert.deepEqual([...HTML.matchAll(/data-pick="(\w+)"/g)].map((m) => m[1]), ['all', 'sample', 'random', 'block']);
+  const { BLOCK_PREFIXES } = require('../src/main/scan/targets');
+  assert.deepEqual([...HTML.matchAll(/<option value="(\d+)"[^>]*>[\d,]+ \(\/\d+\)</g)].map((m) => Number(m[1])), BLOCK_PREFIXES, 'the block sizes on the page are the ones main takes');
+  // the CDN lists beside Cloudflare's, and the button that updates them
+  assert.deepEqual([...HTML.matchAll(/data-preset="([\w-]+)" data-i18n="scan\.p\./g)].map((m) => m[1]), ['cf', 'fastly', 'cloudfront', 'gcore', 'warp-masque', 'warp-wg']);
+  assert.match(HTML, /id="btnScanCdnUpdate"/);
   assert.ok(HTML.indexOf('id="scanSummary"') < HTML.indexOf('class="scan-forms"'), 'the summary sits above the forms');
   assert.match(read('plus/scan.css'), /\.scan-summary \{[^}]*position: sticky/);
 });
@@ -169,5 +174,5 @@ test('the request the page sends reads as main sanitizes it: the variants, the p
   assert.deepEqual([o.passRatio, o.delayExpect, o.prefilterTls, o.prefilterConcurrency], [1, '200-299', true, 300]);
   assert.equal(sanitizeOpts({ delayExpect: 'nonsense' }).delayExpect, '204', 'an expectation that does not read falls back to the default page’s');
   assert.equal(sanitizeOpts({ delayHost: 'example.org' }).delayExpect, '', 'another page: any 2xx/3xx');
-  assert.deepEqual(sanitizePick({ mode: 'sample', count: 500 }), { mode: 'sample', perRange: 20, count: 500, fresh: true });
+  assert.deepEqual(sanitizePick({ mode: 'sample', count: 500 }), { mode: 'sample', perRange: 20, count: 500, perBlock: 5, block: 24, fresh: true });
 });
