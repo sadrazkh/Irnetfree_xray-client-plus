@@ -329,32 +329,44 @@ async function delaySeries(socksPort, opts = {}) {
  * the config sends, nothing more (no certificate check — a pin or a fronted
  * name is the core's business; the question is only "does this address finish
  * a handshake for this name"). 'no-tcp' when the connect fails, 'tls' when the
- * handshake does. `ms` is the handshake's end.
+ * handshake does. `ms` is the handshake's end. `dial` reaches the address some
+ * other way than a plain connect (upstream.js).
  */
 function tlsPing(host, port, opts = {}) {
   const timeout = Number(opts.timeout) || 3000;
   const start = Date.now();
   return new Promise((resolve) => {
     let connected = false, done = false;
-    const sock = net.connect({ host, port });
-    let secure = null;
+    let sock = null, secure = null;
     const finish = (r) => {
       if (done) return;
       done = true;
       clearTimeout(to);
-      try { (secure || sock).destroy(); } catch { /* gone */ }
+      try { if (secure || sock) (secure || sock).destroy(); } catch { /* gone */ }
       resolve(r);
     };
     const fail = (e) => finish({ ok: false, ms: -1, reason: connected ? 'tls' : 'no-tcp', error: errName(e) });
     const to = setTimeout(() => fail(new Error('timeout')), timeout);
-    sock.once('error', fail);
-    sock.once('connect', () => {
+    const handshake = () => {
       connected = true;
       const o = { socket: sock, rejectUnauthorized: false, ALPNProtocols: Array.isArray(opts.alpn) && opts.alpn.length ? opts.alpn : undefined };
       if (opts.servername && net.isIP(opts.servername) === 0) o.servername = opts.servername;
       secure = tls.connect(o, () => finish({ ok: true, ms: Date.now() - start, reason: '', error: null }));
       secure.once('error', fail);
-    });
+      secure.once('close', () => fail(new Error('closed')));
+    };
+    if (typeof opts.dial === 'function') {
+      opts.dial(host, port, timeout).then((s) => {
+        sock = s;
+        if (done) { s.destroy(); return; }
+        s.once('error', fail);
+        handshake();
+      }, fail);
+      return;
+    }
+    sock = net.connect({ host, port });
+    sock.once('error', fail);
+    sock.once('connect', handshake);
   });
 }
 

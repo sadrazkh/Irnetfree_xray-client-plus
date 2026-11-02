@@ -38,6 +38,12 @@
 .scan-pick { margin-block-end: 0; }
 .scan-pick-opts { align-items: center; flex-wrap: wrap; margin-block-start: 8px; }
 .scan-inline-label { margin: 0; }
+.scan-path-row { align-items: center; flex-wrap: wrap; }
+.scan-proxy-addr { flex: 1 1 150px; min-inline-size: 0; inline-size: auto; font-family: var(--mono); }
+.scan-proxy-addr[hidden] { display: none; }
+.scan-path-line { margin-block: 6px 0; font-size: 12px; line-height: 1.6; color: var(--ink3); }
+.scan-path-line.warn { color: var(--warn); }
+.scan-path-line.ok { color: var(--ok, var(--ink3)); }
 .scan-block-size { align-items: center; }
 .scan-block-size[hidden] { display: none; }
 .scan-block-pick { inline-size: auto; flex: 0 0 auto; }
