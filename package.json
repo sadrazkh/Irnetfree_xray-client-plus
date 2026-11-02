@@ -1,6 +1,6 @@
 {
   "name": "irnetfree-plus",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "IRNetFree Plus — the tools beside IRNetFree: an IP/SNI scanner for Xray configs (MASQUE, ECH, WARP, Hysteria2, WireGuard) and a local Xray server with a 3x-ui-style panel and reverse proxy",
   "main": "src/main/main.js",
   "author": {
@@ -11,6 +11,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node --require ./tests/noNetwork.preload.js --test \"tests/*.test.js\"",
+    "update-cdn-ranges": "node scripts/update-cdn-ranges.js",
     "server": "node src/server/server.js",
     "get-xray": "node scripts/download-xray.js",
     "validate": "node scripts/validate-configs.js",

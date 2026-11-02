@@ -528,9 +528,9 @@ function setup(spec = {}, extra = {}) {
 const progressOf = (events) => events.filter(e => e.ch === 'scan-progress').map(e => e.payload);
 const EVENT_KEYS = ['alive', 'done', 'etaMs', 'reasons', 'runId', 'speedDone', 'speedTotal', 'stage', 'total'];
 
-test('register() puts exactly the twelve scan channels on the context', () => {
+test('register() puts exactly the thirteen scan channels on the context', () => {
   const s = setup();
-  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:copy', 'scan:export', 'scan:forget', 'scan:links', 'scan:plan', 'scan:presets', 'scan:retest', 'scan:sets', 'scan:start', 'scan:stop', 'scan:suggest']);
+  assert.deepEqual(Object.keys(s.handlers).sort(), ['scan:apply', 'scan:cdnUpdate', 'scan:copy', 'scan:export', 'scan:forget', 'scan:links', 'scan:plan', 'scan:presets', 'scan:retest', 'scan:sets', 'scan:start', 'scan:stop', 'scan:suggest']);
   assert.equal(s.scan.busy(), false);
 });
 
@@ -562,9 +562,9 @@ test('scan:presets — the Cloudflare ranges, the exact defaults, the three pres
   assert.equal(p.tested, 0, 'nothing tested yet');
   assert.deepEqual(Object.keys(p).sort(), ['cfRanges', 'defaults', 'dimensions', 'engines', 'last', 'limits', 'presets', 'ranges', 'sets', 'tested']);
   assert.deepEqual(p.dimensions.map((d) => d.id), ['fingerprint', 'alpn', 'cipherSuites', 'fragment', 'finalMask', 'dialMode', 'mux', 'xhttpMode']);
-  assert.deepEqual([p.limits.variants, p.limits.sampleMax, p.limits.pick], [300, 1000000, { mode: 'all', perRange: 20, count: 1000, fresh: true }]);
+  assert.deepEqual([p.limits.variants, p.limits.sampleMax, p.limits.pick], [300, 1000000, { mode: 'all', perRange: 20, count: 1000, perBlock: 5, block: 24, fresh: true }]);
   assert.deepEqual(p.sets, []);
-  assert.deepEqual(Object.keys(p.ranges).sort(), ['cf', 'cf-plain-ports', 'cf-tls-ports', 'warp-masque', 'warp-wg']);
+  assert.deepEqual(Object.keys(p.ranges).sort(), ['cf', 'cf-plain-ports', 'cf-tls-ports', 'cloudfront', 'fastly', 'gcore', 'warp-masque', 'warp-wg']);
 });
 
 test('scan:start refuses what it cannot run, with the agreed reasons', async () => {
@@ -615,7 +615,7 @@ test('scan:start runs in the background and streams scan-progress: one event per
   // the last request is remembered without results, with the engines it actually ran and the v2.1 option names
   const last = s.data.scan;
   assert.deepEqual(Object.keys(last).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'variants']);
-  assert.deepEqual(last.pick, { mode: 'all', perRange: 20, count: 1000, fresh: true }, 'a request without a pick is every address');
+  assert.deepEqual(last.pick, { mode: 'all', perRange: 20, count: 1000, perBlock: 5, block: 24, fresh: true }, 'a request without a pick is every address');
   assert.deepEqual(last.variants, { dims: {}, limit: 300 }, 'no parameter dimensions: the plain run');
   assert.equal(last.serverId, 'sv-vless');
   assert.equal(last.ipsText, req.ipsText);
@@ -811,14 +811,14 @@ test('scan:start with a random pick draws perRange from every range, remembers t
   const req = { serverId: 'sv-vless', ipsText: '1.1.1.0/30\n2.2.2.0/30', pick: { mode: 'random', perRange: 2 }, tests: FILTER_ONLY, opts: { batch: 20 } };
   const reply = await s.handlers['scan:start'](req);
   assert.equal(reply.total, 4, '2 per range × 2 ranges × 1 engine');
-  assert.deepEqual(reply.pick, { mode: 'random', perRange: 2, count: 1000, fresh: true });
+  assert.deepEqual(reply.pick, { mode: 'random', perRange: 2, count: 1000, perBlock: 5, block: 24, fresh: true });
   assert.deepEqual([reply.ranges, reply.exhausted, reply.truncated], [2, 0, false]);
   await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
   const ips = s.rig.cores[0].ips.slice().sort();
   assert.equal(ips.length, 4);
   assert.equal(ips.filter(ip => ip.startsWith('1.1.1.')).length, 2);
   assert.equal(ips.filter(ip => ip.startsWith('2.2.2.')).length, 2);
-  assert.deepEqual(s.data.scan.pick, { mode: 'random', perRange: 2, count: 1000, fresh: true }, 'the pick is part of the remembered request');
+  assert.deepEqual(s.data.scan.pick, { mode: 'random', perRange: 2, count: 1000, perBlock: 5, block: 24, fresh: true }, 'the pick is part of the remembered request');
   assert.deepEqual(Object.keys(s.data.scan).sort(), ['engines', 'ipsText', 'link', 'opts', 'pick', 'portsText', 'serverId', 'snisText', 'tests', 'variants']);
   // the history: the four addresses, as integers, and the count in presets
   assert.equal(s.data.scanTested.length, 4);
@@ -826,6 +826,21 @@ test('scan:start with a random pick draws perRange from every range, remembers t
   assert.deepEqual(s.data.scanTested.slice().sort(), ips);
   assert.equal((await s.handlers['scan:presets']()).tested, 4);
   assert.ok(s.logs.some(l => /4 of 8 address\(es\), 2 from each of 2 range\(s\), 0 tested before skipped/.test(l.line)), s.logs.map(l => l.line).join('\n'));
+});
+
+test('scan:start with a block pick: N from every /24 the ranges touch, remembered with its size, and the log says it', async () => {
+  const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS] });
+  const req = { serverId: 'sv-vless', ipsText: '1.1.0.0/23\n2.2.2.2/32', pick: { mode: 'block', perBlock: 2, block: 24 }, tests: FILTER_ONLY, opts: { batch: 20 } };
+  const reply = await s.handlers['scan:start'](req);
+  assert.equal(reply.total, 5, '2 from each of two /24s, and the /32 itself');
+  assert.deepEqual(reply.addresses, { total: 513, taken: 5 });
+  await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
+  const ips = s.rig.cores[0].ips.slice();
+  assert.equal(ips.filter(ip => ip.startsWith('1.1.0.')).length, 2);
+  assert.equal(ips.filter(ip => ip.startsWith('1.1.1.')).length, 2);
+  assert.ok(ips.includes('2.2.2.2'));
+  assert.deepEqual(s.data.scan.pick, { mode: 'block', perRange: 20, count: 1000, perBlock: 2, block: 24, fresh: true });
+  assert.ok(s.logs.some(l => /5 of 513 address\(es\), 2 from every \/24/.test(l.line)), s.logs.map(l => l.line).join('\n'));
 });
 
 test('a later random run skips the addresses tested before; once a range has run out it repeats and says so; forget empties the history', async () => {
@@ -877,16 +892,19 @@ test('a plain (v2.1) request reads as pick `all`, still records what it tested, 
   const s = setup({ installed: ['xray'] }, { servers: [F.VLESS_WS_TLS] });
   s.data.scanTested = [ip4ToInt('9.9.9.9'), 'junk', -1, 2 ** 32];
   const reply = await s.handlers['scan:start']({ serverId: 'sv-vless', ipsText: '1.1.1.1\n1.1.1.2', tests: FILTER_ONLY });
-  assert.deepEqual(reply.pick, { mode: 'all', perRange: 20, count: 1000, fresh: true });
+  assert.deepEqual(reply.pick, { mode: 'all', perRange: 20, count: 1000, perBlock: 5, block: 24, fresh: true });
   assert.deepEqual([reply.ranges, reply.exhausted, reply.addresses], [2, 0, { total: 2, taken: 2 }]);
   await until(() => progressOf(s.events).some(p => p.finished), 5000, 'finished');
-  assert.deepEqual(s.data.scan.pick, { mode: 'all', perRange: 20, count: 1000, fresh: true });
+  assert.deepEqual(s.data.scan.pick, { mode: 'all', perRange: 20, count: 1000, perBlock: 5, block: 24, fresh: true });
   assert.equal(s.data.scanTested[0], '9.9.9.9', 'a v2.2 integer is read back as its address and stays first');
   assert.deepEqual(s.data.scanTested.slice(1).sort(), ['1.1.1.1', '1.1.1.2'], 'bad entries dropped, the run’s addresses added');
-  assert.deepEqual(sanitizePick({ mode: 'random', perRange: 0, fresh: 0 }), { mode: 'random', perRange: 1, count: 1000, fresh: false }, 'clamped, like every other number');
-  assert.deepEqual(sanitizePick({ mode: 'weird', perRange: 99999 }), { mode: 'all', perRange: 99999, count: 1000, fresh: true }, 'no 5000 cap any more');
-  assert.deepEqual(sanitizePick({ mode: 'sample', count: 5e9 }), { mode: 'sample', perRange: 20, count: 1000000, fresh: true }, 'a sample stops at MAX_SAMPLE');
+  assert.deepEqual(sanitizePick({ mode: 'random', perRange: 0, fresh: 0 }), { mode: 'random', perRange: 1, count: 1000, perBlock: 5, block: 24, fresh: false }, 'clamped, like every other number');
+  assert.deepEqual(sanitizePick({ mode: 'weird', perRange: 99999 }), { mode: 'all', perRange: 99999, count: 1000, perBlock: 5, block: 24, fresh: true }, 'no 5000 cap any more');
+  assert.deepEqual(sanitizePick({ mode: 'sample', count: 5e9 }), { mode: 'sample', perRange: 20, count: 1000000, perBlock: 5, block: 24, fresh: true }, 'a sample stops at MAX_SAMPLE');
   assert.deepEqual(sanitizePick(null), PICK_DEFAULTS);
+  assert.deepEqual(sanitizePick({ mode: 'block', perBlock: 7, block: 26 }), { mode: 'block', perRange: 20, count: 1000, perBlock: 7, block: 26, fresh: true });
+  assert.deepEqual(sanitizePick({ mode: 'block', perBlock: 0, block: 13 }), { mode: 'block', perRange: 20, count: 1000, perBlock: 1, block: 24, fresh: true }, 'a block size the page does not offer reads as /24');
+  assert.equal(sanitizePick({ mode: 'block', perBlock: 9e9 }).perBlock, 65536);
 });
 
 /* ----------------------------- v3: targets, UDP, readiness, the engine gate, ECH, SNI, links ----------------------------- */
