@@ -464,7 +464,7 @@
       '<td><span class=' + JSON.stringify('proto-badge proto-' + i.protocol) + '>' + escapeHtml(i.protocol) + '</span></td>' +
       '<td class="xs-c-addr">' + escapeHtml(i.listen + ':' + i.port) + '</td>' +
       '<td><span class="xs-tag">' + escapeHtml(i.tag) + '</span></td>' +
-      '<td class="xs-c-num xs-in-clients"></td>' +
+      '<td class="xs-in-clients"></td>' +
       '<td class="xs-c-num xs-in-traffic"></td>' +
       '<td class="xs-c-num xs-in-limits"></td>' +
       '<td class="xs-c-acts">' +
