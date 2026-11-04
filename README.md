@@ -191,7 +191,7 @@ node src/server/server.js --port 6970
 <div dir="ltr">
 
 ```mermaid
-flowchart LR
+flowchart TD
     A["🧩 یک کانفیگ"] --> B["آدرس × پورت × SNI × پارامتر"]
     B --> C{"پیش‌بررسی"}
     C -->|"مرده"| X["کنار می‌رود، با دلیل"]
@@ -276,9 +276,9 @@ npm start
 
 ## 🙏 ساخته شده با
 
-[IRNetFree](https://github.com/sadrazkh/Irnetfree_xray-client) · [Xray-core](https://github.com/XTLS/Xray-core) · [Xray-PattN](https://github.com/patterniha/Xray-core) · [Electron](https://www.electronjs.org/)، با الهام از مدل [3x-ui](https://github.com/MHSanaei/3x-ui)
+[IRNetFree](https://github.com/sadrazkh/Irnetfree_xray-client) · [Xray-core](https://github.com/XTLS/Xray-core) · [Xray-PattN](https://github.com/patterniha/Xray-core) · [Electron](https://www.electronjs.org/)
 
-مجوز: MIT
+تب سرور با الهام از مدل [3x-ui](https://github.com/MHSanaei/3x-ui) ساخته شده است. مجوز: MIT
 
 </div>
 

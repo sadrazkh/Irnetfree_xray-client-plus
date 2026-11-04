@@ -184,7 +184,7 @@ The [dev](https://github.com/sadrazkh/Irnetfree_xray-client-plus/releases/tag/de
 ## 🗺️ How a scan works
 
 ```mermaid
-flowchart LR
+flowchart TD
     A["🧩 One config"] --> B["address × port × SNI × parameter"]
     B --> C{"Pre-check"}
     C -->|"dead"| X["Left out, with the reason"]
