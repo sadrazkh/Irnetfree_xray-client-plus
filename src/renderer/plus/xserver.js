@@ -384,7 +384,7 @@
     const reset = row.querySelector('.xs-cl-reset');
     if (c.resetDays > 0) {
       // The date is isolated: after Persian words its digits would otherwise reorder around the hyphens.
-      reset.textContent = tf('xs.resetEvery', { n: c.resetDays }) + (resetAt ? ' · ' + tf('xs.resetNext', { d: '⁦' + toDateInput(resetAt) + '⁩' }) : '');
+      reset.textContent = tf('xs.resetEvery', { n: c.resetDays }) + (resetAt ? ' · ' + tf('xs.resetNext', { d: '\u2066' + toDateInput(resetAt) + '\u2069' }) : '');
     } else reset.textContent = '—';
     const on = live ? live.enabled : c.enabled;
     row.querySelector('.xs-c-sw input').checked = !!on;
