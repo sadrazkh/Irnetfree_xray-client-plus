@@ -48,7 +48,7 @@
   </tr>
   <tr>
     <td><img src="docs/readme/params.png" alt="پارامترها"><br><b>🧬 پارامترها:</b> هر ردیف یک سوئیچ، با مقدارهای آماده یا دلخواه</td>
-    <td><img src="docs/readme/server.png" alt="ورودی سرور"><br><b>🖧 سرور:</b> ورودی‌ها با Reality یا TLS و کاربرهای جدا</td>
+    <td><img src="docs/readme/server.png" alt="جدول ورودی‌های سرور"><br><b>🖧 سرور:</b> ورودی‌ها با Reality یا TLS و کاربرهای جدا</td>
   </tr>
   <tr>
     <td><img src="docs/readme/reverse.png" alt="ریورس"><br><b>🔁 ریورس:</b> دو جادوگر portal و bridge برای دستگاه پشت NAT</td>
