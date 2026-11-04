@@ -201,6 +201,15 @@ test('the Reset cell is a sentence: it takes the page’s direction, and the dat
   assert.doesNotMatch(js, /[\u2066-\u2069]/, 'written as escapes: an invisible character in the source would pass unseen');
 });
 
+test('an inbound’s Users cell is a sentence too: it takes the page’s direction, so in Persian the count comes first', () => {
+  // In a left-to-right cell the Persian word lands on the right, where a Persian reader starts.
+  const js = read('plus/xserver.js');
+  assert.deepEqual(js.match(/<td class="([^"]*xs-in-clients[^"]*)">/)[1].split(' '), ['xs-in-clients'], 'none of the left-to-right cell classes');
+  const rule = read('plus/xserver.css').replace(/\/\*[\s\S]*?\*\//g, '').match(/\.xs-in-clients[^{]*\{([^}]*)\}/);
+  assert.ok(rule, 'the cell has a rule');
+  assert.doesNotMatch(rule[1], /direction/);
+});
+
 test('the request the page sends reads as main sanitizes it: the variants, the pick with its count, the accuracy options', () => {
   // the names buildReq/buildOpts write, as main's sanitizers read them
   for (const name of ['variants: buildSpec()', 'count: pickCount()', 'o.passRatio', 'o.delayExpect', 'o.prefilterTls', "'prefilterConcurrency'"]) assert.ok(SCAN_JS.includes(name), name);
