@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" width="1280" height="340" role="img" aria-label="IRNetFree Plus">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#121c26"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#4f8cff"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f8cff"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#ffffff" stroke-opacity="0.035"/>
+    </pattern>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2dd4bf" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#2dd4bf" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sweep" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf" stop-opacity="0"/>
+      <stop offset="1" stop-color="#2dd4bf" stop-opacity="0.32"/>
+    </linearGradient>
+    <style>
+      .flow { stroke-dasharray: 7 13; animation: flow 1.4s linear infinite; }
+      @keyframes flow { to { stroke-dashoffset: -40; } }
+      .beat { animation: beat 2.8s ease-in-out infinite; }
+      .beat.b { animation-delay: .7s; }
+      .beat.c { animation-delay: 1.4s; }
+      .beat.d { animation-delay: 2.1s; }
+      @keyframes beat { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+      .sweep { animation: sweep 4.2s linear infinite; }
+      @keyframes sweep { from { transform: translateX(-62px); } to { transform: translateX(286px); } }
+      @media (prefers-reduced-motion: reduce) { .flow, .beat, .sweep { animation: none; } .sweep { transform: translateX(120px); } }
+      text { font-family: "Segoe UI", Vazirmatn, Tahoma, "Helvetica Neue", Arial, sans-serif; }
+      .mono { font-family: Consolas, "SF Mono", Menlo, monospace; }
+    </style>
+    <clipPath id="field"><rect x="702" y="70" width="228" height="200" rx="12"/></clipPath>
+  </defs>
+
+  <rect width="1280" height="340" rx="18" fill="url(#bg)"/>
+  <rect width="1280" height="340" rx="18" fill="url(#grid)"/>
+  <rect width="1280" height="5" fill="url(#brand)"/>
+  <circle cx="830" cy="170" r="210" fill="url(#halo)"/>
+
+  <!-- the mark -->
+  <g transform="translate(76 92) scale(0.31)">
+    <g filter="url(#glow)">
+      <path d="M256 92 L392 142 V268 C392 350 332 404 256 432 C180 404 120 350 120 268 V142 Z" fill="none" stroke="url(#shield)" stroke-width="16" stroke-linejoin="round"/>
+    </g>
+    <g stroke="url(#shield)" stroke-width="9" fill="none" stroke-linecap="round">
+      <circle cx="256" cy="262" r="78"/>
+      <ellipse cx="256" cy="262" rx="34" ry="78"/>
+      <path d="M178 262 H334"/>
+      <path d="M190 222 H322"/>
+      <path d="M190 302 H322"/>
+    </g>
+  </g>
+
+  <!-- the name -->
+  <text x="236" y="150" font-size="66" font-weight="700" fill="#e6edf3" letter-spacing="-1">IR<tspan fill="url(#brand)">NetFree</tspan><tspan fill="#2dd4bf" font-size="40" dx="12" dy="-16">Plus</tspan></text>
+  <text x="240" y="196" font-size="23" fill="#9fb0c0">A clean-IP scanner and an Xray server</text>
+  <text x="240" y="238" font-size="23" fill="#c8d5e0" direction="rtl" text-anchor="end">اسکنر IP تمیز و سرور Xray</text>
+  <text x="240" y="280" font-size="16" fill="#6f8294" class="mono">Windows · macOS · Linux · Headless</text>
+
+  <!-- the addresses being tried: most stay dark, a few answer -->
+  <rect x="702" y="70" width="228" height="200" rx="12" fill="#10171f" stroke="#2b3947"/>
+  <g clip-path="url(#field)">
+    <rect class="sweep" x="702" y="70" width="62" height="200" fill="url(#sweep)"/>
+    <g fill="#1d2935">
+      <rect x="718" y="86" width="20" height="20" rx="5"/><rect x="746" y="86" width="20" height="20" rx="5"/><rect x="774" y="86" width="20" height="20" rx="5"/><rect x="802" y="86" width="20" height="20" rx="5"/><rect x="830" y="86" width="20" height="20" rx="5"/><rect x="858" y="86" width="20" height="20" rx="5"/><rect x="886" y="86" width="20" height="20" rx="5"/>
+      <rect x="718" y="114" width="20" height="20" rx="5"/><rect x="746" y="114" width="20" height="20" rx="5"/><rect x="774" y="114" width="20" height="20" rx="5"/><rect x="802" y="114" width="20" height="20" rx="5"/><rect x="830" y="114" width="20" height="20" rx="5"/><rect x="858" y="114" width="20" height="20" rx="5"/><rect x="886" y="114" width="20" height="20" rx="5"/>
+      <rect x="718" y="142" width="20" height="20" rx="5"/><rect x="746" y="142" width="20" height="20" rx="5"/><rect x="774" y="142" width="20" height="20" rx="5"/><rect x="802" y="142" width="20" height="20" rx="5"/><rect x="830" y="142" width="20" height="20" rx="5"/><rect x="858" y="142" width="20" height="20" rx="5"/><rect x="886" y="142" width="20" height="20" rx="5"/>
+      <rect x="718" y="170" width="20" height="20" rx="5"/><rect x="746" y="170" width="20" height="20" rx="5"/><rect x="774" y="170" width="20" height="20" rx="5"/><rect x="802" y="170" width="20" height="20" rx="5"/><rect x="830" y="170" width="20" height="20" rx="5"/><rect x="858" y="170" width="20" height="20" rx="5"/><rect x="886" y="170" width="20" height="20" rx="5"/>
+      <rect x="718" y="198" width="20" height="20" rx="5"/><rect x="746" y="198" width="20" height="20" rx="5"/><rect x="774" y="198" width="20" height="20" rx="5"/><rect x="802" y="198" width="20" height="20" rx="5"/><rect x="830" y="198" width="20" height="20" rx="5"/><rect x="858" y="198" width="20" height="20" rx="5"/><rect x="886" y="198" width="20" height="20" rx="5"/>
+      <rect x="718" y="226" width="20" height="20" rx="5"/><rect x="746" y="226" width="20" height="20" rx="5"/><rect x="774" y="226" width="20" height="20" rx="5"/><rect x="802" y="226" width="20" height="20" rx="5"/><rect x="830" y="226" width="20" height="20" rx="5"/><rect x="858" y="226" width="20" height="20" rx="5"/><rect x="886" y="226" width="20" height="20" rx="5"/>
+    </g>
+    <g fill="#2dd4bf">
+      <rect class="beat" x="774" y="114" width="20" height="20" rx="5"/>
+      <rect class="beat b" x="858" y="86" width="20" height="20" rx="5"/>
+      <rect class="beat c" x="746" y="198" width="20" height="20" rx="5"/>
+      <rect class="beat d" x="830" y="170" width="20" height="20" rx="5"/>
+      <rect class="beat b" x="886" y="226" width="20" height="20" rx="5"/>
+    </g>
+    <g fill="#e5604d" fill-opacity="0.5">
+      <rect x="802" y="142" width="20" height="20" rx="5"/>
+      <rect x="718" y="86" width="20" height="20" rx="5"/>
+      <rect x="858" y="198" width="20" height="20" rx="5"/>
+    </g>
+  </g>
+
+  <path d="M930 170 H992" fill="none" stroke="#2dd4bf" stroke-width="3" class="flow"/>
+
+  <!-- the best ones, ready to copy -->
+  <g class="mono" font-size="14">
+    <rect x="992" y="82" width="244" height="40" rx="10" fill="#132a28" stroke="#2dd4bf" stroke-opacity="0.6"/>
+    <text x="1008" y="107" fill="#7fe6d6">104.17.148.22</text>
+    <text x="1220" y="107" fill="#7fe6d6" text-anchor="end">86 ms</text>
+    <rect x="992" y="150" width="244" height="40" rx="10" fill="#14233b" stroke="#4f8cff" stroke-opacity="0.6"/>
+    <text x="1008" y="175" fill="#9dc0ff">172.67.70.118</text>
+    <text x="1220" y="175" fill="#9dc0ff" text-anchor="end">91 ms</text>
+    <rect x="992" y="218" width="244" height="40" rx="10" fill="#14233b" stroke="#4f8cff" stroke-opacity="0.6"/>
+    <text x="1008" y="243" fill="#9dc0ff">104.18.32.71</text>
+    <text x="1220" y="243" fill="#9dc0ff" text-anchor="end">94 ms</text>
+  </g>
+</svg>
