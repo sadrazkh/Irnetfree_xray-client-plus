@@ -188,6 +188,18 @@ test('a Server table row stays a table row: a field with a button has a class of
   assert.deepEqual(inRtl[1].split(', ').sort(), ltrCells.sort());
 });
 
+test('the Reset cell is a sentence: it takes the page’s direction, and the date inside it stays in order', () => {
+  // After Persian words the digits of a date count as Arabic numbers and each hyphen splits them, so
+  // 2026-12-04 shows as 04-12-2026. Only the isolate stops that; without the page's direction the
+  // isolated date would then land before the sentence instead of after it.
+  const js = read('plus/xserver.js');
+  assert.deepEqual(js.match(/<td class="([^"]*xs-cl-reset[^"]*)">/)[1].split(' '), ['xs-cl-reset'], 'none of the left-to-right cell classes');
+  const rule = read('plus/xserver.css').replace(/\/\*[\s\S]*?\*\//g, '').match(/\.xs-cl-reset \{([^}]*)\}/);
+  assert.ok(rule, 'the cell has its own rule');
+  assert.doesNotMatch(rule[1], /direction/);
+  assert.ok(js.includes(String.raw`{ d: '⁦' + toDateInput(resetAt) + '⁩' }`), 'the date is isolated');
+});
+
 test('the request the page sends reads as main sanitizes it: the variants, the pick with its count, the accuracy options', () => {
   // the names buildReq/buildOpts write, as main's sanitizers read them
   for (const name of ['variants: buildSpec()', 'count: pickCount()', 'o.passRatio', 'o.delayExpect', 'o.prefilterTls', "'prefilterConcurrency'"]) assert.ok(SCAN_JS.includes(name), name);
