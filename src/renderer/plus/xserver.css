@@ -348,6 +348,13 @@
 .xs-clients .xs-th { padding-block: 7px; }
 .xs-clients .xs-row td { padding: 5px 8px; }
 .xs-c-email { font-weight: 600; white-space: nowrap; }
+/* A sentence in the page's language, so not a left-to-right cell like its neighbours. */
+.xs-cl-reset {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink2);
+  white-space: nowrap;
+}
 
 /* ----------------------------- routing ----------------------------- */
 
