@@ -46,7 +46,7 @@
   </tr>
   <tr>
     <td><img src="docs/readme/params.png" alt="Parameters"><br><b>🧬 Parameters:</b> a switch per row, with ready or custom values</td>
-    <td><img src="docs/readme/server.png" alt="A server inbound"><br><b>🖧 Server:</b> inbounds with Reality or TLS and separate clients</td>
+    <td><img src="docs/readme/server.png" alt="The server's inbounds table"><br><b>🖧 Server:</b> inbounds with Reality or TLS and separate clients</td>
   </tr>
   <tr>
     <td><img src="docs/readme/reverse.png" alt="Reverse proxy"><br><b>🔁 Reverse:</b> portal and bridge wizards for a device behind NAT</td>
