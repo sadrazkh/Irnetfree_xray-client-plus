@@ -1,6 +1,6 @@
 {
   "name": "irnetfree-plus",
-  "version": "3.3.0",
+  "version": "3.3.1",
   "description": "IRNetFree Plus — the tools beside IRNetFree: an IP/SNI scanner for Xray configs (MASQUE, ECH, WARP, Hysteria2, WireGuard) and a local Xray server with a 3x-ui-style panel and reverse proxy",
   "main": "src/main/main.js",
   "author": {
