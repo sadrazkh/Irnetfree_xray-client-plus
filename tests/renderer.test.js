@@ -197,7 +197,8 @@ test('the Reset cell is a sentence: it takes the page’s direction, and the dat
   const rule = read('plus/xserver.css').replace(/\/\*[\s\S]*?\*\//g, '').match(/\.xs-cl-reset \{([^}]*)\}/);
   assert.ok(rule, 'the cell has its own rule');
   assert.doesNotMatch(rule[1], /direction/);
-  assert.ok(js.includes(String.raw`{ d: '⁦' + toDateInput(resetAt) + '⁩' }`), 'the date is isolated');
+  assert.ok(js.includes(String.raw`{ d: '\u2066' + toDateInput(resetAt) + '\u2069' }`), 'the date is isolated');
+  assert.doesNotMatch(js, /[\u2066-\u2069]/, 'written as escapes: an invisible character in the source would pass unseen');
 });
 
 test('the request the page sends reads as main sanitizes it: the variants, the pick with its count, the accuracy options', () => {
