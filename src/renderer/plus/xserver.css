@@ -134,9 +134,9 @@
   inline-size: 100%;
   border-collapse: collapse;
   font-size: 12px;
-  /* Measured: the inbound table's nine columns need about 760px, the rule
-     table's eleven about 900px. Narrower than that the wrapper scrolls,
-     never the page. */
+  /* Measured: the inbound table's nine columns need about 840px whatever this
+     says, the rule table's eleven about 900px, more with long values. Narrower
+     than that the wrapper scrolls, never the page. */
   min-inline-size: 760px;
 }
 .xs-table-out { min-inline-size: 520px; }
@@ -221,6 +221,9 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* An address or a number reads left to right in either language but sits where
+   its header starts: in Persian that is the end of a left-to-right cell, not its start. */
+[dir="rtl"] :is(.xs-c-addr, .xs-c-mono, .xs-c-num, .xs-c-list) { text-align: end; }
 .xs-c-acts {
   white-space: nowrap;
   text-align: end;
@@ -325,7 +328,12 @@
 }
 .xs-sub-head .btn { margin-inline-start: auto; }
 .xs-sub-empty { font-size: 11px; color: var(--dim); padding-block: 6px; }
+/* The clients table is wider than most windows and sits in one cell of the
+   inbound table. Zero width of its own, then the whole cell: it scrolls here
+   instead of setting the width of every column above it. */
 .xs-clients-wrap {
+  inline-size: 0;
+  min-inline-size: 100%;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: var(--r4);
@@ -451,12 +459,12 @@
 .xs-checks-empty { font-size: 11px; color: var(--dim); }
 
 /* a field with a button glued to its end (generate, copy, QR) */
-.xs-row-field, .xs-row {
+.xs-row-field {
   display: flex;
   align-items: center;
   gap: 8px;
 }
-.xs-row .input { flex: 1 1 auto; min-inline-size: 0; }
+.xs-row-field .input { flex: 1 1 auto; min-inline-size: 0; }
 
 /* ----------------------------- log, preview, errors ----------------------------- */
 
