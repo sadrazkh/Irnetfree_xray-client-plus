@@ -166,6 +166,28 @@ test('the Scan page’s scripts parse, and no Persian string carries a straight 
   for (const [k, v] of read('plus/scan.i18n.js').matchAll(/'([A-Za-z0-9_.-]+)':\s*'([^'\n]*)'/g)) assert.ok(!/[؀-ۿ]'/.test(v), k);
 });
 
+test('a Server table row stays a table row: a field with a button has a class of its own, and the clients table cannot widen the table around it', () => {
+  // .xs-row is the rows of the inbound, client, outbound and rule tables. display:flex on a <tr> takes
+  // it out of the table: the headers stop lining up with their columns and the table overflows its box.
+  const rules = [...ALL_CSS.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^{}]*)\}/g)];
+  const onRow = rules.filter(([, sel, body]) => /\.xs-row(?![\w-])/.test(sel) && /(^|[\s;])display\s*:/.test(body));
+  assert.deepEqual(onRow.map(([, sel]) => sel.trim()), [], 'nothing sets display on .xs-row');
+  assert.match(read('plus/xserver.css'), /\.xs-row-field \{[^}]*display: flex/);
+  // the class goes on table rows only, in the markup and in what the script builds
+  const notRows = [...HTML.matchAll(/<(\w+)[^>]*\sclass="(?:[^"]*\s)?xs-row(?![\w-])[^>]*>/g)].map((m) => m[0]);
+  assert.deepEqual(notRows, [], 'no element in the markup is .xs-row');
+  assert.equal(HTML.match(/<div class="xs-row-field">/g).length, 4, 'the link and the three generated secrets');
+  const built = [...read('plus/xserver.js').matchAll(/(\w+)\.className = 'xs-row(?![\w-])/g)].map((m) => m[1]);
+  assert.deepEqual(built, ['tr', 'tr', 'tr', 'tr'], 'client, inbound, outbound, rule');
+  // 980px of clients sit inside one cell: without this they set the width of every column above them
+  assert.match(read('plus/xserver.css'), /\.xs-clients-wrap \{[^}]*inline-size: 0;[^}]*min-inline-size: 100%/);
+  // a left-to-right cell starts where its header starts: `start` on it alone is the far side in Persian
+  const ltrCells = rules.filter(([, sel, body]) => /^\s*\.xs-c-[\w-]+\s*$/.test(sel) && /direction: ltr/.test(body)).map(([, sel]) => sel.trim());
+  const inRtl = read('plus/xserver.css').match(/\[dir="rtl"\] :is\(([^)]*)\) \{ text-align: end; \}/);
+  assert.ok(inRtl, 'the rule for a right-to-left page');
+  assert.deepEqual(inRtl[1].split(', ').sort(), ltrCells.sort());
+});
+
 test('the request the page sends reads as main sanitizes it: the variants, the pick with its count, the accuracy options', () => {
   // the names buildReq/buildOpts write, as main's sanitizers read them
   for (const name of ['variants: buildSpec()', 'count: pickCount()', 'o.passRatio', 'o.delayExpect', 'o.prefilterTls', "'prefilterConcurrency'"]) assert.ok(SCAN_JS.includes(name), name);
