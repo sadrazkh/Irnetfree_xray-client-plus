@@ -383,7 +383,8 @@
     const resetAt = live ? live.resetAt : c.resetAt;
     const reset = row.querySelector('.xs-cl-reset');
     if (c.resetDays > 0) {
-      reset.textContent = tf('xs.resetEvery', { n: c.resetDays }) + (resetAt ? ' · ' + tf('xs.resetNext', { d: toDateInput(resetAt) }) : '');
+      // The date is isolated: after Persian words its digits would otherwise reorder around the hyphens.
+      reset.textContent = tf('xs.resetEvery', { n: c.resetDays }) + (resetAt ? ' · ' + tf('xs.resetNext', { d: '\u2066' + toDateInput(resetAt) + '\u2069' }) : '');
     } else reset.textContent = '—';
     const on = live ? live.enabled : c.enabled;
     row.querySelector('.xs-c-sw input').checked = !!on;
@@ -403,7 +404,7 @@
       '<td class="xs-c-num">' + (c.limitIp > 0 ? c.limitIp : '—') + '</td>' +
       '<td class="xs-c-quota"><div class="xs-quota-wrap"><span class="usage-bar" hidden><span class="usage-fill"></span></span><span class="xs-used"></span></div></td>' +
       '<td class="xs-c-mono">' + escapeHtml(c.expiresAt ? toDateInput(c.expiresAt) : t('xs.never')) + '</td>' +
-      '<td class="xs-c-mono xs-cl-reset"></td>' +
+      '<td class="xs-cl-reset"></td>' +
       '<td class="xs-c-dim" title="' + attr(c.comment) + '">' + escapeHtml(c.comment || '') + '</td>' +
       '<td>' + (c.reverseTag ? '<span class="xs-tag reverse">' + escapeHtml(c.reverseTag) + '</span>' : '—') + '</td>' +
       '<td class="xs-c-acts">' +
