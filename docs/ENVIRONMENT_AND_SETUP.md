@@ -69,3 +69,20 @@ User-facing install steps are in [README.en.md](../README.en.md) and [GUIDE.md](
 Release rules (V): push a tag alone (D-020). `electron-builder` runs with `--publish never`; `softprops/action-gh-release` publishes. Checksum and artifact steps must not block publishing, so they use `continue-on-error`.
 
 `release.yml` sets the build's version from the tag; `package.json` in git matches the latest tag (V: 3.3.3). A release is merged as a `Merge: Plus vX.Y.Z` commit, and the tag points at it (V: git log, `v3.3.3`). `npm run update-cdn-ranges` is manual and not tied to releases (KI-16).
+
+### Publishing a release
+
+**[V]** `.github/workflows/release.yml` runs when a tag `v*` (or `N.N.N`) is pushed, and builds Windows, macOS and Linux (`build` matrix) into the GitHub Release of that tag. Plus has no Android or router build.
+
+1. Set the version in `package.json` and `package-lock.json`. Commit on `main`.
+2. From the repository folder, tag and push:
+
+   ```bash
+   git tag -a v3.4.0 -m "v3.4.0"
+   git push origin main v3.4.0
+   ```
+
+3. Follow the build on the repository's Actions tab; the files appear on the Releases page when it ends.
+
+**[A]** A tag made on GitHub (Releases, Draft a new release, a new tag name, target `main`, Publish) should start the same workflow.
+
