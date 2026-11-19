@@ -60,6 +60,6 @@ Synced files sit in the same folders as own code (`src/server/guard.js` beside `
 | `AI_WORKING_GUIDELINES.md` | Rules for changing this repo |
 | `CHANGELOG.md` | One line per release |
 
-Existing documents, linked and not repeated: [README.md](../README.md) (Persian front page), [README.en.md](../README.en.md), [GUIDE.md](../GUIDE.md) (full manual, Persian), [SYNC.md](SYNC.md) (the upstream sync), [readme/](readme/) (banner and screenshots), [superpowers/](superpowers/) (design specs and plans).
+Existing documents, linked and not repeated: [README.md](../README.md) (Persian front page), [README.en.md](../README.en.md), [GUIDE.md](../GUIDE.md) (full manual, Persian), [site/](../site/) (the website, https://sadrazkh.github.io/Irnetfree_xray-client-plus/), [SYNC.md](SYNC.md) (the upstream sync), [readme/](readme/) (banner and screenshots), [superpowers/](superpowers/) (design specs and plans).
 
 `docs/superpowers/` is history, not current truth: several of its numbers and names have since changed (`KNOWN_ISSUES_AND_TECH_DEBT.md` KI-19).

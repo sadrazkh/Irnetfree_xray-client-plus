@@ -9,7 +9,7 @@
 [![Tests](https://img.shields.io/github/actions/workflow/status/sadrazkh/Irnetfree_xray-client-plus/test.yml?branch=main&style=for-the-badge&label=tests&labelColor=161d27)](https://github.com/sadrazkh/Irnetfree_xray-client-plus/actions/workflows/test.yml)
 [![Stars](https://img.shields.io/github/stars/sadrazkh/Irnetfree_xray-client-plus?style=for-the-badge&label=stars&color=e3b341&labelColor=161d27)](https://github.com/sadrazkh/Irnetfree_xray-client-plus/stargazers)
 
-[فارسی](README.md) · **English** · [📖 Full guide (Persian)](GUIDE.md)
+[فارسی](README.md) · **English** · [📖 Full guide (Persian)](GUIDE.md) · [🌐 Website](https://sadrazkh.github.io/Irnetfree_xray-client-plus/en/)
 
 ### The toolbox beside IRNetFree: find clean addresses, run your own server.
 

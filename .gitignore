@@ -9,3 +9,6 @@ bin/
 *.log
 .DS_Store
 /_*.json
+
+# The Pages site, built by scripts/build-site.js (CI writes it; never committed)
+/_site/
