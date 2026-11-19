@@ -202,3 +202,11 @@ Scope checked: `docs/superpowers/`, `docs/SYNC.md`, tag and commit messages, sou
 - **Consequences / limitations:** a new system tool must be added to `BLOCKED`.
 - **Do not change without reconsidering:** always run tests through `npm test`.
 - **Status:** Verified in code (`tests/noNetwork.preload.js`)
+
+## D-026: The website is built by Actions from site/, like IRNetFree's  (2026-11-19)
+- **Context:** The owner asked for GitHub Pages sites for both apps, IRNetFree and its scanner, in one request.
+- **Decision:** The same design and build as IRNetFree's site (its D-032): `site/` (Persian at the root, English under `en/`), `scripts/build-site.js` adding `docs/readme/*.png` and `release.json` from the API at build time, `pages.yml` deploying after site changes and after every Build & Release. Nothing loads from another host. The pages link to IRNetFree's site, and a phone visitor is sent there (Plus has no phone version).
+- **Alternatives considered:** One site for both apps in one repository (rejected: each repository's releases, screenshots and docs live with it, and a release of one should rebuild only its own page). Sharing the site's files between the repositories (rejected: no mechanism for it; the files are copied, like the upstream sync copies code, and each repository's test pins its own).
+- **Consequences / limitations:** A change to the shared design has to be made in both repositories. `dev-release.yml` ignores the site's paths, so a site change does not rebuild the dev app.
+- **Do not change without reconsidering:** No external script, stylesheet or font. Asset names in `package.json` (electron-builder) and the patterns in `site/assets/site.js` (`SLOTS`) move together.
+- **Status:** Verified in code (`tests/site.test.js`).

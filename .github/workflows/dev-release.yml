@@ -25,6 +25,11 @@ on:
       - '**/*.md'
       - 'docs/**'
       - '.gitignore'
+      # the website (pages.yml builds it): no app change
+      - 'site/**'
+      - 'scripts/build-site.js'
+      - 'tests/site.test.js'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
     inputs:
       all_platforms:

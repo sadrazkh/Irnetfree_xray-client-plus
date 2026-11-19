@@ -5,6 +5,7 @@ Scope checked: `git tag`, tag annotations and merge commit messages at `docs/bas
 
 The repository also holds 134 tags inherited from the upstream client (`v0.x`, `v1.x`, and some bare numbers) and the rolling `dev` tag. Those are not Plus releases and are left out.
 
+- 2026-11-19 (milestone): website on GitHub Pages (`site/`, `scripts/build-site.js`, `pages.yml`), Persian and English, with the latest release's downloads; no app version.
 - 2026-11-08 (milestone): documentation baseline written (Mode A); consistency review finished; no code changed.
 - v3.3.3 (2026-11-04): Server tab, an inbound's Users cell reads in order in Persian, the count first.
 - v3.3.2 (2026-11-04): Server tab, the next reset date reads the right way round in Persian.

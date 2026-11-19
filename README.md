@@ -9,7 +9,7 @@
 [![تست‌ها](https://img.shields.io/github/actions/workflow/status/sadrazkh/Irnetfree_xray-client-plus/test.yml?branch=main&style=for-the-badge&label=tests&labelColor=161d27)](https://github.com/sadrazkh/Irnetfree_xray-client-plus/actions/workflows/test.yml)
 [![ستاره‌ها](https://img.shields.io/github/stars/sadrazkh/Irnetfree_xray-client-plus?style=for-the-badge&label=stars&color=e3b341&labelColor=161d27)](https://github.com/sadrazkh/Irnetfree_xray-client-plus/stargazers)
 
-**فارسی** · [English](README.en.md) · [📖 راهنمای کامل](GUIDE.md)
+**فارسی** · [English](README.en.md) · [📖 راهنمای کامل](GUIDE.md) · [🌐 سایت](https://sadrazkh.github.io/Irnetfree_xray-client-plus/)
 
 ### جعبه‌ابزار کنار IRNetFree: آدرس تمیز پیدا کن، سرور خودت را بالا بیاور.
 

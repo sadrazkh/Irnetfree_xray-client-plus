@@ -65,10 +65,21 @@ User-facing install steps are in [README.en.md](../README.en.md) and [GUIDE.md](
 | `test.yml` | Every push and PR | `npm test` on three OSes. Then on Linux: fetches suggested cores, `validate-configs` on both, both probes |
 | `dev-release.yml` | Push to `main` outside docs, or manual | `npm test`, build Windows (all platforms if asked), replace the rolling `dev` pre-release |
 | `release.yml` | Tag `v*` or `x.y.z`, or manual | Build three OSes, sync version to the tag, checksums, publish. A tag with `-` is a pre-release. No tests (KI-02) |
+| `pages.yml` | Push to `main` touching `site/**`, `docs/readme/**`, the logo or `scripts/build-site.js`; every finished Build & Release (`workflow_run`); manual | Builds the website with `scripts/build-site.js --require-release` and deploys it to GitHub Pages. `dev-release.yml` ignores these paths |
 
 Release rules (V): push a tag alone (D-020). `electron-builder` runs with `--publish never`; `softprops/action-gh-release` publishes. Checksum and artifact steps must not block publishing, so they use `continue-on-error`.
 
 `release.yml` sets the build's version from the tag; `package.json` in git matches the latest tag (V: 3.3.3). A release is merged as a `Merge: Plus vX.Y.Z` commit, and the tag points at it (V: git log, `v3.3.3`). `npm run update-cdn-ranges` is manual and not tied to releases (KI-16).
+
+### Website (GitHub Pages)
+
+**[V]** https://sadrazkh.github.io/Irnetfree_xray-client-plus/ (Persian) and `/en/` (English), from `site/` [V: `scripts/build-site.js`, `.github/workflows/pages.yml`]. The same design and build as IRNetFree's own site (its D-032):
+
+- `node scripts/build-site.js --serve` previews on http://127.0.0.1:4518/; `--offline` skips the GitHub API.
+- `node scripts/build-site.js --out _site` builds what Pages serves: `site/` (names starting with `_` stay out), `docs/readme/*.png` as `shots/`, the logo and icon, `release.json` (the latest release's assets, read from the API at build time), `sitemap.xml` and `robots.txt`. `_site/` is git-ignored.
+- The repository's Pages source is "GitHub Actions" (set once through the API on 2026-11-19); no `gh-pages` branch.
+- `site/assets/og.png` (the link preview) is rendered from `site/_og.html` at 1200×630 in headless Chrome.
+- `tests/site.test.js` builds it with a made-up release and checks links, the two languages' sections, the asset-name patterns (the mac zips are named `IRNetFree.Plus-…`) and the workflows.
 
 ### Publishing a release
 
